@@ -729,12 +729,11 @@ def maybe_dual_stream_forward(
     """Dual-stream MoE forward: shared experts on alt stream, routed on main."""
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    DUAL_STREAM_TOKEN_THRESHOLD = 1024
     num_tokens, hidden_dim = hidden_states.shape
     if (
         self._use_dual_stream
         and num_tokens > 0
-        and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
+        and num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
     ):
         return self.dual_stream_moe_forward(hidden_states)
     else:
@@ -827,10 +826,11 @@ class DeepseekV2MoE(nn.Module):
 
         if config.n_shared_experts is not None:
             if not is_rocm_aiter_fusion_shared_expert_enabled():
-                self._use_dual_stream = True
-                self.alt_stream = DeepseekV2MoE._get_shared_stream()
-                compilation_config = get_current_atom_config().compilation_config
-                compilation_config.static_forward_context[prefix] = self
+                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0:
+                    self._use_dual_stream = True
+                    self.alt_stream = DeepseekV2MoE._get_shared_stream()
+                    compilation_config = get_current_atom_config().compilation_config
+                    compilation_config.static_forward_context[prefix] = self
                 intermediate_size = (
                     config.moe_intermediate_size * config.n_shared_experts
                 )
