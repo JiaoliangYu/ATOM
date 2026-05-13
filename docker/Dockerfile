@@ -372,12 +372,6 @@ RUN echo "========== [Parallel] Building Mooncake ==========" && \
         openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get remove -y golang golang-go 2>/dev/null || true && \
-    rm -rf /usr/local/go && \
-    wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
-    rm go1.22.2.linux-amd64.tar.gz
-
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN git clone https://github.com/kvcache-ai/Mooncake.git /app/mooncake && \
@@ -386,6 +380,14 @@ RUN git clone https://github.com/kvcache-ai/Mooncake.git /app/mooncake && \
     git submodule update --init --recursive
 
 RUN cd /app/mooncake && bash dependencies.sh -y
+
+# Go 1.22.2 MUST be installed AFTER dependencies.sh, which pulls a newer
+# Go that causes "mallocHeaderSize redeclared" build failures.
+RUN rm -rf /usr/local/go && \
+    wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+    rm go1.22.2.linux-amd64.tar.gz && \
+    go version
 
 RUN cd /app/mooncake && \
     mkdir -p build && cd build && \
