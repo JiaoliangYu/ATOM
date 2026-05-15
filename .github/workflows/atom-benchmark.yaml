@@ -420,7 +420,7 @@ jobs:
         model: ${{ fromJson(needs.load-pd-models.outputs.models_json) }}
         config: ${{ fromJson(needs.parse-pd-params.outputs.matrix_json) }}
 
-    runs-on: atom-mi300-8gpu
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}
     timeout-minutes: 120
 
     env:
@@ -544,7 +544,19 @@ jobs:
 
       - name: Collect GPU info
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh atom-pd-prefill docker "atom-mi300-8gpu"
+        run: |
+          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}"
+          bash .github/scripts/collect_gpu_info.sh atom-pd-prefill docker "$RUNNER_HINT"
+          DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
+          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
+            RESOLVED_IMAGE=""
+            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
+              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
+            fi
+            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
+          fi
+          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Download model (prefill node)
         run: |
@@ -587,7 +599,7 @@ jobs:
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
-            -e DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
+            -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
             -e DISPLAY_NAME="${{ matrix.model.display }}" \
             atom-pd-prefill python3 -c "
