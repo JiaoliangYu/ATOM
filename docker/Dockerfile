@@ -417,6 +417,12 @@ COPY --from=build_mori /opt/venv /opt/venv
 COPY --from=build_mori /app/mori /app/mori
 RUN pip show mori || true
 
+# RDMA libraries needed by Mooncake — must be installed BEFORE the custom
+# RCCL .deb, which breaks the dpkg dependency state for rocm-hip.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 # RCCL: install .deb from build stage
 COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
 RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
@@ -451,11 +457,7 @@ COPY --from=build_mooncake /usr/local/lib/libre2* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/bin/mooncake_master /usr/local/bin/
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake /opt/venv/lib/python3.12/site-packages/mooncake
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake-*.dist-info /opt/venv/lib/python3.12/site-packages/
-RUN apt-mark hold rccl rccl-dev rocm-hip && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev && \
-    rm -rf /var/lib/apt/lists/* && \
-    ldconfig && \
+RUN ldconfig && \
     python -c "from mooncake.engine import TransferEngine; print('Mooncake ROCm OK')"
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
