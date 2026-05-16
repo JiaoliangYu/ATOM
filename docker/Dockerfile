@@ -417,10 +417,17 @@ COPY --from=build_mori /opt/venv /opt/venv
 COPY --from=build_mori /app/mori /app/mori
 RUN pip show mori || true
 
-# RDMA libraries needed by Mooncake — must be installed BEFORE the custom
+# RDMA + Mooncake runtime libraries — must be installed BEFORE the custom
 # RCCL .deb, which breaks the dpkg dependency state for rocm-hip.
+# Mooncake links gflags, glog, jsoncpp, yaml-cpp, numa, curl, unwind, c-ares
+# at runtime; install them via apt so transitive deps are handled correctly.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev && \
+    apt-get install -y --no-install-recommends \
+        librdmacm-dev libibverbs-dev \
+        libgflags-dev libgoogle-glog-dev \
+        libjsoncpp-dev libyaml-cpp-dev \
+        libnuma-dev libcurl4-openssl-dev \
+        libunwind-dev libc-ares-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # RCCL: install .deb from build stage
@@ -446,14 +453,13 @@ COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
 
-# Mooncake: copy built libraries, gRPC runtime, and Python package
+# Mooncake: copy source-built artifacts only.
+# gRPC/protobuf/abseil/re2/upb are apt-installed in build_mooncake (system path),
+# and not needed at runtime (non-legacy etcd uses libetcd_wrapper, a Go cgo lib).
+# Runtime system libs (glog, gflags, jsoncpp, yaml-cpp, numa, curl, unwind,
+# c-ares) are installed via apt above.
 COPY --from=build_mooncake /usr/local/lib/libmooncake* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/lib/libetcd_wrapper.so /usr/local/lib/
-COPY --from=build_mooncake /usr/local/lib/libgrpc* /usr/local/lib/
-COPY --from=build_mooncake /usr/local/lib/libprotobuf* /usr/local/lib/
-COPY --from=build_mooncake /usr/local/lib/libabsl* /usr/local/lib/
-COPY --from=build_mooncake /usr/local/lib/libupb* /usr/local/lib/
-COPY --from=build_mooncake /usr/local/lib/libre2* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/bin/mooncake_master /usr/local/bin/
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake /opt/venv/lib/python3.12/site-packages/mooncake
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake-*.dist-info /opt/venv/lib/python3.12/site-packages/
