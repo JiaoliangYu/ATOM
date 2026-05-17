@@ -402,6 +402,14 @@ RUN cd /app/mooncake/mooncake-wheel && \
     cp /app/mooncake/build/mooncake-integration/engine.cpython-*-linux-gnu.so "$MOONCAKE_DIR/" && \
     python -c "from mooncake.engine import TransferEngine; print('Mooncake ROCm OK')"
 
+# Collect Mooncake runtime .so deps into a staging dir for the final image.
+# This lets us COPY them directly instead of apt-get install (which can
+# upgrade base-image packages and break RCCL).
+RUN mkdir -p /mooncake-runtime && \
+    for lib in gflags glog jsoncpp yaml-cpp cares rdmacm ibverbs numa curl unwind; do \
+        find /usr/lib -name "lib${lib}*.so*" -exec cp -aL {} /mooncake-runtime/ \; 2>/dev/null || true; \
+    done
+
 # --------------------------------------------------------------------
 # Stage 6: Final merge — collect all build artifacts + install ATOM
 # --------------------------------------------------------------------
@@ -417,17 +425,10 @@ COPY --from=build_mori /opt/venv /opt/venv
 COPY --from=build_mori /app/mori /app/mori
 RUN pip show mori || true
 
-# Mooncake runtime deps.  Do NOT add libibverbs-dev / librdmacm-dev here —
-# they pull in a system rdma-core that overwrites the ROCm base-image version
-# and breaks RCCL (ncclSystemError at barrier).  The base image already
-# provides libibverbs + librdmacm runtime libs via ibverbs-utils.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        libgflags-dev libgoogle-glog-dev \
-        libjsoncpp-dev libyaml-cpp-dev \
-        libnuma-dev libcurl4-openssl-dev \
-        libunwind-dev libc-ares-dev && \
-    rm -rf /var/lib/apt/lists/*
+# Mooncake runtime deps: COPY pre-built .so files from the build stage
+# instead of apt-get install, which can upgrade base-image packages and
+# break RCCL (ncclSystemError at barrier).
+COPY --from=build_mooncake /mooncake-runtime/ /usr/lib/x86_64-linux-gnu/
 
 # RCCL: install .deb from build stage
 COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
