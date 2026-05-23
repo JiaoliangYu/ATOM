@@ -112,6 +112,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#supported-quantization-dtypes">3.4 Supported Quantization Dtypes</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#auto-detection-from-huggingface">3.5 Auto-Detection from HuggingFace</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#layer-level-quantization-dispatch">3.6 Layer-Level Quantization Dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#online-quantization-at-load-time">3.7 Online Quantization at Load Time</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
@@ -1125,6 +1126,67 @@ parameters:</p>
 <h3>3.6 Layer-Level Quantization Dispatch<a class="headerlink" href="#layer-level-quantization-dispatch" title="Link to this heading"></a></h3>
 <p>Linear layers, MoE layers, and fused ops call <code class="docutils literal notranslate"><span class="pre">quant_config.get_layer_quant_config(prefix)</span></code> to obtain the appropriate <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> for their position in the model. This enables mixed-precision quantization where different layers can have different quant types and dtypes (e.g., FP8 for attention, FP4 for MLP).</p>
 </section>
+<section id="online-quantization-at-load-time">
+<h3>3.7 Online Quantization at Load Time<a class="headerlink" href="#online-quantization-at-load-time" title="Link to this heading"></a></h3>
+<p>ATOM can re-quantize model weights while loading them by passing
+<code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> to the engine. This is useful when the source checkpoint
+is unquantized or uses a different supported quantization layout than the runtime
+layout you want to benchmark.</p>
+<p>The flag accepts a JSON object:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">  &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">  &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;},</span>
+<span class="s1">  &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">}&#39;</span>
+</pre></div>
+</div>
+<p>Fields:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p>Default target quantization format for all layers.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">layer_quant_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">str]</span></code></p></td>
+<td><p>Per-layer target overrides. Keys are fnmatch-style layer patterns such as <code class="docutils literal notranslate"><span class="pre">&quot;*expert*&quot;</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">exclude_layer</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span> <span class="pre">|</span> <span class="pre">list[str]</span></code></p></td>
+<td><p>Layers to leave unquantized. Supports exact/prefix matches, glob patterns, and <code class="docutils literal notranslate"><span class="pre">re:</span></code> regex entries. Prefer a JSON list when excluding multiple patterns.</p></td>
+</tr>
+</tbody>
+</table>
+<p>Supported target format strings:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Format</p></th>
+<th class="head"><p>Target config</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_Token</span></code> with FP8 weights</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_1x32</span></code> with packed MXFP4 weights</p></td>
+</tr>
+</tbody>
+</table>
+<p>Notes:</p>
+<ul class="simple">
+<li><p>An empty JSON object (<code class="docutils literal notranslate"><span class="pre">--online_quant_config</span> <span class="pre">'{}'</span></code>) is treated the same as not passing the flag and does not enable online quantization.</p></li>
+<li><p>Online quantization currently applies when the source model is unquantized or uses supported FP8 block quantization (<code class="docutils literal notranslate"><span class="pre">QuantType.per_1x128</span></code>). The loader dequantizes FP8 block weights before applying the requested target format.</p></li>
+<li><p>Tensor-parallel weights are gathered before quantization only when local quantization would produce different scales than quantizing the full unpartitioned weight.</p></li>
+<li><p>Rank 0 writes an <code class="docutils literal notranslate"><span class="pre">online_quant_info_*.json</span></code> summary with elapsed time and per-layer target formats. The file is written under <code class="docutils literal notranslate"><span class="pre">ATOM_TORCH_PROFILER_DIR</span></code> when set, otherwise the current working directory.</p></li>
+</ul>
+</section>
 </section>
 <hr class="docutils" />
 <section id="parallel-configuration-parallelconfig">
@@ -1491,6 +1553,12 @@ all flags via <code class="docutils literal notranslate"><span class="pre">add_c
 <td><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0.0</span></code></p></td>
 <td><p>Delay factor multiplied by previous prompt latency before scheduling next prompt</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code></p></td>
+<td><p></p></td>
+<td><p>JSON string</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Load-time online quantization override; see Section 3.7</p></td>
 </tr>
 </tbody>
 </table>
