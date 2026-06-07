@@ -160,6 +160,105 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ForwardMode:
+    """Per-step dispatch decision: cudagraph vs eager + effective batch size.
+
+    Single source of truth for ``prepare_inputs`` (to size ``attn_metadata``)
+    and ``run_model`` (to pick dispatch). Constructed only via :meth:`decide`.
+
+    Invariant:
+        ``slot_mapping.shape[0] == input_ids.shape[0] == effective_bs * max_q``
+    holds for decode + eager; cudagraph captures padded shape internally,
+    prefill is variable-length. See :meth:`assert_shape_contract`.
+    """
+
+    use_cudagraph: bool
+    effective_bs: int
+    is_prefill: bool
+
+    @classmethod
+    def decide(
+        cls,
+        *,
+        is_prefill: bool,
+        total_seqs_num: int,
+        scheduled_bs_decode: int,
+        num_input_tokens: int,
+        dp_uniform_decode: bool,
+        enforce_eager: bool,
+        graph_bs: list[int],
+        mtp_step: int = 1,
+    ) -> "ForwardMode":
+        """Compute dispatch + effective_bs. Any new force-eager condition
+        belongs here, not in caller-side checks."""
+        if is_prefill:
+            # Prefill is always eager. effective_bs is the sequence count;
+            # per-token sums are tracked separately via cu_seqlens_q.
+            return cls(
+                use_cudagraph=False,
+                effective_bs=total_seqs_num,
+                is_prefill=True,
+            )
+
+        if enforce_eager or not dp_uniform_decode:
+            # Forced eager — keep slot_mapping at local-real length so it
+            # matches the input_ids that model.forward receives.
+            return cls(
+                use_cudagraph=False,
+                effective_bs=scheduled_bs_decode,
+                is_prefill=False,
+            )
+
+        # MTP draft tokens: divide by (mtp_k + 1) to recover the per-step batch.
+        padded_scheduled_bs = (num_input_tokens + mtp_step - 1) // mtp_step
+
+        if padded_scheduled_bs > graph_bs[-1]:
+            return cls(
+                use_cudagraph=False,
+                effective_bs=scheduled_bs_decode,
+                is_prefill=False,
+            )
+
+        # CUDAGraph path: pick the smallest captured size that fits.
+        eff = next(
+            (x for x in graph_bs if x >= padded_scheduled_bs),
+            padded_scheduled_bs,
+        )
+        return cls(use_cudagraph=True, effective_bs=eff, is_prefill=False)
+
+    @property
+    def attn_tensors_are_padded(self) -> bool:
+        """True iff per-token attention tensors carry padding this step
+        (cudagraph today; update if other padded layouts are added)."""
+        return self.use_cudagraph
+
+    def assert_shape_contract(
+        self,
+        input_ids: "torch.Tensor",
+        attn_metadata: "AttentionMetaData",
+    ) -> None:
+        """Validate ``input_ids`` / ``slot_mapping`` against this ForwardMode.
+
+        Skips prefill (variable-length) and cudagraph (graph-internal shape);
+        callers invoke unconditionally to keep dispatch decisions centralised.
+        """
+        if self.is_prefill or self.attn_tensors_are_padded:
+            return
+        max_q = attn_metadata.max_seqlen_q
+        expected = self.effective_bs * max_q
+        actual_in = input_ids.shape[0]
+        actual_slot = attn_metadata.slot_mapping.shape[0]
+        assert actual_in == expected, (
+            f"eager input_ids length {actual_in} != effective_bs*max_q="
+            f"{expected} ({self})"
+        )
+        assert actual_slot == expected, (
+            f"eager slot_mapping length {actual_slot} != effective_bs*max_q="
+            f"{expected} ({self}); attn_metadata_builder used a stale bs"
+        )
+
+
 @dataclass
 class Context:
     # This context is used to store the basic context of the forward.
@@ -173,6 +272,11 @@ class Context:
     # case is treated as True). Mirrors vLLM's `uniform_decode` flag and
     # gates DP-specific variable-length all_gather/scatter paths.
     dp_uniform_decode: bool = True
+    # Single source of truth for cudagraph vs eager dispatch + effective_bs.
+    # Set by prepare_inputs via ForwardMode.decide(). None only on legacy
+    # paths that haven't been routed through it (run_model falls back to
+    # the original four-OR derivation in that case for back-compat).
+    forward_mode: Optional[ForwardMode] = None
     # Optional flat token ids for the current forward. Read by callbacks
     # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
     # that need the token ids but cannot receive them as a function arg
@@ -188,6 +292,7 @@ class Context:
         graph_bs: int = 0,
         is_draft: bool = False,
         dp_uniform_decode: bool = True,
+        forward_mode: Optional[ForwardMode] = None,
         input_ids: Optional[torch.Tensor] = None,
     ):
         self.positions = positions
@@ -197,6 +302,7 @@ class Context:
         self.graph_bs = graph_bs
         self.is_draft = is_draft
         self.dp_uniform_decode = dp_uniform_decode
+        self.forward_mode = forward_mode
         self.input_ids = input_ids
 
 
