@@ -739,7 +739,7 @@
 <li><p>Dedicated Triton kernels for FP8 MQA logits (<code class="docutils literal notranslate"><span class="pre">fp8_mqa_logits</span></code>), paged MQA logits (<code class="docutils literal notranslate"><span class="pre">deepgemm_fp8_paged_mqa_logits</span></code>), and fused RMSNorm+quantization (<code class="docutils literal notranslate"><span class="pre">_fuse_rmsnorm_quant</span></code>).</p></li>
 </ul>
 </li>
-<li><p><strong>V3.2 extension:</strong> <code class="docutils literal notranslate"><span class="pre">DeepseekV32ForCausalLM</span></code> is an alias. The <code class="docutils literal notranslate"><span class="pre">DeepseekV2Model</span></code> detects V3.2 via <code class="docutils literal notranslate"><span class="pre">config.index_topk</span></code> and allocates an <code class="docutils literal notranslate"><span class="pre">topk_indices_buffer</span></code> for index-based routing.</p></li>
+<li><p><strong>V3.2 extension:</strong> <code class="docutils literal notranslate"><span class="pre">DeepseekV32ForCausalLM</span></code> is an alias. The <code class="docutils literal notranslate"><span class="pre">DeepseekV2Model</span></code> detects V3.2 via <code class="docutils literal notranslate"><span class="pre">config.index_topk</span></code>; the indexer computes top-k rows as per-forward scratch and the MLA path packs them into sparse attention metadata.</p></li>
 <li><p><strong>Note:</strong> <code class="docutils literal notranslate"><span class="pre">DeepseekV3ForCausalLM</span></code> is a subclass of <code class="docutils literal notranslate"><span class="pre">DeepseekV2ForCausalLM</span></code> (pass-through, no override).</p></li>
 </ul>
 </section>

@@ -1132,6 +1132,12 @@ parameters:</p>
 <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> to the engine. This is useful when the source checkpoint
 is unquantized or uses a different supported quantization layout than the runtime
 layout you want to benchmark.</p>
+<blockquote>
+<div><p>For ready-to-run recipes (DeepSeek-R1, Qwen3 MoE, …), pattern-design guidance,
+verification, and troubleshooting, see
+<a class="reference internal" href="online_quantization_guide.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">online_quantization_guide.md</span></code></span></a>. This section
+documents only the field-level reference.</p>
+</div></blockquote>
 <p>The flag accepts a JSON object:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
 <span class="s1">  &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
