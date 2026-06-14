@@ -494,7 +494,10 @@
 <li class="toctree-l3"><a class="reference internal" href="#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#environment-variables">6. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#online-quantization">Online quantization</a></li>
+</ul>
+</li>
 </ul>
 </li>
 </ul>
@@ -979,6 +982,17 @@ set environment variables before launching:</p>
 </tr>
 </tbody>
 </table>
+<section id="online-quantization">
+<h3>Online quantization<a class="headerlink" href="#online-quantization" title="Link to this heading"></a></h3>
+<p>Online (load-time) quantization is supported in plugin mode. Since <code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>
+cannot take ATOM’s <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> CLI flag, pass the same JSON through
+vLLM’s <code class="docutils literal notranslate"><span class="pre">--additional-config</span></code> under the <code class="docutils literal notranslate"><span class="pre">online_quant_config</span></code> key:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span>...<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--additional-config<span class="w"> </span><span class="s1">&#39;{&quot;online_quant_config&quot;: {&quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;, &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;}, &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]}}&#39;</span>
+</pre></div>
+</div>
+<p>See the <a class="reference internal" href="online_quantization_guide.html#35-plugin-mode-vllm-serve"><span class="std std-ref">online quantization guide</span></a> for the full schema.</p>
+</section>
 </section>
 </section>
 

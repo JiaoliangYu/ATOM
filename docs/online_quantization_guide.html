@@ -492,7 +492,10 @@
 <li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#disable-atom-plugin">5.6 Disable ATOM Plugin</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#environment-variables">6. Environment Variables</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#online-quantization">Online quantization</a></li>
+</ul>
+</li>
 </ul>
 </li>
 </ul>
@@ -770,6 +773,33 @@ decoding for ~2.5× lower TPOT.</p>
 quantization — it can be added to any of the recipes above without changing
 the <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> JSON.</p>
 </section>
+</section>
+<hr class="docutils" />
+<section id="plugin-mode-vllm-serve">
+<h2>3.5 Plugin mode (<code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>)<a class="headerlink" href="#plugin-mode-vllm-serve" title="Link to this heading"></a></h2>
+<p>In the <a class="reference internal" href="vllm_plugin_backend_guide.html"><span class="std std-doc">vLLM out-of-tree plugin backend</span></a> you launch
+with <code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>, whose CLI does not understand ATOM’s <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code>
+flag. Instead, pass the <strong>same JSON object</strong> through vLLM’s official plugin
+escape hatch <code class="docutils literal notranslate"><span class="pre">--additional-config</span></code>, under the <code class="docutils literal notranslate"><span class="pre">online_quant_config</span></code> key. ATOM
+reads it during the vLLM→ATOM config translation and routes it through the
+identical load-time quantization path (<code class="docutils literal notranslate"><span class="pre">process_weights_after_loading</span></code>),
+including the <code class="docutils literal notranslate"><span class="pre">online_quant_info_*.json</span></code> dump described in § 4.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>serve<span class="w"> </span>deepseek-ai/DeepSeek-R1-0528<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tensor-parallel-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--no-enable-prefix-caching<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--additional-config<span class="w"> </span><span class="s1">&#39;{&quot;online_quant_config&quot;: {</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">    &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;},</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }}&#39;</span>
+</pre></div>
+</div>
+<p>The schema, target formats, pattern semantics, and resolution order are
+identical to the <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> flag documented in § 2. Omitting it
+leaves weights at their source precision. As with the standalone flag, online
+quantization only activates when the source checkpoint’s <code class="docutils literal notranslate"><span class="pre">quant_method</span></code> is
+unquantized or per-block FP8 (see § 1).</p>
 </section>
 <hr class="docutils" />
 <section id="verifying-the-result">
