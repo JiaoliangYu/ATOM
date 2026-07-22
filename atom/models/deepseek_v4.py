@@ -26,15 +26,12 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
-import threading
-
 import aiter
 import torch
 import torch.nn.functional as F
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    get_hip_quant,
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
@@ -44,12 +41,23 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.jit.utils.chip_info import get_gfx
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_all_reduce,
+    pcp_allgather_rankmajor,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_reduce_scatter,
+    pcp_round_robin_split,
+)
+from atom.utils.custom_register import direct_register_custom_op
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -83,6 +91,7 @@ from atom.model_ops.sparse_attn_v4 import (
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
+from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
@@ -98,39 +107,11 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-# Per-device auxiliary stream for TBO-adjacent collectives (DP input_ids
-# all-gather hoisted into DeepseekV4ForCausalLM.forward, MoE combine_outputs
-# TP all-reduce). Submitting these on a dedicated stream keeps the main
-# compute lane free of nccl interleaving so it can hardware-overlap with
-# TBO's own comm_stream.
-_TBO_COMM_STREAM: dict = {}
-_TBO_COMM_STREAM_LOCK = threading.Lock()
-
-
-def _run_on_tbo_comm_stream(fn, *args, **kwargs):
-    # Without TBO there is no second compute/comm stream to overlap with,
-    # so the side-stream hop only adds event/sync overhead. Run inline.
-    if not get_current_atom_config().enable_tbo:
-        return fn(*args, **kwargs)
-    device = torch.cuda.current_device()
-    with _TBO_COMM_STREAM_LOCK:
-        side = _TBO_COMM_STREAM.get(device)
-        if side is None:
-            side = torch.cuda.Stream(device=device)
-            _TBO_COMM_STREAM[device] = side
-    main = torch.cuda.current_stream()
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        result = fn(*args, **kwargs)
-    main.wait_stream(side)
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -159,6 +140,7 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
+SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -176,15 +158,75 @@ def _v4_attention_fake(
     return torch.empty_like(x)
 
 
+# PIECEWISE cudagraph: persistent per-(layer, num_tokens) buffers holding each
+# attention op's output.
+_v4_attn_piecewise_out: dict = {}
+
+
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
 def v4_attention_with_output(
     x: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    # WIDE split (legacy / FULL cudagraph path): the whole attention (pre + core
+    # + post) is a single eager splitting op. Used when NOT doing PIECEWISE
+    # cudagraph — the manual whole-forward FULL capture graphs everything at once
+    # so there are no inter-piece tensors to stabilise. Unchanged from baseline.
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     return self.forward_impl(x, positions)
+
+
+# ---------------------------------------------------------------------------
+# Narrow PIECEWISE split: only the paged / dynamic-shape attention core stays
+# eager.
+# ---------------------------------------------------------------------------
+def _v4_core_attention_fake(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    kv_pre: torch.Tensor,
+    qr: torch.Tensor,
+    qr_scale: torch.Tensor,
+    positions: torch.Tensor,
+    idx_q_fp8: Optional[torch.Tensor],
+    idx_weights: Optional[torch.Tensor],
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return x.new_empty((x.shape[0], self.n_local_heads * self.head_dim))
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_v4_core_attention_fake, mutates_args=[])
+def v4_core_attention(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    kv_pre: torch.Tensor,
+    qr: torch.Tensor,
+    qr_scale: torch.Tensor,
+    positions: torch.Tensor,
+    idx_q_fp8: Optional[torch.Tensor],
+    idx_weights: Optional[torch.Tensor],
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    out = self._attn_core(x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights)
+
+    from atom.config import CUDAGraphMode
+    from atom.utils.forward_context import get_forward_context
+
+    fc = get_forward_context()
+    if getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE:
+        key = (layer_name, int(out.shape[0]))
+        buf = _v4_attn_piecewise_out.get(key)
+        if buf is None:
+            buf = torch.empty_like(out)
+            _v4_attn_piecewise_out[key] = buf
+        buf.copy_(out)
+        return buf
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -831,12 +873,16 @@ class _V4RoPE(nn.Module):
                 nope_first=False,
             )
 
-    def inverse(self, positions: torch.Tensor, x: torch.Tensor) -> None:
+    def inverse(
+        self, positions: torch.Tensor, x: torch.Tensor, prefix: str = ""
+    ) -> None:
         """In-place inverse RoPE via fused Triton kernel.
 
         ``x`` must be the rope-slice only (last dim == rotary_dim).
         """
-        inverse_rope_inplace(x, self.cos_cache, self.sin_cache, positions)
+        inverse_rope_inplace(
+            x, self.cos_cache, self.sin_cache, positions, prefix=prefix
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +950,11 @@ class Compressor(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
 
+        # Fixed CUDAGraph-stable scratch for `wkv_gate(x)` output on the captured
+        # decode path, in TBO, two concurrent ubatch threads never share the
+        # same scratch.
+        self._combined_cg_buf: dict = {}
+
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
@@ -911,6 +962,13 @@ class Compressor(nn.Module):
         # of `self.kv_cache`. Bound by the V4 builder when `kv_cache.dtype` is
         # FP8 (Indexer-inner Compressor); None for BF16 cache (Main path).
         self.cache_scale: Optional[torch.Tensor] = None
+        # Native 2buff fp8 Main path (CSA/HCA Main under --kv_cache_dtype fp8):
+        # parallel bf16 rope pool [NB, k_per_block, rope_head_dim] and a write
+        # mode tag. Bound by DeepseekV4AttentionMetadataBuilder; "main_2buff_fp8"
+        # routes the compress scatter to the flydsl group_fp8 path, "bf16" /
+        # "indexer_fp8" keep the existing behavior.
+        self.kv_cache_rope: Optional[torch.Tensor] = None
+        self.write_mode: str = "bf16"
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
@@ -1010,6 +1068,48 @@ class Compressor(nn.Module):
         # stride must be 1).
         coff_d = (1 + overlap) * d
         combined = self.wkv_gate(x)
+        # ===== PCP (full-KV) =====
+        # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
+        # The wkv_gate projection above is per-token (parallelizable), but the
+        # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
+        # into one entry — which round-robin split breaks. So all-gather the
+        # projected `combined` back to full sequence order before compression,
+        # mirroring SGLang's compute_kv_score (all-gather kv_score after the
+        # projection, before the cross-token compress). The plan /
+        # state_slot_mapping passed to fused_compress_attn are full-sequence
+        # (never split in the builder), so they match the gathered `combined`.
+        if _pcp_active():
+            from atom.utils.tbo.ubatching import (
+                tbo_active as _tbo_active,
+                tbo_yield_and_switch_from_compute_to_comm,
+                tbo_switch_to_compute_sync,
+            )
+
+            _tbo = _tbo_active()
+            if _tbo:
+                tbo_yield_and_switch_from_compute_to_comm()
+            combined = pcp_allgather_rerange(combined, get_pcp_world_size())
+            if _tbo:
+                tbo_switch_to_compute_sync()
+        # TBO decode: copy `combined` into a fixed-address buffer so CUDAGraph
+        # capture/replay see a stable pointer (allocator may re-place it).
+        from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
+
+        _fc = get_forward_context()
+        if getattr(_fc, "in_hipgraph", False) and tbo_active():
+            ub = tbo_current_ubatch_id()
+            n_tok = combined.shape[0]
+            buf = self._combined_cg_buf.get(ub)
+            if buf is None or buf.shape[0] < n_tok or buf.shape[1] != combined.shape[1]:
+                buf = torch.empty(
+                    combined.shape[0],
+                    combined.shape[1],
+                    dtype=combined.dtype,
+                    device=combined.device,
+                )
+                self._combined_cg_buf[ub] = buf
+            buf[:n_tok].copy_(combined)
+            combined = buf[:n_tok]
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -1018,19 +1118,27 @@ class Compressor(nn.Module):
         # fwd's data for the NEXT fwd's overlap — must run AFTER the fused
         # kernel.
         cos_cache, sin_cache = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
-        # Quant path triggers when the bound cache is FP8 (Indexer-inner).
-        # `self.cache_scale` is bound alongside `self.kv_cache` by the V4
-        # builder when the cache is FP8 (strided fp32 view of the per-block
-        # scale region).
-        is_quant = self.kv_cache is not None and self.kv_cache.dtype != torch.bfloat16
+        # Three scatter modes, discriminated by the bound `write_mode`:
+        #   - "indexer_fp8": per-row fp8 + preshuffle (Indexer-inner Compressor).
+        #   - "main_2buff_fp8": CSA/HCA Main under --kv_cache_dtype fp8 — native
+        #     group_fp8 2buff (nope-fp8 + inline e8m0 into `kv_cache`, bf16 rope
+        #     into `kv_cache_rope`). Routed to the flydsl group_fp8 path.
+        #   - "bf16": plain bf16 Main scatter.
+        # `self.cache_scale` is bound alongside an fp8 `kv_cache` by the V4
+        # builder (indexer-inner only; group_fp8 carries scale inline so
+        # cache_scale stays None).
+        main_2buff_fp8 = self.write_mode == "main_2buff_fp8"
+        is_quant = self.write_mode == "indexer_fp8"
         # Skip the kernel's cache scatter during warmup (kv_cache/block_tables
         # not yet bound).
         if block_tables is None or self.kv_cache is None:
             scatter_kv_cache = None
             scatter_block_tables = None
+            scatter_kv_cache_rope = None
         else:
             scatter_kv_cache = self.kv_cache
             scatter_block_tables = block_tables
+            scatter_kv_cache_rope = self.kv_cache_rope if main_2buff_fp8 else None
         fused_compress_attn(
             kv_in=kv,
             score_in=score,
@@ -1055,6 +1163,9 @@ class Compressor(nn.Module):
             use_ue8m0=(self.scale_fmt == "ue8m0"),
             preshuffle=True,
             fp8_max=(torch.finfo(self.kv_cache.dtype).max if is_quant else None),
+            main_2buff_fp8=main_2buff_fp8,
+            kv_cache_rope=scatter_kv_cache_rope,
+            prefix=f"{self.prefix}.fused_compress_attn",
         )
         update_compressor_states(
             kv,
@@ -1063,10 +1174,10 @@ class Compressor(nn.Module):
             self.kv_state,
             self.score_state,
             write_plan=plan.write_plan_gpu,
-            num_write=plan.num_write,
             state_slot_mapping=state_slot_mapping,
             ratio=ratio,
             overlap=overlap,
+            prefix=f"{self.prefix}.update_compressor_states",
         )
 
 
@@ -1115,7 +1226,10 @@ class Indexer(nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         # Init-time hoists out of `forward_batched`'s hot path.
-        self._fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        # FP8 Q quant is fused into `rope_rotate_activation` (per_1x128 over
+        # head_dim); `group_size` is the per-1xN block. head_dim is the index
+        # head dim (128), so there is exactly one scale per (token, head).
+        self._q_quant_group = self.head_dim
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
         # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
         # one indexer slot per `compress_ratio` source tokens.
@@ -1152,6 +1266,7 @@ class Indexer(nn.Module):
             prefix
         ] = self
 
+    @mark_trace
     def forward_batched(
         self,
         x_full: torch.Tensor,  # [total_tokens, dim]
@@ -1177,6 +1292,43 @@ class Indexer(nn.Module):
             Consumer (`csa_translate_pack`) skips negative entries via its
             `topk >= 0` write mask.
         """
+        q_fp8, weights = self.forward_pre(x_full, qr_full, positions, qr_full_scale)
+        return self.score_topk_from(q_fp8, weights)
+
+    def topk(
+        self,
+        x_full: torch.Tensor,
+        qr_full: torch.Tensor,
+        positions: torch.Tensor,
+        qr_full_scale: Optional[torch.Tensor] = None,
+        *,
+        pre_q_fp8: Optional[torch.Tensor] = None,
+        pre_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the top-k, reusing precomputed projections when available.
+
+        PIECEWISE narrow split projects Q/weights in `_attn_pre` (graphed piece)
+        and passes them as ``pre_q_fp8``/``pre_weights`` so only the eager paged
+        ``score_topk_from`` runs here. Otherwise (FULL/legacy) project inline via
+        ``forward_batched``. Same result either way — only the split site differs.
+        """
+        if pre_q_fp8 is not None:
+            return self.score_topk_from(pre_q_fp8, pre_weights)
+        return self.forward_batched(x_full, qr_full, positions, qr_full_scale)
+
+    def forward_pre(
+        self,
+        x_full: torch.Tensor,  # [total_tokens, dim]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] fp8
+        positions: torch.Tensor,  # [total_tokens]
+        qr_full_scale: Optional[torch.Tensor] = None,
+    ):
+        """Graphable indexer Q proj + RoPE + weights (num_tokens-shaped).
+
+        No paged / KV-cache access, so this runs in the compiled dense piece.
+        Only `score_topk_from` (paged gather + score) must stay eager.
+        Returns (q_fp8, weights).
+        """
         assert self.rotary_emb is not None
         rd = self.rope_head_dim
         total_tokens = x_full.size(0)
@@ -1187,16 +1339,28 @@ class Indexer(nn.Module):
         q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
             total_tokens, self.n_heads, self.head_dim
         )
-        # self.rotary_emb(positions, q[..., -rd:])
-        # q = rotate_activation(q)
-        rope_rotate_activation(
-            q, q, self.rotary_emb.cos_cache, self.rotary_emb.sin_cache, positions, rd
+        # RoPE + Hadamard-rotate + FP8 quant fused in one kernel. Q is online
+        # (recomputed each fwd, no cache); the bf16 rotated Q is never read back,
+        # so it is quantized in place of being materialized. `out_scale` carries
+        # the per-(token, head) fp8 block scale (head_dim == group => one/row).
+        # `_weights_scale` precomputed in __init__.
+        # self.rotary_emb(positions, q[..., -rd:]); q = rotate_activation(q)
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        q_scale = torch.empty(
+            (total_tokens * self.n_heads, self.head_dim // self._q_quant_group),
+            dtype=dtypes.fp32,
+            device=q.device,
         )
-
-        # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
-        # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
-        q_2d = q.view(-1, self.head_dim)
-        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
+        rope_rotate_activation(
+            q_fp8,
+            q,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            rd,
+            out_scale=q_scale,
+            group_size=self._q_quant_group,
+        )
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
@@ -1204,8 +1368,18 @@ class Indexer(nn.Module):
         # weights_proj is BF16 but auto-promotes to fp32 via fp32 q_scale,
         # so no explicit `.float()` cast needed.
         weights = self.weights_proj(x_full)
-        weights = scale_indexer_weights(weights, q_scale, self._weights_scale)
+        weights = scale_indexer_weights(
+            weights,
+            q_scale,
+            self._weights_scale,
+            prefix=f"{self.prefix}.scale_indexer_weights",
+        )
+        return q_fp8, weights
 
+    def score_topk_from(
+        self, q_fp8: torch.Tensor, weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Eager paged gather + score + top-k (reads compressor KV cache)."""
         return torch.ops.aiter.indexer_score_topk(
             q_fp8, weights, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
@@ -1284,14 +1458,6 @@ class Indexer(nn.Module):
 
         cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
         cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
-        logits = fp8_mqa_logits(
-            Q=q_fp8,
-            KV=k_fp8,
-            kv_scales=k_scale,
-            weights=weights,
-            cu_starts=cu_starts,
-            cu_ends=cu_ends,
-        )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
 
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
         # pybind kwarg). Honors per-row [cu_starts[i], cu_ends[i]) so cells
@@ -1308,17 +1474,65 @@ class Indexer(nn.Module):
         topk_global = torch.empty(
             (total_tokens, topk), dtype=torch.int32, device=device
         )
-        top_k_per_row_prefill(
-            logits,
-            cu_starts,
-            cu_ends,
-            topk_global,
-            None,  # values not needed, only indices
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
+        # The dense `fp8_mqa_logits` buffer is [total_tokens, total_committed]
+        # fp32. total_committed is the sum of all co-scheduled prefill contexts
+        # and is unbounded by max_num_batched_tokens, so a burst of long-context
+        # requests can push a single allocation to tens of GiB (#1376). Under
+        # chunked prefill total_tokens is already capped by
+        # max_num_batched_tokens, so the OOM is driven by total_committed (the
+        # column dim). Chunk along the Q (query-row) dimension with q_chunk sized
+        # so the buffer [q_chunk, total_committed] fp32 stays within the memory
+        # budget — q_chunk shrinks as total_committed grows. Each chunk still
+        # scores the FULL KV, so every row's top-k is computed completely in one
+        # shot: the result is exact with no cross-chunk merge, and the kernel's
+        # global column indices need no remapping (the seq_base subtraction below
+        # is per-token). When the budget is disabled (0) or a single chunk fits,
+        # the loop runs exactly once and matches the original single-shot path.
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and total_committed > 0
+            and budget_bytes // (total_committed * 4) < total_tokens
+        ):
+            # 4 bytes per fp32 logit; total_committed * 4 is one row's footprint.
+            # Round the budget-derived row count DOWN to keep the buffer within
+            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
+            # the normal regime, avoiding the coarse power-of-2 doubling. When
+            # the budget affords < 128 rows (extreme total_committed), fall back
+            # to a power-of-2 floor so it degrades to 64/32/.../1 instead of
+            # collapsing straight to 1.
+            budget_rows = budget_bytes // (total_committed * 4)
+            if budget_rows >= 128:
+                chunk_tokens = (budget_rows // 128) * 128
+            else:
+                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
+        else:
+            # Budget disabled, or a single chunk already fits all rows.
+            chunk_tokens = total_tokens
+        for chunk_start in range(0, total_tokens, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
+            # Per-row window bounds slice 1:1 with this chunk's rows.
+            row_starts = cu_starts[chunk_start:chunk_end]
+            row_ends = cu_ends[chunk_start:chunk_end]
+            logits = fp8_mqa_logits(
+                Q=q_fp8[chunk_start:chunk_end],
+                KV=k_fp8,
+                kv_scales=k_scale,
+                weights=weights[chunk_start:chunk_end],
+                cu_starts=row_starts,
+                cu_ends=row_ends,
+            )  # [chunk, total_committed] fp32; outside [start,end) is -inf
+            top_k_per_row_prefill(
+                logits,
+                row_starts,
+                row_ends,
+                topk_global[chunk_start:chunk_end],
+                None,  # values not needed, only indices
+                chunk_end - chunk_start,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
         seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
             1
         )  # [total_tokens, 1] int32
@@ -1352,10 +1566,34 @@ class Indexer(nn.Module):
         """
         total_tokens = q_fp8.size(0)
         n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
-        bs = block_tables.size(0)
-        # V4-Pro has no MTP, so next_n = total_tokens // bs = 1. The reshape
-        # also handles future multi-token decode (MTP) without code change.
-        next_n = total_tokens // bs
+        attn_md = get_forward_context().attn_metadata
+
+        # DSpark RAGGED (paper §5.2): the decode indexer kernel
+        # `deepgemm_fp8_paged_mqa_logits` is RECTANGULAR-ONLY — its grid maps
+        # rows via `pid % next_n` / `pid // next_n`, assuming every seq has
+        # exactly next_n queries. Under per-request ragged verify each seq has
+        # its own len_i (!= a shared next_n), so total_tokens != bs*next_n and a
+        # plain `.view(bs, next_n, ...)` is impossible.
+
+        ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
+        is_ragged = ragged_lens is not None and attn_md.dspark_full_q > 0
+        if is_ragged:
+            return self._score_topk_decode_ragged(
+                q_fp8,
+                weights,
+                block_tables,
+                n_committed_per_seq_gpu,
+                ragged_lens,
+                int(attn_md.dspark_full_q),
+                topk,
+            )
+
+        # NOTE: derive the query batch size from the ACTUAL number of query
+        # tokens, NOT from block_tables.size(0). Under TBO the per-ubatch
+        # block_tables / n_committed are padded to a DP-unified bucket and will
+        # get errors if we try to use the padded rows.
+        next_n = max(1, int(attn_md.max_seqlen_q))
+        bs = total_tokens // next_n
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
         q_4d = q_fp8.view(
@@ -1405,6 +1643,105 @@ class Indexer(nn.Module):
         )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
+    def _score_topk_decode_ragged(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        n_committed_per_seq_gpu: torch.Tensor,  # int32 [bs]
+        ragged_lens: torch.Tensor,  # int32 [bs] — per-seq len_i (= ell_i+1)
+        full_q: int,  # full draft span width (mtp_k + 1)
+        topk: int,
+    ) -> torch.Tensor:
+        """RAGGED decode indexer via pad-to-rectangle + gather (paper §5.2).
+
+        EAGER-ONLY: this per-seq ragged path runs only under --enforce-eager. The
+        CUDAGraph path uses a rectangular (uniform q_eff) decode layout (see
+        `_dspark_apply_ragged`'s graph branch), so under graph the indexer takes
+        the plain `_score_topk_decode` and never reaches here. True per-seq flat
+        under graph is a follow-up.
+
+        The decode indexer kernel is rectangular-only (see `_score_topk_decode`).
+        We scatter the ragged Q/weights into a [bs, full_q] rectangle at each
+        token's original in-span slot j, run the kernel at next_n=full_q, then
+        gather each seq's first len_i rows back. Numerically identical to a
+        regular rectangular decode (the causal bound lines up because ragged
+        positions are span-head-anchored and slot j == pid_next_n). Padding rows
+        carry zero Q; their logits are computed but never gathered.
+        """
+        device = q_fp8.device
+        total_tokens = q_fp8.size(0)
+        bs = int(ragged_lens.shape[0])
+        H, D = self.n_heads, self.head_dim
+        R = bs * full_q  # padded rectangle rows (fixed per (bs, full_q) graph)
+
+        # CUDAGraph-SAFE pad-to-rectangle. RIGHT-ALIGN: token j of seq i goes to
+        # row i*full_q + (full_q-len_i) + j, so a len_i seq fills the TAIL slots
+        # [full_q-len_i .. full_q-1] and sees ctx-len_i+j (matches the indexer's
+        # causal bound, identical to the rectangular path). dst is built without
+        # data-dependent-shape ops (repeat_interleave banned under CG); clamp the
+        # -1 pad ids to 0 here (redirected to the dump row below).
+        attn_md = get_forward_context().attn_metadata
+        bid_raw = attn_md.batch_id_per_token[:total_tokens].to(torch.int64)
+        bid = torch.clamp(bid_raw, min=0)  # [total_tokens]
+        lens_i64 = ragged_lens.to(torch.int64)
+        cu = torch.zeros(bs + 1, dtype=torch.int64, device=device)
+        torch.cumsum(lens_i64, dim=0, out=cu[1:])
+        tok_arange = torch.arange(total_tokens, device=device, dtype=torch.int64)
+        j_in_seq = tok_arange - cu[bid]  # in-span slot 0..len_i-1 (real tokens)
+        pad_i = full_q - lens_i64  # [bs] leading pad per seq (right-align)
+        dst = bid * full_q + pad_i[bid] + j_in_seq  # [total_tokens]
+        # Redirect CG tail-padding tokens (bid == -1) to a dedicated DUMP row R
+        # (one past the real rect) so they never clobber a real token's q. Fixed
+        # shape (total_tokens) → CG-safe; only rows [0:R] feed the kernel.
+        is_pad = bid_raw < 0
+        dst = torch.where(is_pad, torch.full_like(dst, R), dst)  # pad → row R
+        dst = torch.clamp(dst, 0, R)  # defensive: never OOB the [R+1] rect
+
+        # Zero the [R+1] rectangle (last row = pad dump), scatter all tokens.
+        q_rect = torch.zeros(R + 1, H, D, dtype=q_fp8.dtype, device=device)
+        w_rect = torch.zeros(R + 1, weights.size(1), dtype=weights.dtype, device=device)
+        q_rect[dst] = q_fp8
+        w_rect[dst] = weights
+        q_4d = q_rect[:R].view(bs, full_q, H, D)
+
+        kv_cache_4d = self.kv_cache.unsqueeze(-2)
+        # kernel operates on the real [R] rect (bs*full_q rows); the dump row R is
+        # only a scatter sink, excluded from the kernel + topk.
+        logits = torch.empty(
+            R, self._max_model_len_idx, dtype=torch.float32, device=device
+        )
+        deepgemm_fp8_paged_mqa_logits(
+            q_4d,
+            kv_cache_4d,
+            w_rect[:R],
+            logits,
+            n_committed_per_seq_gpu,
+            block_tables,
+            self._max_model_len_idx,
+            KVBlockSize=self.kv_cache.size(1),
+            Preshuffle=True,
+        )
+        # topk_rect has R+1 rows: [0:R] real, row R is the pad dump so that
+        # gather with dst∈{..,R} stays in-bounds. Fill row R with -1 sentinels
+        # (csa_translate_pack skips topk<0), the rest by the kernel.
+        topk_rect = torch.full(
+            (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
+        )
+        top_k_per_row_decode(
+            logits,
+            full_q,
+            n_committed_per_seq_gpu,
+            topk_rect[:R],
+            R,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        # Gather each seq's real rows back to the ragged [total_tokens] layout.
+        # Pad tokens (dst==R) read the -1 sentinel row → harmless downstream.
+        return topk_rect[dst]  # [total_tokens, index_topk] int32, seq-local
+
 
 # ---------------------------------------------------------------------------
 # Stubs — implementations land in tasks #5-#8
@@ -1437,7 +1774,7 @@ class DeepseekV4Attention(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        compress_stream: Optional[torch.cuda.Stream] = None,
+        indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -1519,6 +1856,9 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
+        # Cached at construction (non-compiled) so `_attn_post` — now traced into
+        # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
+        self._is_gfx1250 = get_gfx() == "gfx1250"
 
         # ----- Compressor (and Indexer for CSA) -----
         if self.compress_ratio:
@@ -1592,7 +1932,7 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
         self.alt_stream = alt_stream
-        self.compress_stream = compress_stream
+        self.indexer_stream = indexer_stream
         self._use_async_compress = (
             self.alt_stream is not None and self.compressor is not None
         )
@@ -1600,6 +1940,12 @@ class DeepseekV4Attention(nn.Module):
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
+        # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
+        # native 2buff fp8 path (compute-only 2buff quant, op4 fp8 prefill, op5
+        # asm decode). Dynamo specializes on this constant so the bf16 path
+        # traces unchanged. The rope buffers (swa_kv_rope / unified_kv_rope) are
+        # bound onto the module by DeepseekV4AttentionMetadataBuilder.
+        self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
 
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
@@ -1658,18 +2004,22 @@ class DeepseekV4Attention(nn.Module):
         """Fire Compressor(s) on side streams, return immediately.
 
         Main Compressor → alt_stream (CSA + HCA).
-        Indexer Compressor → compress_stream (CSA only).
+        Indexer Compressor → indexer_stream (CSA only).
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
         fc = get_forward_context()
         current_stream = fc.main_stream
-        use_async_compress = self._use_async_compress and fc.in_hipgraph
+        from atom.utils.tbo.ubatching import tbo_active
+
+        use_async_compress = (
+            self._use_async_compress and fc.in_hipgraph and not tbo_active()
+        )
         has_compressor = self.compressor is not None
         has_indexer = self.indexer is not None and not self.skip_topk
         if use_async_compress:
             if has_compressor:
                 self.alt_stream.wait_stream(current_stream)
             if has_indexer:
-                self.compress_stream.wait_stream(current_stream)
+                self.indexer_stream.wait_stream(current_stream)
 
             if has_compressor:
                 with torch.cuda.stream(self.alt_stream):
@@ -1680,7 +2030,7 @@ class DeepseekV4Attention(nn.Module):
                         block_tables=block_tables,
                     )
             if has_indexer:
-                with torch.cuda.stream(self.compress_stream):
+                with torch.cuda.stream(self.indexer_stream):
                     self.indexer.compressor(
                         x,
                         plan=plan,
@@ -1709,7 +2059,90 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # Split-op granularity depends on the cudagraph mode
+        #  - PIECEWISE cudagraph -> NARROW split attention
+        #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
+        #  for torch compile.
+        cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+        if cg_mode is not None and cg_mode.requires_piecewise_compilation():
+            q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights = self._attn_pre(
+                x, positions
+            )
+            o = torch.ops.aiter.v4_core_attention(
+                x,
+                q,
+                kv_pre,
+                qr,
+                qr_scale,
+                positions,
+                idx_q_fp8,
+                idx_weights,
+                self.layer_name,
+            )
+            return self._attn_post(o)
         return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
+
+    def _attn_pre(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        run_indexer_proj: bool = True,
+    ):
+        """Q/KV (+ optional indexer input) projections (graphable, num_tokens).
+
+        Shared by both attention paths:
+          - PIECEWISE (narrow split): run_indexer_proj=True — the indexer Q/weights
+            projection is compiled into the graphed piece here; the eager core
+            then only does the paged score/top-k via `score_topk_from`.
+          - FULL (wide split): run_indexer_proj=False — the legacy `forward_impl`
+            keeps the indexer's `forward_batched` inline in the core (unchanged
+            ordering), so no indexer projection happens here.
+
+        Returns (q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights); the last two
+        are None when run_indexer_proj is False or the layer has no indexer.
+        """
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        if _V4_FORCE_UE8M0_QUANT:
+            x = x.clone()
+            act_quant_inplace(x, 128, "ue8m0")
+        qkv_a = self.wqkv_a(x)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
+        q = self.wq_b(qr, x_scale=qr_scale)
+        # Indexer Q/weights projection (no paged access) -> graphed piece.
+        idx_q_fp8 = idx_weights = None
+        if run_indexer_proj and self.indexer is not None and not self.skip_topk:
+            idx_q_fp8, idx_weights = self.indexer.forward_pre(
+                x, qr, positions, qr_scale
+            )
+        return q, kv_pre, qr, qr_scale, x, idx_q_fp8, idx_weights
+
+    @mark_trace
+    def _wo_a_grouped_lora(self, o: torch.Tensor, prefix: str = "") -> torch.Tensor:
+        num_tokens = o.size(0)
+        o = o.view(num_tokens, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        if num_tokens <= 32 or self._is_gfx1250:
+            y = torch.empty(
+                num_tokens,
+                self.n_local_groups,
+                self.o_lora_rank,
+                dtype=o.dtype,
+                device=o.device,
+            ).transpose(0, 1)
+            y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
+            return y.transpose(0, 1)
+        return torch.einsum("sgd,grd->sgr", o, wo_a)
+
+    def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
+        """Grouped output LoRA + wo_b (graphable, num_tokens-shaped)."""
+        o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
+        return self.wo_b(o.flatten(1))
 
     def forward_impl(
         self,
@@ -1724,6 +2157,84 @@ class DeepseekV4Attention(nn.Module):
         per-seq slot + block_table from the V4 attention builder's metadata.
         Per-seq slicing uses `cu_seqlens_q` from `forward_context`.
         """
+        # FULL / legacy wide-split path. Compose the shared helpers in the
+        # ORIGINAL order so behaviour is byte-equivalent to the pre-refactor
+        # inline body: launch the compressor BEFORE the Q/KV projections (to
+        # overlap on the side stream), run the projections (indexer projection
+        # stays inline in the core via forward_batched, so run_indexer_proj=
+        # False here), then the paged core, then the output LoRA.
+        fc = get_forward_context()
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return torch.zeros_like(x)
+
+        # Experimental UE8M0 input round-trip BEFORE the compressor sees x, to
+        # match the legacy inline ordering (dead path: default off + asserted off
+        # under fused q_norm quant, but kept ordered for byte-equivalence).
+        if _V4_FORCE_UE8M0_QUANT:
+            x = x.clone()
+            act_quant_inplace(x, 128, "ue8m0")
+
+        # Metadata + compressor launch (must precede projections for overlap).
+        ratio = self.compress_ratio
+        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
+        plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
+        self.maybe_compressors_async(
+            x,
+            plan_for_layer,
+            attn_md.state_slot_mapping,
+            attn_md.block_tables,
+        )
+
+        # Q/KV projections (indexer projection deferred to the core's inline
+        # forward_batched -> run_indexer_proj=False). x already UE8M0-quantised
+        # above, so _attn_pre must NOT re-quantise -> its guard is a no-op here
+        # because we pass the already-processed x (the flag re-clones, harmless
+        # on the dead path, but we rely on the assert keeping this off anyway).
+        q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w = self._attn_pre(
+            x, positions, run_indexer_proj=False
+        )
+        # Paged attention core (compressor already launched above).
+        o = self._attn_core(
+            x,
+            q,
+            kv_pre,
+            qr,
+            qr_scale,
+            positions,
+            idx_q_fp8=None,
+            idx_weights=None,
+            compressor_already_launched=True,
+        )
+        # Output LoRA + wo_b.
+        return self._attn_post(o)
+
+    def _attn_core(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+        q: torch.Tensor,  # [num_tokens, n_heads*head_dim]  from wq_b
+        kv_pre: torch.Tensor,  # [num_tokens, head_dim]  KV latent (pre-norm/rope)
+        qr: torch.Tensor,  # [num_tokens, q_lora_rank] FP8  q RMSNorm out (for indexer)
+        qr_scale: torch.Tensor,  # qr FP8 scale
+        positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+        idx_q_fp8: Optional[torch.Tensor] = None,  # indexer q_fp8 (from _attn_pre)
+        idx_weights: Optional[torch.Tensor] = None,  # indexer weights (from _attn_pre)
+        compressor_already_launched: bool = False,
+    ) -> torch.Tensor:  # [num_tokens, n_local_heads*head_dim]  flat attn output
+        """Paged/dynamic attention core — SINGLE source of the paged attention
+        body, shared by both the PIECEWISE narrow-split op and the FULL/legacy
+        `forward_impl`. The two paths differ only in the compressor launch timing
+        and the indexer projection site, both parameterised here:
+
+        - `compressor_already_launched`: FULL launches the compressor BEFORE the
+          Q/KV projections (in `forward_impl`, to overlap with them — unchanged
+          legacy ordering) and passes True so we don't relaunch. PIECEWISE passes
+          False and launches here (its projections are in a separate captured
+          piece, and side-stream alloc can't happen during capture anyway).
+        - `idx_q_fp8`/`idx_weights`: if provided (PIECEWISE, projected in
+          `_attn_pre`), the indexer runs only its paged score/top-k via
+          `score_topk_from`; if None (FULL), the indexer's `forward_batched`
+          projects + scores inline here (unchanged legacy path).
+        """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
@@ -1734,12 +2245,13 @@ class DeepseekV4Attention(nn.Module):
         # on a real fwd. swa_write / Compressor / Indexer are also skipped to
         # avoid touching unbound state caches.
         fc = get_forward_context()
-        if fc.context.is_dummy_run:
-            return torch.zeros_like(x)
-        if os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            return torch.zeros_like(x)
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return x.new_zeros((x.shape[0], self.n_local_heads * self.head_dim))
         num_tokens = x.size(0)
-        cache_size = self.swa_kv.shape[1]
+        # paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
+        # content-addressed region; block_size (not a ring cache_size) is the
+        # paging stride.
+        swa_block_size = self.swa_block_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
@@ -1752,30 +2264,26 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
+        # paged-SWA: swa_write targets the separate SWA pool via
+        # swa_block_tables (always populated for V4).
+        swa_block_tables_gpu = attn_md.swa_block_tables
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 
-        # ----- Batched ops on full flat tensors -----
-        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
-        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
-        # quantization. EXPERIMENT only.
-        if _V4_FORCE_UE8M0_QUANT:
-            x = x.clone()
-            act_quant_inplace(x, 128, "ue8m0")
+        # ===== Compressor launch =====
+        # FULL already launched it before the projections (overlap); PIECEWISE
+        # launches here. maybe_compressors_async runs single-stream anyway when a
+        # cudagraph is capturing (side-stream alloc breaks capture).
+        if compressor_already_launched:
+            from atom.utils.tbo.ubatching import tbo_active
 
-        # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
-        use_async_compress = self.maybe_compressors_async(
-            x, plan_for_layer, state_slot_mapping, block_tables_gpu
-        )
-
-        # ----- Q/KV projections (main stream) -----
-        qkv_a = self.wqkv_a(x)
-        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        assert (
-            not _V4_FORCE_UE8M0_QUANT
-        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
-        qr, qr_scale = self.q_norm(q_lora)
-        q = self.wq_b(qr, x_scale=qr_scale)
+            use_async_compress = (
+                self._use_async_compress and fc.in_hipgraph and not tbo_active()
+            )
+        else:
+            use_async_compress = self.maybe_compressors_async(
+                x, plan_for_layer, state_slot_mapping, block_tables_gpu
+            )
         is_decode = attn_md.state is AttnState.DECODE
         # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
         # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
@@ -1784,7 +2292,47 @@ class DeepseekV4Attention(nn.Module):
         # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
         # Optional FP8 quant outputs left off — downstream sparse_attn /
         # swa_write are still bf16.
-        q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
+        # Decode folds the SWA cache-write into qk_norm_rope_maybe_quant: the
+        # post-norm/rope KV row is written into swa_kv[slot, pos%cache, :]
+        # (slot = state_slot_mapping[batch_id_per_token[t]]). The flydsl path
+        # fuses it into the kernel launch; the Triton fallback emits a separate
+        # swa_write internally — either way the bridge owns the SWA write, so
+        # no backend dispatch is needed here. Prefill writes its in-chunk SWA
+        # tail after sparse_attn, so it passes swa_kv=None and never fuses.
+        # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
+        # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
+        # covers exactly the tokens the old standalone swa_write did.
+        # paged-SWA: do NOT fuse the SWA write into qk_norm_rope_maybe_quant.
+        # The fused (flydsl, aiter) path scatters into a per-request ring
+        # (swa_kv[slot, pos%cache]); paged content-addressing needs the
+        # block_tables-based swa_write below instead. Pass swa_kv=None so neither
+        # the flydsl nor the Triton-fallback fused write fires.
+        # Decode FUSES the paged (content-addressed) SWA cache-write into the
+        # qk_norm_rope launch via swa_block_tables — this drops a separate
+        # _swa_write_kernel launch per layer (profiling showed the standalone
+        # write + its 11k launches were the paged-SWA decode overhead vs the
+        # old ring-fused path). The flydsl kernel writes
+        #   swa_kv[block_tables[bid, pos//bs]*bs + pos%bs] = kv_out[t]
+        # for every token (gated on batch_id>=0), matching the standalone
+        # swa_write exactly. Decode has no ordering hazard (unlike prefill,
+        # which writes its in-chunk SWA tail AFTER sparse_attn so chunked
+        # prefix reads see prior-chunk contents), so writing here (before the
+        # decode attention reads the window) is safe. Prefill → swa_kv=None,
+        # separate post-attn swa_write below.
+        # Fused per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE,
+        # dispatching on the kv-cache layout inside the wrapper (fp8 2buff ↔ bf16)
+        # so this call site is branch-free. Decode FUSES the paged
+        # (content-addressed) SWA cache-write into the launch via swa_block_tables
+        # (bf16: flydsl swa_kv; fp8: aiter swa_nope/rope buffers — each K row
+        # scattered into its SWA pool, batch_id<0 skips CG-pad), running before the
+        # decode attention reads the window (no ordering hazard). Prefill passes
+        # swa_*=None and scatters its window tail post-attn below.
+        #
+        # bf16 → qkn.q_sa / qkn.kv populated; fp8 2buff → qkn.q_packed / qkn.q_rope
+        # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
+        # rope-bf16 [.,64] that op4 (prefill) / op5 (decode) consume with no
+        # requant). The inactive path's fields stay None.
+        qkn = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
             self.kv_norm.weight,
@@ -1797,21 +2345,21 @@ class DeepseekV4Attention(nn.Module):
             self.eps,
             quant_q=False,
             quant_k=False,
+            fp8_2buff=self.kv_fp8,
+            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_block_tables=swa_block_tables_gpu if is_decode else None,
+            swa_block_size=swa_block_size if is_decode else None,
+            # bf16 SWA fusion (flydsl kernel / Triton fallback):
+            swa_kv=self.swa_kv if (is_decode and not self.kv_fp8) else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
+            swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
+            # fp8 2buff SWA fusion (aiter group-quant launch):
+            swa_nope_scale_buff=self.swa_kv if (is_decode and self.kv_fp8) else None,
+            swa_rope_buff=self.swa_kv_rope if (is_decode and self.kv_fp8) else None,
+            prefix=f"{self.layer_name}.qk_norm_rope_maybe_quant",
         )
-        if is_decode:
-            # SWA write per-token in decode (prefill writes after sparse_attn
-            # below so the in-chunk SWA tail is captured post-attention).
-            swa_write(
-                kv,
-                positions,
-                attn_md.cu_seqlens_q,
-                state_slot_mapping,
-                self.swa_kv,
-                cache_size,
-                min(attn_md.max_seqlen_q, cache_size),
-            )
-        if _V4_USE_REF_QUANT:
-            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+        if _V4_USE_REF_QUANT and not self.kv_fp8:
+            act_quant_inplace(qkn.kv[..., :-rd], 64, self.scale_fmt)
 
         # HCA
         if use_async_compress:
@@ -1819,20 +2367,22 @@ class DeepseekV4Attention(nn.Module):
             if self.compressor is not None:
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
-                current_stream.wait_stream(self.compress_stream)
+                current_stream.wait_stream(self.indexer_stream)
         # ===== Compressor + Indexer =====
+        # `topk` reuses the Q/weights projected in `_attn_pre` (graphed piece)
+        # when passed, else projects inline (FULL/legacy) — same result, only the
+        # split site differs. Then translate the seq-local top-k → physical paged
+        # offsets into the active CSA buffer (`_fill_csa_paged_compress`
+        # dispatches on decode vs prefill).
         if self.indexer is not None and not self.skip_topk:
-            indexer_topk_batched = self.indexer.forward_batched(
-                x_full=x,
-                qr_full=qr,
-                qr_full_scale=qr_scale,
-                positions=positions,
+            indexer_topk_batched = self.indexer.topk(
+                x,
+                qr,
+                positions,
+                qr_scale,
+                pre_q_fp8=idx_q_fp8,
+                pre_weights=idx_weights,
             )
-            # Translate seq-local topk → physical paged offsets and write into
-            # the CSA section of either:
-            #   - decode buffer `kv_indices_csa` (state is DECODE)
-            #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
-            # `_fill_csa_paged_compress` dispatches internally on state.
             self._fill_csa_paged_compress(
                 attn_md, indexer_topk_batched, positions, num_tokens
             )
@@ -1853,18 +2403,68 @@ class DeepseekV4Attention(nn.Module):
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
+            # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
+            # (unified_kv_rope set) → aiter asm op5 with pre-packed fp8 Q + the
+            # 2buff fp8/bf16 pools read with no requant; bf16 (unified_kv_rope
             o = sparse_attn_v4_paged_decode(
-                q_sa,
+                qkn.q_sa,
                 self.unified_kv,
                 kv_indices,
                 kv_indptr,
                 self.attn_sink,
                 self.softmax_scale,
+                unified_kv_rope=self.unified_kv_rope,
+                q_packed_in=qkn.q_packed,
+                q_rope_in=qkn.q_rope,
+                qo_indptr=attn_md.qo_indptr,
+                prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
             # buffer with SWA history + compress section), extend from per-fwd
             # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
+            #
+            # ===== PCP (full-KV) =====
+            # Under PCP the model.forward entry round-robin-split x/positions to 1/W,
+            # so `q_sa` and `kv` here are this rank's 1/W shard. The per-query
+            # metadata (kv_indptr/indices_*, indexer_meta) was already reduced
+            # to this rank's owned queries in the builder (_apply_pcp_reindex),
+            # so `q_sa` + those indices are aligned and used as-is. The only
+            # runtime fixups here are on the actual K/V data:
+            #   - swa_write must write the FULL sequence SWA ring (every PCP
+            #     rank keeps full KV), and
+            #   - sparse_attn's extend source must be the FULL `kv` so each 1/W
+            #     query can attend the whole in-chunk SWA window.
+            # So all-gather `kv` back to full order; positions/cu_seqlens_q/
+            # state_slot_mapping for the SWA write stay full (cu_seqlens_q /
+            # state_slot_mapping are per-seq, never split; positions_full comes
+            # from the forward context which holds the pre-split copy).
+            pcp_on = _pcp_active()
+            if pcp_on:
+                pcp_ws = get_pcp_world_size()
+                from atom.utils.tbo.ubatching import (
+                    tbo_active as _tbo_active_attn,
+                    tbo_yield_and_switch_from_compute_to_comm,
+                    tbo_switch_to_compute_sync,
+                )
+
+                _tbo_attn = _tbo_active_attn()
+                if _tbo_attn:
+                    tbo_yield_and_switch_from_compute_to_comm()
+                kv_full = pcp_allgather_rerange(qkn.kv, pcp_ws)
+                # positions must match kv_full's full-sequence coords for the
+                # swa_write ring addressing (`positions[src] % cache_size`).
+                # `positions` here is this rank's 1/W shard (split in
+                # ForCausalLM.forward); all-gather it back to full order with
+                # the same rerange used for kv (NOT fc.context.positions, which
+                # the builder reindexed to 1/W).
+                positions_full = pcp_allgather_rerange(positions, pcp_ws)
+                if _tbo_attn:
+                    tbo_switch_to_compute_sync()
+            else:
+                kv_full = qkn.kv
+                positions_full = positions
+
             if ratio == 0:
                 kv_indices_prefix = attn_md.kv_indices_prefix_swa
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_swa
@@ -1876,39 +2476,76 @@ class DeepseekV4Attention(nn.Module):
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_hca
             else:
                 raise ValueError(f"Unsupported compress_ratio {ratio}")
+            # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
+            # (unified_kv_rope set) → aiter op4 with the 2buff fp8 prefix pool
+            # (nope-fp8 + rope-bf16) + op-quantized fp8 Q and extend K, no dequant
+            # of the prefix and no torch quant; bf16 → OPUS / Triton over q_sa and
+            # the bf16 extend kv_full. (fp8 + PCP is out of scope: k_packed/k_rope
+            # are this fwd's shard, NOT PCP all-gathered like kv_full.) On bf16 the
+            # wrapper reuses out=qkn.q_sa as the attention output buffer (q_sa is
+            # not needed after this call → avoids an extra empty_like); fp8 ignores
+            # both q_sa and out.
             o = sparse_attn_v4_paged_prefill(
-                q_sa,
+                qkn.q_sa,
                 self.unified_kv,
                 kv_indices_prefix,
                 kv_indptr_prefix,
-                kv,
+                kv_full,
                 attn_md.kv_indices_extend,
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
-            )  # [S, H, head_dim]
-            # swa_write AFTER attn so chunked-prefill prefix SWA reads see
-            # prior-chunk's ring contents (current swa_write would overwrite
-            # ring slots `pos % cache_size` for positions in this chunk's tail).
+                # Reuse q_sa as the attention output buffer; q_sa is not needed
+                # after this call and this avoids an extra empty_like allocation.
+                out=qkn.q_sa,
+                unified_kv_rope=self.unified_kv_rope,
+                q_packed=qkn.q_packed,
+                q_rope=qkn.q_rope,
+                k_packed=qkn.k_packed,
+                k_rope=qkn.k_rope,
+                prefix=f"{self.layer_name}.sparse_attn_prefill",
+            )  # [S, H, head_dim] bf16
+            # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
+            # prior chunk's contents (not this chunk's just-computed tail).
+            # OPT (window-only prefill write): only write each seq's trailing
+            # `window_size` tokens (not the whole chunk). SWA decode only ever
+            # reads the last `window` tokens, so this is correct for the seq's
+            # own decode; it drops cross-request prefix reuse of the middle SWA
+            # blocks. Cuts prefill scatter-writes ~ chunk_len/window (e.g. 64x
+            # at in8192) — kills the uncoalesced block_tables scatter that made
+            # concurrent prefill slow. Correct for single- AND multi-chunk:
+            # window(128) <= chunk size, so any token's window reaches back at
+            # most 127 tokens = within the prior chunk's written last-128;
+            # free_after_prefill_chunk keeps that trailing block until read.
+            # Dispatch on kv-cache layout inside the wrapper (swa_region_rope set
+            # → fp8 2buff path, which scatters the op-quantized extend K
+            # (k_packed/k_rope) into both paged SWA pools; else bf16 single-pool
+            # write over kv_full). Both are window-only (same trailing-window
+            # semantics). fp8 uses this fwd's shard, no PCP — positions_full ==
+            # positions when PCP off, and kv_full is None on fp8.
             swa_write(
-                kv,
-                positions,
+                kv_full,
+                positions_full,
                 attn_md.cu_seqlens_q,
-                state_slot_mapping,
+                swa_block_tables_gpu,
                 self.swa_kv,
-                cache_size,
-                min(attn_md.max_seqlen_q, cache_size),
+                swa_block_size,
+                min(self.window_size, attn_md.max_seqlen_q),
+                k_packed=qkn.k_packed,
+                k_rope=qkn.k_rope,
+                swa_region_rope=self.swa_kv_rope,
+                prefix=f"{self.layer_name}.swa_write",
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
-        self.rotary_emb.inverse(positions, o[..., -rd:])
-        # ----- Grouped output LoRA (batched on the full flat tensor) -----
-        o = o.view(num_tokens, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        x = self.wo_b(o.flatten(1))
-        return x
+        self.rotary_emb.inverse(
+            positions,
+            o[..., -rd:],
+            prefix=f"{self.layer_name}.inverse_rope",
+        )
+        # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
+        return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
     def _fill_csa_paged_compress(
         self,
@@ -1985,6 +2622,7 @@ class DeepseekV4Attention(nn.Module):
             swa_pages=attn_md.swa_pages,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
+            prefix=f"{self.layer_name}.csa_translate_pack",
         )
 
 
@@ -2076,10 +2714,12 @@ class MoE(nn.Module):
     `FusedMoE.select_experts(scoring_func="sqrtsoftplus", e_score_correction_bias=...)`,
     which we extended in atom/model_ops/moe.py to add the V4 path.
 
-    Hash routing for `layer_id < n_hash_layers` (first 3 V4 layers) is NOT yet
-    wired through FusedMoE — the `tid2eid` buffer is declared so weight loading
-    completes, but inference uses the standard sqrtsoftplus path. Hash layers
-    will produce incorrect routing; correct hash routing lands in PR3+.
+    Hash routing for `layer_id < n_hash_layers` (first 3 V4 layers) is wired
+    through FusedMoE via the `custom_routing_function` hook: hash layers load a
+    `tid2eid` table (token-id -> expert-id) instead of `gate.bias`, and
+    `select_experts` gives `custom_routing_function` precedence over the
+    standard sqrtsoftplus path. Expert *selection* comes from `tid2eid[input_ids]`
+    while expert *weights* still use sqrtsoftplus(gate_logits). Accuracy verified.
     """
 
     def __init__(
@@ -2148,6 +2788,7 @@ class MoE(nn.Module):
             top_k=self.n_activated_experts,
             hidden_size=self.dim,
             intermediate_size=args.moe_inter_dim,
+            layer_id=self.layer_id,
             reduce_results=False,
             renormalize=True,
             quant_config=qc,
@@ -2157,6 +2798,9 @@ class MoE(nn.Module):
             e_score_correction_bias=getattr(self.gate, "e_score_correction_bias", None),
             config=moe_cfg,
             shared_expert_prefix=f"{prefix}.shared_experts",
+            # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
+            # default) to avoid padding the MoE intermediate up to 512.
+            pad_align=128,
         )
         self.experts.swiglu_limit = args.swiglu_limit
 
@@ -2188,9 +2832,13 @@ class MoE(nn.Module):
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
         )
-        if self._use_dual_stream:
-            # Register self in static_forward_context so the custom op
-            # dispatcher can look us up by `layer_name` (= self.prefix).
+        # Register self in static_forward_context so the custom op dispatcher
+        # can look us up by `layer_name` (= self.prefix). Needed by
+        # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
+        # — the latter requires registration regardless of
+        # dual-stream, so register whenever either consumer is active.
+        _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
+        if self._use_dual_stream or _pcp_merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -2214,26 +2862,17 @@ class MoE(nn.Module):
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
         num_tokens = gating_output.shape[0]
-        ids = ids[:num_tokens].clamp(0, self.gate.tid2eid.shape[0] - 1)
-        topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
-        scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
-        topk_weights = scores.gather(dim=-1, index=topk_ids.long())
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
+        assert (
+            ids.shape[0] == num_tokens
+        ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        tid2eid = self.gate.tid2eid
 
-        # Fused shared expert: the custom_routing_function path in
-        # `select_experts` (moe.py:3055) returns early and bypasses the
-        # sqrtsoftplus fused-shared branch (moe.py:3108). Without this block the
-        # returned topk_ids are [N, top_k] with ids in 0..n_routed-1 only — the
-        # shared expert (slot n_routed_experts) never appears, so moe_sorting
-        # assigns it no tokens and its contribution (≈40% of the layer output)
-        # is silently dropped. Replicate the shared-col append: write the routed
-        # weights/ids into the first `top_k` columns of the global topK buffer
-        # and return the full [N, top_k + n_shared] view (last cols pre-filled
-        # with shared id = n_routed_experts and weight = shared_experts_score).
+        # Fused-shared expert: the custom_routing_function path bypasses
+        # select_experts' shared-expert append, so the shared expert (slot
+        # n_routed_experts) would never be routed and its ~40% contribution
+        # dropped. When shared is fused, write the routed result into the first
+        # `topk` columns of the global topK buffer (shared cols pre-filled) and
+        # return the full [N, topk + n_shared] view.
         num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
         if num_fused_shared > 0:
             import atom.model_ops.topK as _topK_mod
@@ -2243,12 +2882,33 @@ class MoE(nn.Module):
                 "init_aiter_topK_meta_data must run before hash-layer routing."
             )
             total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
-            n_tokens = topk_ids.shape[0]
-            assert total_topk_weights.shape[0] >= n_tokens
-            total_topk_ids[:n_tokens, :topk] = topk_ids
-            total_topk_weights[:n_tokens, :topk] = topk_weights
-            return total_topk_weights[:n_tokens], total_topk_ids[:n_tokens]
+            assert total_topk_weights.shape[0] >= num_tokens
+            hash_topk_triton(
+                ids,
+                gating_output,
+                tid2eid,
+                renormalize,
+                self.routed_scaling_factor,
+                total_topk_ids[:num_tokens, :topk],
+                total_topk_weights[:num_tokens, :topk],
+            )
+            return total_topk_weights[:num_tokens], total_topk_ids[:num_tokens]
 
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        hash_topk_triton(
+            ids,
+            gating_output,
+            tid2eid,
+            renormalize,
+            self.routed_scaling_factor,
+            topk_ids,
+            topk_weights,
+        )
         return topk_weights, topk_ids
 
     def routed_expert_forward(
@@ -2279,24 +2939,37 @@ class MoE(nn.Module):
             sizes = ctx.dp_metadata.get_sizes_across_dp()
             ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
         else:
-            from atom.model_ops.moe import pad_for_all_gather
+            from atom.model_ops.moe import all_gather_with_padding
 
-            ids_2d, _ = pad_for_all_gather(ids_2d)
-            ids_2d = get_dp_group().all_gather(ids_2d, use_custom=False, dim=0)
+            ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
         return ids_2d.flatten()
 
+    @mark_trace
     def combine_outputs(
         self,
         routed: torch.Tensor,  # [num_tokens, dim]
         shared: Optional[torch.Tensor],  # [num_tokens, dim] or None
+        prefix: str = "",
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Add shared-expert contribution (when not fused into routed) and
         all-reduce across TP ranks.
         """
         if shared is not None:
+            # PCP with ATOM_PCP_MOE_MERGE=1 (non-fused shared only): the shared expert
+            # is NOT pcp-sharded (its MergedColumn/RowParallelLinear bind to the
+            # 4-card tp group, so every pcp rank holds the same shared weights
+            # and computes the same full shared output — pcp-redundant). After
+            # this combine the result rides through Block.forward's pcp
+            # reduce_scatter, which SUMS the pcp partners. Without correction the
+            # shared part would be summed pcp_size times (doubled for pcp=2). So
+            # pre-scale shared by 1/pcp_size: the reduce_scatter then RESTORES it
+            # to 1x instead of multiplying. routed is genuinely pcp-sharded
+            # (partial sum) so it must NOT be scaled — only shared.
+            if _moe_pcp_merge_active() or _moe_pcp_merge_decode_active():
+                shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
-            routed = _run_on_tbo_comm_stream(tensor_model_parallel_all_reduce, routed)
+            routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
     def single_stream_moe_forward(
@@ -2305,7 +2978,9 @@ class MoE(nn.Module):
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         routed = self.routed_expert_forward(x)
-        return self.combine_outputs(routed, shared)
+        return self.combine_outputs(
+            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+        )
 
     def dual_stream_moe_forward(
         self, x: torch.Tensor  # [num_tokens, dim]
@@ -2319,9 +2994,11 @@ class MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
-            shared = self.shared_experts(x)
+            shared = self.shared_experts.forward(x)
         current_stream.wait_stream(self.alt_stream)
-        return self.combine_outputs(routed, shared)
+        return self.combine_outputs(
+            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+        )
 
     def forward(
         self,
@@ -2371,9 +3048,10 @@ class Block(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        compress_stream: Optional[torch.cuda.Stream] = None,
+        indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.prefix = prefix
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.attn = DeepseekV4Attention(
@@ -2381,9 +3059,12 @@ class Block(nn.Module):
             args,
             prefix=f"{prefix}.attn",
             alt_stream=alt_stream,
-            compress_stream=compress_stream,
+            indexer_stream=indexer_stream,
         )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
+        self._moe_merge_enabled = get_pcp_world_size() > 1 and bool(
+            envs.ATOM_PCP_MOE_MERGE
+        )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -2513,6 +3194,60 @@ class Block(nn.Module):
         )
         return y.type_as(x)
 
+    @mark_trace
+    def mhc_fused_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+        prefix: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._mhc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            float(self.norm_eps),
+            float(self.hc_eps),
+            float(self.hc_eps),
+            self.HC_POST_MULT,
+            int(self.hc_sinkhorn_iters),
+            norm_weight,
+            norm_eps,
+        )
+
+    @mark_trace
+    def mhc_post_pre(
+        self,
+        x: Optional[torch.Tensor],
+        residual: torch.Tensor,
+        post: Optional[torch.Tensor],
+        comb: Optional[torch.Tensor],
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+        prefix: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if x is not None:
+            res = self.hc_post(x, residual, post, comb)
+        else:
+            res = residual
+        x, post, comb = self.hc_pre(
+            res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+        )
+        return x, post, comb, res
+
     def fuse_hc(
         self,
         hc_state: HCState,
@@ -2527,7 +3262,7 @@ class Block(nn.Module):
         comb = hc_state.comb_mix
         x = hc_state.x_prev
         if self.enable_fused_hc and x is not None:
-            post, comb, x, res = self._mhc_fused_post_pre(
+            post, comb, x, res = self.mhc_fused_post_pre(
                 x,
                 residual,
                 post,
@@ -2535,21 +3270,22 @@ class Block(nn.Module):
                 hc_fn,
                 hc_scale,
                 hc_base,
-                float(self.norm_eps),
-                float(self.hc_eps),
-                float(self.hc_eps),
-                self.HC_POST_MULT,
-                int(self.hc_sinkhorn_iters),
                 norm_weight,
                 norm_eps,
+                prefix=f"{self.prefix}.mhc_fused_post_pre",
             )
         else:
-            if x is not None:
-                res = self.hc_post(x, residual, post, comb)
-            else:
-                res = residual
-            x, post, comb = self.hc_pre(
-                res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            x, post, comb, res = self.mhc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                norm_eps,
+                prefix=f"{self.prefix}.mhc_post_pre",
             )
         return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
 
@@ -2579,9 +3315,12 @@ class Block(nn.Module):
             self.norm_eps,
         )
         x = hc_state.x_prev
-        x = self.ffn(
-            x
-        )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
+        if self._moe_merge_enabled:
+            x = torch.ops.aiter.moe_pcp_merge_forward(x, self.ffn.prefix)
+        else:
+            x = self.ffn(
+                x
+            )  # [num_tokens, dim]  (input_ids from forward_context for hash MoE)
         hc_state.x_prev = x
         return hc_state
 
@@ -2652,6 +3391,124 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
+def _run_moe(moe: "MoE", x: torch.Tensor) -> torch.Tensor:
+    """Replicate MoE.forward's dual/single dispatch (we are already inside an
+    opaque op, so call the underlying methods directly rather than re-entering
+    the maybe_dual_stream_forward custom op)."""
+    threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    num_tokens = x.shape[0]
+    if moe._use_dual_stream and 0 < num_tokens <= threshold:
+        return moe.dual_stream_moe_forward(x)
+    return moe.single_stream_moe_forward(x)
+
+
+def moe_pcp_merge_forward(
+    hidden_states: torch.Tensor,  # [n_local, dim]
+    layer_name: str,
+) -> torch.Tensor:  # [n_local, dim]  (shape-preserving)
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    # Gate is read EAGERLY here (op is opaque to Dynamo), so it is NEVER baked —
+    # keeping is_dummy_run in the gate is correct and NECESSARY: it keeps this op
+    # consistent with the out-of-graph split gate `_pcp_active()` (also has
+    # is_dummy). At warmup (is_dummy=True) neither splits nor merges, so x stays
+    # full and the hash-MoE input_ids (also un-split at warmup) match. Removing
+    # is_dummy here would merge a never-split warmup batch -> input_ids/hidden
+    # length mismatch -> crash. (The in-graph gate needed is_dummy *removed* to
+    # bake True into code0; the opaque op does NOT — opacity is the fix.)
+    do_prefill = _moe_pcp_merge_active()
+    do_decode = _moe_pcp_merge_decode_active()
+    ws = get_pcp_world_size()
+    x = hidden_states
+    if do_prefill:
+        from atom.utils.tbo.ubatching import (
+            tbo_active as _tbo_active,
+            tbo_yield_and_switch_from_compute_to_comm,
+            tbo_switch_to_compute_sync,
+        )
+
+        _tbo = _tbo_active()
+        # allgather: when TBO is active, yield to the partner ubatch so its
+        # compute overlaps this collective on the comm stream (P2 overlap).
+        if _tbo:
+            tbo_yield_and_switch_from_compute_to_comm()
+        x = pcp_allgather_rankmajor(x, ws)  # [1/W,dim] -> [full,dim]
+        if _tbo:
+            tbo_switch_to_compute_sync()
+    x = _run_moe(moe, x)
+    if do_prefill:
+        # reduce_scatter: same yield pattern.
+        if _tbo:
+            tbo_yield_and_switch_from_compute_to_comm()
+        x = pcp_reduce_scatter(x, ws)  # [full,dim] -> [1/W,dim]
+        if _tbo:
+            tbo_switch_to_compute_sync()
+    elif do_decode:
+        x = pcp_all_reduce(x)  # sum pcp half (decode tokens are pcp-redundant)
+    return x
+
+
+def _moe_pcp_merge_forward_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_pcp_merge_forward",
+    op_func=moe_pcp_merge_forward,
+    mutates_args=(),
+    fake_impl=_moe_pcp_merge_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _pcp_active() -> bool:
+    """Whether to apply PCP round-robin-split in this forward.
+
+    True only when pcp_size > 1 AND this is a real prefill forward (not decode,
+    not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
+    warmup dummy run has no valid KV cache so it must skip the split path.
+    """
+    if get_pcp_world_size() <= 1:
+        return False
+    fc = get_forward_context()
+    return fc.context.is_prefill and not fc.context.is_dummy_run
+
+
+def _moe_pcp_merge_active() -> bool:
+    """Whether PCP applies `attn with PCP -> all-gather hidden -> full before MoE,
+     slice back` after in this forward.
+
+    True only when this is a real PCP prefill (`_pcp_active`) AND the
+    `ATOM_PCP_MOE_MERGE` env is set. Mode A returns False: MoE runs on the
+    1/W shard with no extra comm.
+    """
+    if not _pcp_active():
+        return False
+    return bool(envs.ATOM_PCP_MOE_MERGE)
+
+
+def _moe_pcp_merge_decode_active() -> bool:
+    """moe_pcp_merge DECODE path: MoE weights are sharded W*tp ways (pcp folded
+    into tp at build time), but decode does NOT stripe-split tokens — every pcp
+    rank holds the same full batch. So decode skips gather/reduce_scatter and
+    instead does one pcp all_reduce after MoE to sum the pcp-half of the
+    intermediate that combine_outputs' tp all_reduce misses.
+
+    True only when pcp>1, ATOM_PCP_MOE_MERGE set, and this is a real DECODE forward
+    (not prefill — that's `_moe_pcp_merge_active` — and not dummy/warmup).
+    """
+    if get_pcp_world_size() <= 1:
+        return False
+    if not bool(envs.ATOM_PCP_MOE_MERGE):
+        return False
+    fc = get_forward_context()
+    return (not fc.context.is_prefill) and (not fc.context.is_dummy_run)
+
+
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     """Full model: embed -> expand to hc_mult copies -> N blocks -> hc_head -> logits.
@@ -2679,15 +3536,19 @@ class DeepseekV4Model(nn.Module):
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
         # directly. At TP>1 each rank holds vocab_size/tp rows.
-        self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
+        self.embed = VocabParallelEmbedding(
+            args.vocab_size,
+            args.dim,
+            prefix="embed",
+        )
         # alt_stream: dual-stream MoE (shared_experts // routed_experts) AND
-        # Main Compressor overlap. compress_stream: Indexer Compressor overlap.
+        # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
         # MoE in each block, so attn and MoE never contend for alt_stream.
         self.alt_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-        self.compress_stream: Optional[torch.cuda.Stream] = (
+        self.indexer_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = nn.ModuleList(
@@ -2697,7 +3558,7 @@ class DeepseekV4Model(nn.Module):
                     args,
                     prefix=f"layers.{layer_id}",
                     alt_stream=self.alt_stream,
-                    compress_stream=self.compress_stream,
+                    indexer_stream=self.indexer_stream,
                 )
                 for layer_id in range(args.n_layers)
             ]
@@ -2728,13 +3589,19 @@ class DeepseekV4Model(nn.Module):
         MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
+        # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
+        # split to this rank's 1/W shard (done in DeepseekV4ForCausalLM.forward,
+        # OUTSIDE the torch.compile boundary — keeping comms / dynamic padding
+        # out of the compiled graph). So everything here runs on the 1/W shard;
+        # the K/V all-gather inside attention reconstructs full KV per layer,
+        # and the final all-gather + un-pad happens back in the caller.
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
         for layer in self.layers:
-            hc_state = layer(hc_state, positions)  # [num_tokens, hc, dim]
+            hc_state = layer(hc_state, positions)
         h = self.layers[-1].hc_post(
             hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
         )
@@ -2853,19 +3720,103 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
+
+        # ===== PCP: round-robin-split the prefill sequence OUTSIDE torch.compile =====
+        # PCP splits the prefill query sequence across the PCP group (full-KV
+        # scheme). This must happen here in ForCausalLM.forward (NOT in the
+        # @support_torch_compile-wrapped DeepseekV4Model.forward) so the
+        # cross-rank all-gather + data-dependent padding stay out of the
+        # compiled graph (Dynamo mishandles comms / dynamic shapes -> shape
+        # desync). Mirrors SGLang, which does cp_round_robin on input_ids in
+        # the un-compiled ForCausalLM.forward. We pad tokens to a multiple of
+        # pcp_size (dummy tokens, zero-length KV in the builder metadata), then
+        # round-robin-split input_ids/positions to this rank's 1/W shard. The model
+        # runs entirely on 1/W; the final hidden is all-gathered + un-padded
+        # after self.model(...) returns.
+        use_pcp = _pcp_active()
+        # NOTE: moe_merge here is the OUT-OF-GRAPH gate, used only for the
+        # input_ids gather below (round-robin split + hash-MoE id alignment).
+        # The MoE merge collectives gate themselves separately inside the opaque
+        # moe_pcp_merge_forward custom op (called from Block.forward).
+        moe_merge = _moe_pcp_merge_active()
+        # PCP with ATOM_PCP_MOE_MERGE=1 (default) is incompatible with DP-attention
+        # id-gathering for now: both rewrite ctx.context.input_ids with different
+        # (full-PCP vs DP-gathered) token sets, and stacking them is unverified.
+        # Disallow until needed.
+        assert not (moe_merge and self._need_ids_gather), (
+            "PCP with ATOM_PCP_MOE_MERGE=1 (default) is not supported "
+            "together with DP-attention input-id gathering yet."
+        )
+        full_padded_ids = None
+        if use_pcp:
+            from atom.utils.tbo.ubatching import tbo_active as _tbo_active
+
+            pcp_size = get_pcp_world_size()
+            if _tbo_active():
+                # PCP+TBO prefill: the split was done upstream in run_model;
+                # input_ids is already 1/(2*pcp) tokens. full_padded_ids was
+                # precomputed there and stored in ctx.context.input_ids (carried
+                # into this ubatch context by _make_ubatch_context). Nothing to do.
+                pass
+            else:
+                n_global = input_ids.shape[0]
+                pad = pcp_pad_len(n_global, pcp_size) - n_global
+                if pad > 0:
+                    input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
+                    positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
+                input_ids = pcp_round_robin_split(input_ids, pcp_size)
+                positions = pcp_round_robin_split(positions, pcp_size)
+                # each Block rank-major all-gathers hidden before MoE
+                # (pcp_allgather_rankmajor = plain all_gather(dim=0), RANK-MAJOR
+                # order: [rank0's stripe | rank1's stripe | ...]). The hash MoE
+                # indexes input_ids per hidden row, so the ids must be gathered in
+                # the SAME rank-major order. pcp_allgather_rankmajor is int-safe
+                # (plain all_gather), so reuse it for the ids too.
+                if moe_merge:
+                    full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
+
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
-            # gate sees DP-gathered gating_output, so gather ids to match. This
-            # runs for every forward, including each TBO ubatch, which invokes
-            # this same forward with its own local slice + ubatch context.
-            # Route through the routing-side stream so the all-gather does not
-            # serialize behind the main compute stream during TBO ping-pong.
-            ctx.context.input_ids = _run_on_tbo_comm_stream(
-                MoE._gather_ids_for_dp, input_ids.flatten(), ctx
-            )
+            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # the gather INLINE on the compute stream. Running this all-gather on
+            # a side stream coordinated it with a DIFFERENT stream/sync than the
+            # MoE hidden/router DP gather under TBO → mismatched DP layouts →
+            # wrong V4 hash routing (GSM8K 0.95→0.87). NOTE: do NOT wrap this in
+            # the TBO ping-pong
+            # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
+            # desyncs the ping-pong ring and collapses accuracy to ~0.54
+            # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
+            # so inline costs ~nothing in overlap.
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
+        elif moe_merge:
+            if full_padded_ids is not None:
+                # Normal PCP path: set ids from the just-computed all-gather.
+                ctx.context.input_ids = full_padded_ids
+            else:
+                # PCP+TBO path: input_ids is the per-ubatch slice of local ids
+                # (set by _make_ubatch_context from run_model's local ids).
+                # Allgather across PCP ranks to get padded_total//2 ids,
+                # matching what moe_pcp_merge_forward allgathers for hidden states.
+                # Both PCP ranks call this at the same TBO ubatch phase → synchronized.
+                ctx.context.input_ids = pcp_allgather_rankmajor(
+                    input_ids.flatten(), pcp_size
+                )
         else:
             ctx.context.input_ids = input_ids
-        return self.model(input_ids, positions)
+        h = self.model(input_ids, positions)
+
+        # ----- PCP: all-gather shards, restore original order, drop pad -----
+        if use_pcp:
+            if _tbo_active():
+                # PCP+TBO: skip the all-gather here. Each ubatch returns its
+                # local (1/(2*pcp)) shard; run_model does a single
+                # pcp_allgather_rerange after UBatchWrapper cats both shards.
+                pass
+            else:
+                h = pcp_allgather_rerange(h, pcp_size)
+                if pad > 0:
+                    h = h[:n_global]
+        return h
 
     def compute_logits(
         self,
@@ -2906,9 +3857,21 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mis-load expert weights -> garbage.
         num_fused_shared = 0
         for _m in self.model.modules():
-            if _m.__class__.__name__ == "FusedMoE":
+            if hasattr(_m, "num_fused_shared_experts"):
                 num_fused_shared = getattr(_m, "num_fused_shared_experts", 0)
                 break
+        if num_fused_shared == 0:
+            # Some plugin builds wrap/alias FusedMoE such that the exact class-name
+            # probe above misses it.  If the owning MoE layer was constructed in
+            # fused-shared mode, the loader will rewrite ffn.shared_experts.* to
+            # ffn.experts.{n_routed_experts}.*; include that final slot here so the
+            # generic expert mapping loads it into w13/w2 instead of dropping it.
+            for _m in self.model.modules():
+                if _m.__class__.__name__ == "MoE" and getattr(
+                    _m, "_fuse_shared_into_routed", False
+                ):
+                    num_fused_shared = getattr(self.args, "n_shared_experts", 0)
+                    break
         num_experts = self.args.n_routed_experts + num_fused_shared
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",

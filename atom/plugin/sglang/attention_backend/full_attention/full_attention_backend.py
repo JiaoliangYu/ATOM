@@ -11,6 +11,7 @@ from __future__ import annotations
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -167,6 +168,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
         )
         self.decode_using_pa_ps = self.page_size == 1024
+        if self.use_mla:
+            cu_num = torch.cuda.get_device_properties(self.device).multi_processor_count
+            self.prefill_ps_num_kv_splits = cu_num // math.gcd(self.num_kv_head, cu_num)
+        else:
+            self.prefill_ps_num_kv_splits = None
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
@@ -622,6 +628,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         reduce_final_map = None
         reduce_partial_map = None
         fp8_prefill_kv_indices = None
+        num_kv_splits = None
 
         from sglang.srt.utils import is_gfx95_supported
 
@@ -658,6 +665,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             fp8_prefill_kv_indices = torch.arange(
                 total_s, device=self.device, dtype=torch.int32
             )
+            num_kv_splits = self.prefill_ps_num_kv_splits
 
         self.forward_metadata = ForwardMetadata(
             kv_indptr,
@@ -675,6 +683,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+            num_kv_splits=num_kv_splits,
         )
 
     def _init_extend_mha(self, bs, forward_batch):
@@ -1574,6 +1583,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def _should_use_native_dense_mha(self, layer) -> bool:
         sliding_window_size = getattr(layer, "sliding_window_size", None)
+        is_minimax_m3 = bool(getattr(layer, "_atom_minimax_m3_dense_mha", False))
+        if (
+            is_minimax_m3
+            and not self.use_mla
+            and not layer.is_cross_attention
+            and layer.head_dim == 128
+            and layer.qk_head_dim == 128
+            and layer.v_head_dim == 128
+            and (sliding_window_size is None or sliding_window_size <= -1)
+        ):
+            return True
         return (
             not self.use_mla
             and not layer.is_cross_attention
@@ -1739,6 +1759,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
+        if bool(getattr(layer, "_atom_minimax_m3_dense_mha", False)):
+            # M3 dense decode benefits from the native ragged path, but batched
+            # SGLang prefill is safer through the standard varlen extend path.
+            return self._forward_extend_mha(q, k, v, layer, forward_batch)
         if use_native_dense_mha:
             return self._forward_extend_native_dense_mha(q, layer, forward_batch)
         else:
@@ -2084,6 +2108,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.reduce_final_map,
             md.reduce_partial_map,
             tile_q,
+            md.num_kv_splits,
             output,
             final_lse,
         )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 from atom.plugin.prepare import _set_framework_backbone
@@ -31,6 +33,12 @@ def prepare_model(config: Any):
     _set_framework_backbone("sglang")
 
     model_arch = config.architectures[0]
+    if model_arch == "DeepseekV4ForCausalLM":
+        from atom.plugin.sglang.deepseek_v4_bridge import (
+            install_deepseek_v4_proxy_pool_patch,
+        )
+
+        install_deepseek_v4_proxy_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
     from atom.plugin.register import (
@@ -75,15 +83,19 @@ def prepare_model(config: Any):
 
     apply_graph_capture_patch()
 
-    try:
-        model = model_cls(atom_config=atom_config)
-    except TypeError as exc:
-        # Some SGLang plugin models keep SGLang's native wrapper constructor
-        # and only swap their internal language_model with an ATOM model.
-        # Those classes accept `config=...` instead of `atom_config=...`.
-        if "atom_config" not in str(exc):
-            raise
-        model = model_cls(config=config)
+    construct_context = (
+        model_adapter.construction_context()
+        if model_adapter.construction_context is not None
+        else nullcontext()
+    )
+    with construct_context:
+        init_params = inspect.signature(model_cls.__init__).parameters
+        if "atom_config" in init_params:
+            model = model_cls(atom_config=atom_config)
+        elif "config" in init_params:
+            model = model_cls(config=atom_config)
+        else:
+            model = model_cls(atom_config)
     if not hasattr(model, "atom_config"):
         model.atom_config = atom_config
     return model

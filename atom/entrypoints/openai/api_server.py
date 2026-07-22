@@ -49,6 +49,19 @@ from .serving_chat import (
     stream_chat_response,
     stream_chat_response_fanout,
 )
+from .serving_anthropic import (
+    AnthropicMessagesRequest,
+    anthropic_to_openai_messages,
+    anthropic_to_openai_tools,
+    build_anthropic_response,
+    stream_content_block_delta,
+    stream_content_block_start,
+    stream_content_block_stop,
+    stream_message_delta,
+    stream_message_start,
+    stream_message_stop,
+    stream_signature_delta,
+)
 from .serving_completion import (
     build_completion_response,
     build_completion_response_multi,
@@ -163,6 +176,43 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         )
         n = 1
     return n
+
+
+def _validate_context_length(
+    num_prompt_tokens: int,
+    max_tokens: int,
+    max_model_len: Optional[int],
+) -> None:
+    if max_model_len is None:
+        return
+
+    requested_output_tokens = max(0, int(max_tokens or 0))
+    total_tokens = int(num_prompt_tokens) + requested_output_tokens
+    if total_tokens <= int(max_model_len):
+        return
+
+    raise ValueError(
+        f"This model's maximum context length is {max_model_len} tokens. "
+        f"However, you requested {requested_output_tokens} output tokens and "
+        f"your prompt contains at least {num_prompt_tokens} input tokens, for "
+        f"a total of at least {total_tokens} tokens. Please reduce the length "
+        f"of the input prompt or the number of requested output tokens."
+    )
+
+
+def _get_engine_max_model_len() -> Optional[int]:
+    config = getattr(engine, "config", None)
+    if config is None:
+        config = getattr(getattr(engine, "io_processor", None), "config", None)
+    return getattr(config, "max_model_len", None)
+
+
+def _validate_sequence_context_length(seq) -> None:
+    _validate_context_length(
+        seq.num_prompt_tokens,
+        seq.max_tokens,
+        _get_engine_max_model_len(),
+    )
 
 
 def _has_multimodal_content(messages: List[Any]) -> bool:
@@ -292,6 +342,7 @@ def _send_stream_chunk_direct(
         "finish_reason": request_output.finish_reason,
         "finished_at": time.time(),
         "started_at": started_at,
+        "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
@@ -309,6 +360,9 @@ def _send_stream_chunk_tagged(
     Pushes ``(sibling_index, chunk_data)`` tuples onto a single shared
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
+
+    This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
+    so the shared stream consumer can merge them in order.
     """
     global tokenizer
 
@@ -329,6 +383,7 @@ async def generate_async(
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
@@ -343,12 +398,16 @@ async def generate_async(
     finish_reason: Optional[str] = None
     seq = None
     kv_transfer_output_meta_info = None
+    num_cached_tokens_seen = 0
 
     def completion_callback(request_output: RequestOutput):
-        nonlocal kv_transfer_output_meta_info
+        nonlocal kv_transfer_output_meta_info, num_cached_tokens_seen
         kv_transfer_output_meta_info = getattr(
             request_output, "kv_transfer_params_output", None
         )
+        _ct = getattr(request_output, "num_cached_tokens", 0)
+        if _ct:
+            num_cached_tokens_seen = _ct
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -369,19 +428,48 @@ async def generate_async(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
+        )
+    try:
+        _validate_sequence_context_length(seq)
+    except Exception:
+        engine.io_processor.requests.pop(seq.id, None)
+        raise
     engine.core_mgr.add_request([seq])
 
-    while True:
-        item = await token_queue.get()
-        token_ids = item.get("token_ids") or []
-        if token_ids:
-            if first_token_at is None:
-                first_token_at = item.get("ts", time.time())
-            last_token_at = item.get("ts", time.time())
-            all_token_ids.extend(token_ids)
-        if item.get("finished", False):
-            finish_reason = item.get("finish_reason")
-            break
+    _finished_ok = False
+    try:
+        while True:
+            item = await token_queue.get()
+            token_ids = item.get("token_ids") or []
+            if token_ids:
+                if first_token_at is None:
+                    first_token_at = item.get("ts", time.time())
+                last_token_at = item.get("ts", time.time())
+                all_token_ids.extend(token_ids)
+            if item.get("finished", False):
+                finish_reason = item.get("finish_reason")
+                _finished_ok = True
+                break
+    finally:
+        # Two responsibilities, on EVERY exit path:
+        #   1) If we didn't finish (client disconnected / cancelled), tell the
+        #      engine to stop so the seq doesn't run to max_tokens and burn GPU.
+        #   2) Always drop the seq from io_processor.requests. The engine frees
+        #      its own KV on finish, but this dict is only cleaned up here for
+        #      non-stream requests -- without an unconditional pop, every
+        #      completed non-stream request leaks a Sequence (pending grows
+        #      forever). Streaming pops via cleanup_streaming_request instead.
+        if seq is not None:
+            if not _finished_ok:
+                try:
+                    engine.core_mgr.abort_request(seq.id)
+                except Exception:
+                    pass
+            engine.io_processor.requests.pop(seq.id, None)
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
     num_tokens_input = (
@@ -408,6 +496,7 @@ async def generate_async(
         "ttft": ttft,
         "tpot": tpot,
         "latency": latency,
+        "num_cached_tokens": num_cached_tokens_seen,
     }
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
@@ -454,19 +543,36 @@ async def generate_async_multimodal(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    try:
+        _validate_sequence_context_length(seq)
+    except Exception:
+        engine.io_processor.requests.pop(seq.id, None)
+        raise
     engine.core_mgr.add_request([seq])
 
-    while True:
-        item = await token_queue.get()
-        token_ids_out = item.get("token_ids") or []
-        if token_ids_out:
-            if first_token_at is None:
-                first_token_at = item.get("ts", time.time())
-            last_token_at = item.get("ts", time.time())
-            all_token_ids.extend(token_ids_out)
-        if item.get("finished", False):
-            finish_reason = item.get("finish_reason")
-            break
+    _finished_ok = False
+    try:
+        while True:
+            item = await token_queue.get()
+            token_ids_out = item.get("token_ids") or []
+            if token_ids_out:
+                if first_token_at is None:
+                    first_token_at = item.get("ts", time.time())
+                last_token_at = item.get("ts", time.time())
+                all_token_ids.extend(token_ids_out)
+            if item.get("finished", False):
+                finish_reason = item.get("finish_reason")
+                _finished_ok = True
+                break
+    finally:
+        # See generate_async: abort on early exit, always pop to avoid leak.
+        if seq is not None:
+            if not _finished_ok:
+                try:
+                    engine.core_mgr.abort_request(seq.id)
+                except Exception:
+                    pass
+            engine.io_processor.requests.pop(seq.id, None)
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
     num_tokens_output = len(all_token_ids)
@@ -500,6 +606,7 @@ async def generate_async_fanout(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -553,22 +660,49 @@ async def generate_async_fanout(
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        for seq in seqs:
+            seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s fanout pinned %d sequence(s) to data_parallel_rank=%s",
+            request_id,
+            len(seqs),
+            data_parallel_rank,
+        )
+    try:
+        _validate_sequence_context_length(seqs[0])
+    except Exception:
+        for seq in seqs:
+            engine.io_processor.requests.pop(seq.id, None)
+        raise
     engine.core_mgr.add_request(seqs)
     num_tokens_input = seqs[0].num_prompt_tokens
 
-    while not all(finished):
-        idx, item = await shared_queue.get()
-        if finished[idx]:
-            continue
-        tokens = item.get("token_ids") or []
-        if tokens:
-            if per_first_token_at[idx] is None:
-                per_first_token_at[idx] = item.get("ts", time.time())
-            per_last_token_at[idx] = item.get("ts", time.time())
-            per_tokens[idx].extend(tokens)
-        if item.get("finished", False):
-            per_finish_reason[idx] = item.get("finish_reason")
-            finished[idx] = True
+    _all_finished = False
+    try:
+        while not all(finished):
+            idx, item = await shared_queue.get()
+            if finished[idx]:
+                continue
+            tokens = item.get("token_ids") or []
+            if tokens:
+                if per_first_token_at[idx] is None:
+                    per_first_token_at[idx] = item.get("ts", time.time())
+                per_last_token_at[idx] = item.get("ts", time.time())
+                per_tokens[idx].extend(tokens)
+            if item.get("finished", False):
+                per_finish_reason[idx] = item.get("finish_reason")
+                finished[idx] = True
+        _all_finished = True
+    finally:
+        # Abort any sibling still running on early exit; always pop all seqs.
+        for _seq in seqs:
+            if not _all_finished:
+                try:
+                    engine.core_mgr.abort_request(_seq.id)
+                except Exception:
+                    pass
+            engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
     outputs: List[Dict[str, Any]] = []
@@ -622,8 +756,13 @@ async def setup_streaming_request(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, asyncio.Queue]:
-    """Set up a streaming request with the engine."""
+) -> Tuple[int, asyncio.Queue, int]:
+    """Set up a streaming request with the engine.
+
+    Returns ``(seq_id, stream_queue, num_prompt_tokens)``. ``num_prompt_tokens``
+    is the engine-computed prompt length so the stream response generator does
+    not have to re-tokenize the prompt on the event loop.
+    """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
 
@@ -649,21 +788,41 @@ async def setup_streaming_request(
         _seq_id_to_request_id[seq.id] = request_id
         return seq
 
-    seq = await executor_loop.run_in_executor(None, do_preprocess)
+    seq = None
+    try:
+        seq = await executor_loop.run_in_executor(None, do_preprocess)
+        _validate_sequence_context_length(seq)
+    except Exception:
+        _stream_queues.pop(request_id, None)
+        _stream_loops.pop(request_id, None)
+        _request_start_times.pop(request_id, None)
+        if seq is not None:
+            _seq_id_to_request_id.pop(seq.id, None)
+            engine.io_processor.requests.pop(seq.id, None)
+        raise
     seq_id = seq.id
 
     logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
 
-    return seq_id, stream_queue
+    return seq_id, stream_queue, seq.num_prompt_tokens
 
 
-def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
+def cleanup_streaming_request(
+    request_id: str, seq_id: int, aborted: bool = False
+) -> None:
     """Clean up resources for a streaming request.
 
     Safe to call multiple times for the same ``request_id`` with different
     ``seq_id`` values (as happens in fan-out cleanup): the per-request
     dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+
+    ``aborted`` says the stream did NOT reach its normal end (client disconnect
+    or abnormal generator teardown), so the seq is likely still running in the
+    engine and must be stopped. On normal completion pass False (the default):
+    the engine has already dropped the seq, so an abort would be a guaranteed
+    no-op that just floods the control path (one broadcast per engine core, per
+    request).
     """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
@@ -672,7 +831,109 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    if aborted:
+        try:
+            engine.core_mgr.abort_request(seq_id)
+        except Exception:
+            pass
     engine.io_processor.requests.pop(seq_id, None)
+
+
+class _ClientDisconnected(Exception):
+    """Raised when a non-streaming client hangs up mid-generation."""
+
+    def __init__(self, request_id: str):
+        super().__init__(request_id)
+        self.request_id = request_id
+
+
+async def _listen_for_disconnect(request) -> None:
+    """Block until the client sends an ``http.disconnect`` ASGI event.
+
+    Unlike polling ``request.is_disconnected()`` on a timer, this awaits the
+    disconnect event directly, so detection is immediate and costs nothing while
+    the client stays connected.
+    """
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            break
+
+
+async def _race_disconnect(coro, raw_request, request_id):
+    """Race an awaitable against client disconnect (vLLM ``with_cancellation``
+    style).
+
+    Starlette does NOT cancel a *non-streaming* request handler when the client
+    goes away (unlike StreamingResponse, which is cancelled on http.disconnect).
+    Without this, an abandoned non-stream request keeps ``await``-ing the engine
+    until it hits ``max_tokens`` -- burning GPU on output nobody will read AND
+    leaking the seq(s) in ``io_processor.requests`` (their finally never fires).
+
+    We run ``coro`` (which produces the final result) as a task alongside a task
+    that awaits the ASGI ``http.disconnect`` event. Whichever finishes first
+    wins; the loser is cancelled. On disconnect, the coro's cancellation
+    propagates into its ``await`` points so its own ``try/finally`` runs ->
+    ``abort_request`` + ``io_processor.requests.pop`` (for fan-out, this aborts
+    every sibling). We then raise ``_ClientDisconnected``.
+
+    ``request.receive()`` is safe here because FastAPI has already parsed the
+    request body into a pydantic model before this handler runs, so there is no
+    unread body for ``receive()`` to race against.
+    """
+    handler_task = asyncio.ensure_future(coro)
+
+    # No ASGI request object (e.g. internal call) -> just await the coro.
+    if raw_request is None:
+        return await handler_task
+
+    disconnect_task = asyncio.ensure_future(_listen_for_disconnect(raw_request))
+
+    done, pending = await asyncio.wait(
+        [handler_task, disconnect_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    # Cancel the loser and let its cancellation settle (drives the coro's own
+    # finally -> abort_request when the handler is the loser). Only swallow the
+    # expected CancelledError; log anything else, and let BaseException
+    # (KeyboardInterrupt/SystemExit) propagate.
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning(
+                f"Error tearing down cancelled task for request {request_id}",
+                exc_info=True,
+            )
+
+    if handler_task in done:
+        return handler_task.result()
+
+    logger.info(f"Client disconnected (non-stream), aborting request {request_id}")
+    raise _ClientDisconnected(request_id)
+
+
+async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
+    """Drive a non-stream ``generate_async*`` async-*generator* while watching
+    for client disconnect.
+
+    Thin wrapper over :func:`_race_disconnect` that collects the generator's
+    last yielded output. Use :func:`_race_disconnect` directly for the fan-out
+    path, whose ``generate_async_fanout`` is a coroutine returning a list.
+    """
+
+    async def _collect():
+        final_output = None
+        async for output in agen:
+            final_output = output
+        return final_output
+
+    return await _race_disconnect(_collect(), raw_request, request_id)
 
 
 async def setup_streaming_request_fanout(
@@ -681,12 +942,16 @@ async def setup_streaming_request_fanout(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], asyncio.Queue]:
+) -> Tuple[List[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
     Creates ``sampling_params.n`` sibling sequences sharing one output
     queue. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
     the merge-stream consumer can rewrite ``choices[0].index`` correctly.
+
+    Returns ``(seq_ids, shared_queue, num_prompt_tokens)``. All siblings
+    tokenize the same prompt once, so ``num_prompt_tokens`` is shared and lets
+    the stream response generator skip re-tokenizing on the event loop.
     """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
@@ -723,13 +988,24 @@ async def setup_streaming_request_fanout(
             _seq_id_to_request_id[seq.id] = request_id
         return seqs
 
-    seqs = await executor_loop.run_in_executor(None, do_preprocess)
+    seqs = []
+    try:
+        seqs = await executor_loop.run_in_executor(None, do_preprocess)
+        _validate_sequence_context_length(seqs[0])
+    except Exception:
+        _stream_queues.pop(request_id, None)
+        _stream_loops.pop(request_id, None)
+        _request_start_times.pop(request_id, None)
+        for seq in seqs:
+            _seq_id_to_request_id.pop(seq.id, None)
+            engine.io_processor.requests.pop(seq.id, None)
+        raise
     seq_ids = [seq.id for seq in seqs]
     logger.info(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
     engine.core_mgr.add_request(seqs)
-    return seq_ids, shared_queue
+    return seq_ids, shared_queue, seqs[0].num_prompt_tokens
 
 
 # ============================================================================
@@ -786,7 +1062,7 @@ async def general_error_handler(request: Request, exc: Exception):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
     global engine, tokenizer, model_name
 
@@ -802,7 +1078,7 @@ async def chat_completions(request: ChatCompletionRequest):
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
-            max_tokens=request.max_tokens,
+            max_tokens=request.get_max_tokens(),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -816,9 +1092,14 @@ async def chat_completions(request: ChatCompletionRequest):
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
-            token_ids, multimodal_data = _prepare_multimodal_inputs(
-                messages,
-                merged_kwargs,
+            # Image loading (blocking network I/O, up to a 30s urlopen) plus
+            # processor preprocessing are heavy and would stall the event loop;
+            # run them in a worker thread. Warm the processor on the loop first
+            # so concurrent cold-start requests don't race on its lazy init.
+            _get_multimodal_processor()
+            loop = asyncio.get_running_loop()
+            token_ids, multimodal_data = await loop.run_in_executor(
+                None, _prepare_multimodal_inputs, messages, merged_kwargs
             )
         else:
             prompt = apply_chat_template(
@@ -834,24 +1115,26 @@ async def chat_completions(request: ChatCompletionRequest):
             stream_input = token_ids if is_multimodal else prompt
             stream_multimodal_data = multimodal_data if is_multimodal else None
             if effective_n > 1:
-                seq_ids, stream_queue = await setup_streaming_request_fanout(
-                    stream_input,
-                    sampling_params,
-                    request_id,
-                    multimodal_data=stream_multimodal_data,
-                    kv_transfer_params=request.kv_transfer_params,
+                seq_ids, stream_queue, num_prompt_tokens = (
+                    await setup_streaming_request_fanout(
+                        stream_input,
+                        sampling_params,
+                        request_id,
+                        multimodal_data=stream_multimodal_data,
+                        kv_transfer_params=request.kv_transfer_params,
+                    )
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
                     model_name,
-                    stream_input,
                     stream_queue,
                     seq_ids,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
+                    tools=request.tools,
                 )
             else:
-                seq_id, stream_queue = await setup_streaming_request(
+                seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
                     stream_input,
                     sampling_params,
                     request_id,
@@ -861,11 +1144,11 @@ async def chat_completions(request: ChatCompletionRequest):
                 gen = stream_chat_response(
                     request_id,
                     model_name,
-                    stream_input,
                     stream_queue,
                     seq_id,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
+                    tools=request.tools,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -874,57 +1157,84 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Non-streaming
         if is_multimodal and effective_n > 1:
-            outputs = await generate_async_fanout(
-                token_ids,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    token_ids,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                multimodal_data=multimodal_data,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response_multi(request_id, model_name, outputs)
+            resp = build_chat_response_multi(
+                request_id, model_name, outputs, tools=request.tools
+            )
         elif is_multimodal:
-            final_output = None
-            async for output in generate_async_multimodal(
-                token_ids,
-                multimodal_data,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async_multimodal(
+                    token_ids,
+                    multimodal_data,
+                    sampling_params,
+                    request_id,
+                ),
+                raw_request,
                 request_id,
-            ):
-                final_output = output
+            )
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
-                request_id, model_name, final_output["text"], final_output
+                request_id,
+                model_name,
+                final_output["text"],
+                final_output,
+                tools=request.tools,
             )
         elif effective_n > 1:
-            outputs = await generate_async_fanout(
-                prompt,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response_multi(request_id, model_name, outputs)
+            resp = build_chat_response_multi(
+                request_id, model_name, outputs, tools=request.tools
+            )
         else:
-            final_output = None
-            async for output in generate_async(
-                prompt,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
-            ):
-                final_output = output
+            )
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
-                request_id, model_name, final_output["text"], final_output
+                request_id,
+                model_name,
+                final_output["text"],
+                final_output,
+                tools=request.tools,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
+    except _ClientDisconnected:
+        # Client hung up; seq already aborted + popped. Nothing to return.
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
         logger.error(f"Validation error in chat_completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -934,7 +1244,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 
 @app.post("/v1/completions")
-async def completions(request: CompletionRequest):
+async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
     global engine, tokenizer, model_name
 
@@ -944,7 +1254,7 @@ async def completions(request: CompletionRequest):
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
-            max_tokens=request.max_tokens,
+            max_tokens=request.get_max_tokens(),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -959,23 +1269,24 @@ async def completions(request: CompletionRequest):
         # Streaming
         if request.stream:
             if effective_n > 1:
-                seq_ids, stream_queue = await setup_streaming_request_fanout(
-                    request.prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                seq_ids, stream_queue, num_prompt_tokens = (
+                    await setup_streaming_request_fanout(
+                        request.prompt,
+                        sampling_params,
+                        request_id,
+                        kv_transfer_params=request.kv_transfer_params,
+                    )
                 )
                 gen = stream_completion_response_fanout(
                     request_id,
                     model_name,
-                    request.prompt,
                     stream_queue,
                     seq_ids,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
                 )
             else:
-                seq_id, stream_queue = await setup_streaming_request(
+                seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
                     request.prompt,
                     sampling_params,
                     request_id,
@@ -984,10 +1295,9 @@ async def completions(request: CompletionRequest):
                 gen = stream_completion_response(
                     request_id,
                     model_name,
-                    request.prompt,
                     stream_queue,
                     seq_id,
-                    tokenizer,
+                    num_prompt_tokens,
                     cleanup_streaming_request,
                 )
             return StreamingResponse(
@@ -997,24 +1307,32 @@ async def completions(request: CompletionRequest):
 
         # Non-streaming
         if effective_n > 1:
-            outputs = await generate_async_fanout(
-                request.prompt,
-                sampling_params,
+            outputs = await _race_disconnect(
+                generate_async_fanout(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_completion_response_multi(request_id, model_name, outputs)
         else:
-            final_output = None
-            async for output in generate_async(
-                request.prompt,
-                sampling_params,
+            final_output = await _run_nonstream_with_disconnect(
+                generate_async(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
+                ),
+                raw_request,
                 request_id,
-                kv_transfer_params=request.kv_transfer_params,
-            ):
-                final_output = output
+            )
 
             if final_output is None:
                 raise RuntimeError("No output generated")
@@ -1023,12 +1341,301 @@ async def completions(request: CompletionRequest):
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
+    except _ClientDisconnected:
+        # Client hung up; seq already aborted + popped. Nothing to return.
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in completions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Request):
+    """Handle Anthropic Messages API requests.
+
+    Translates Anthropic format to OpenAI format internally, runs inference,
+    and returns Anthropic-formatted responses. Enables Claude Code and other
+    Anthropic-compatible tools to use ATOM as a backend.
+    """
+    global engine, tokenizer, model_name
+
+    try:
+        # Convert Anthropic messages to OpenAI format
+        openai_messages = anthropic_to_openai_messages(request.messages, request.system)
+
+        # Apply chat template
+        from .protocol import ChatMessage
+
+        messages = [ChatMessage(**m) for m in openai_messages]
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        prompt = apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            [msg.to_template_dict() for msg in messages],
+            tools=anthropic_to_openai_tools(request.tools),
+            **merged_kwargs,
+        )
+
+        sampling_params = _build_sampling_params(
+            temperature=request.temperature or 1.0,
+            max_tokens=request.max_tokens,
+            stop_strings=request.stop_sequences,
+            ignore_eos=False,
+            top_k=request.top_k if request.top_k is not None else -1,
+            top_p=request.top_p if request.top_p is not None else 1.0,
+        )
+
+        request_id = uuid.uuid4().hex[:24]
+        input_tokens = len(tokenizer.encode(prompt))
+
+        max_ctx = None
+        for _path in (
+            lambda: engine.config.max_model_len,
+            lambda: engine.model_config.max_model_len,
+            lambda: engine.scheduler.max_model_len,
+            lambda: getattr(engine, "max_model_len"),
+        ):
+            try:
+                _v = _path()
+                if _v:
+                    max_ctx = int(_v)
+                    break
+            except Exception:
+                continue
+        if not max_ctx:
+            max_ctx = 30720
+        logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
+        headroom = min(request.max_tokens, max(1024, max_ctx // 8))
+        max_input = max_ctx - headroom
+        if input_tokens > max_input:
+            logger.warning(
+                f"Prompt too long ({input_tokens} > {max_input}), truncating"
+            )
+            token_ids = tokenizer.encode(prompt)[:max_input]
+            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
+            input_tokens = max_input
+
+        if request.stream:
+            # Streaming response
+            seq_id, stream_queue, _num_prompt_tokens = await setup_streaming_request(
+                prompt, sampling_params, request_id
+            )
+
+            async def generate_anthropic_stream():
+                from .reasoning import ReasoningFilter
+                from .tool_parser import ToolCallStreamParser
+
+                reasoning_filter = ReasoningFilter()
+                if prompt.rstrip().endswith("<think>"):
+                    reasoning_filter.state = 1
+                tool_parser = ToolCallStreamParser()
+                block_index = 0
+                started_text = False
+                started_thinking = False
+                has_tool_calls = False
+                output_tokens = 0
+                stop_reason = "end_turn"
+
+                message_started = False
+                _thinking_enabled = bool(getattr(request, "thinking", None))
+                # Assume abort until we reach the normal end of the stream. If
+                # the client disconnects, GeneratorExit unwinds through the
+                # yields and the finally runs with this still True -> abort.
+                aborted = True
+
+                try:
+                    while True:
+                        chunk_data = await stream_queue.get()
+                        if not message_started:
+                            cache_read = chunk_data.get("num_cached_tokens", 0)
+                            yield stream_message_start(
+                                request_id, model_name, input_tokens, cache_read
+                            )
+                            message_started = True
+                        new_text = chunk_data["text"]
+                        output_tokens += len(chunk_data.get("token_ids", []))
+                        finished = chunk_data.get("finished", False)
+
+                        # Phase 1: Reasoning filter
+                        segments = reasoning_filter.process(new_text)
+                        if finished:
+                            segments.extend(reasoning_filter.flush())
+
+                        for field, text in segments:
+                            if not text:
+                                continue
+
+                            if field == "reasoning_content":
+                                if not _thinking_enabled:
+                                    yield "event: ping\ndata: " + json.dumps(
+                                        {"type": "ping"}
+                                    ) + "\n\n"
+                                    continue
+                                if not started_thinking and not started_text:
+                                    yield stream_content_block_start(
+                                        block_index, "thinking"
+                                    )
+                                    started_thinking = True
+                                if started_thinking:
+                                    yield stream_content_block_delta(
+                                        block_index, text, "thinking"
+                                    )
+                            else:
+                                # Phase 2: Tool call detection on content
+                                events = tool_parser.process(text)
+                                for etype, edata in events:
+                                    if etype == "content":
+                                        if started_thinking and not started_text:
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                        if not started_text:
+                                            yield stream_content_block_start(
+                                                block_index, "text"
+                                            )
+                                            started_text = True
+                                        yield stream_content_block_delta(
+                                            block_index, edata, "text"
+                                        )
+                                    elif etype == "tool_call_start":
+                                        has_tool_calls = True
+                                        stop_reason = "tool_use"
+                                        if started_text:
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                            started_text = False
+                                        elif started_thinking:
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                            started_thinking = False
+                                        fn = edata.get("function", {})
+                                        yield stream_content_block_start(
+                                            block_index,
+                                            "tool_use",
+                                            tool_use_id=edata.get("id", ""),
+                                            tool_name=fn.get("name", ""),
+                                        )
+                                    elif etype == "tool_call_args":
+                                        fn = edata.get("function", {})
+                                        yield stream_content_block_delta(
+                                            block_index,
+                                            fn.get("arguments", ""),
+                                            "tool_use",
+                                        )
+                                    elif etype == "tool_call_end":
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+
+                        if finished:
+                            # Flush remaining tool call events
+                            for etype, edata in tool_parser.flush():
+                                if etype == "content":
+                                    if not started_text:
+                                        if started_thinking:
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                            started_thinking = False
+                                        yield stream_content_block_start(
+                                            block_index, "text"
+                                        )
+                                        started_text = True
+                                    yield stream_content_block_delta(
+                                        block_index, edata, "text"
+                                    )
+                                elif etype == "tool_call_start":
+                                    has_tool_calls = True
+                                    stop_reason = "tool_use"
+                                    if started_text:
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+                                        started_text = False
+                                    fn = edata.get("function", {})
+                                    yield stream_content_block_start(
+                                        block_index,
+                                        "tool_use",
+                                        tool_use_id=edata.get("id", ""),
+                                        tool_name=fn.get("name", ""),
+                                    )
+                                elif etype == "tool_call_args":
+                                    fn = edata.get("function", {})
+                                    yield stream_content_block_delta(
+                                        block_index,
+                                        fn.get("arguments", ""),
+                                        "tool_use",
+                                    )
+                                elif etype == "tool_call_end":
+                                    yield stream_content_block_stop(block_index)
+                                    block_index += 1
+
+                            if not started_text and not has_tool_calls:
+                                if started_thinking:
+                                    yield stream_signature_delta(block_index)
+                                    yield stream_content_block_stop(block_index)
+                                    block_index += 1
+                                yield stream_content_block_start(block_index, "text")
+                                started_text = True
+                            if started_text:
+                                yield stream_content_block_stop(block_index)
+                            yield stream_message_delta(stop_reason, output_tokens)
+                            yield stream_message_stop()
+                            aborted = False
+                            break
+                finally:
+                    cleanup_streaming_request(request_id, seq_id, aborted=aborted)
+
+            return StreamingResponse(
+                generate_anthropic_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "anthropic-version": "2023-06-01",
+                    "x-request-id": request_id,
+                },
+            )
+
+        # Non-streaming response
+        from .reasoning import separate_reasoning
+        from .tool_parser import parse_tool_calls
+
+        final_output = None
+        async for output in generate_async(prompt, sampling_params, request_id):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("No output generated")
+
+        raw_text = final_output["text"]
+        reasoning_content, content_with_tools = separate_reasoning(raw_text)
+        content_text, tool_calls = parse_tool_calls(content_with_tools)
+        output_tokens = len(tokenizer.encode(raw_text))
+        cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
+        if not getattr(request, "thinking", None):
+            reasoning_content = None
+
+        return build_anthropic_response(
+            request_id=request_id,
+            model=model_name,
+            content_text=content_text,
+            reasoning_content=reasoning_content,
+            tool_calls=tool_calls if tool_calls else None,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+        )
+
+    except Exception as e:
+        logger.error(f"Error in anthropic_messages: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)},
+            },
+        )
 
 
 @app.get("/v1/models")
@@ -1059,16 +1666,40 @@ async def get_mtp_stats():
         )
 
 
+def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
+    kv_role = kv_cfg.get("kv_role")
+    handshake_port = kv_cfg.get("handshake_port", 6301)
+    if kv_role is not None or kv_cfg.get("kv_connector") != "multi":
+        return kv_role, handshake_port
+
+    # MultiConnector wraps the real transfer connector. Surface the producer
+    # role so atomesh can recognize multi[mooncake-producer + offload] as a
+    # prefill node.
+    fallback_role = None
+    fallback_port = handshake_port
+    for sub_cfg in kv_cfg.get("connectors", []):
+        sub_role = sub_cfg.get("kv_role")
+        if sub_role is None:
+            continue
+        if fallback_role is None:
+            fallback_role = sub_role
+            fallback_port = sub_cfg.get("handshake_port", handshake_port)
+        if sub_role == "kv_producer":
+            return sub_role, sub_cfg.get("handshake_port", handshake_port)
+    return fallback_role, fallback_port
+
+
 @app.get("/kv_transfer_info")
 async def kv_transfer_info():
     global engine
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
+    kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
     return {
         "tp_size": cfg.tensor_parallel_size,
         "dp_size": cfg.parallel_config.data_parallel_size,
-        "kv_role": kv_cfg.get("kv_role"),
-        "handshake_port": kv_cfg.get("handshake_port", 6301),
+        "kv_role": kv_role,
+        "handshake_port": handshake_port,
     }
 
 
@@ -1184,8 +1815,24 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    logger.info(f"Starting server on {args.host}:{args.server_port}...")
-    uvicorn.run(app, host=args.host, port=args.server_port)
+    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
+    # which is markedly faster at the SSE socket I/O (sock.send / selector
+    # register-unregister) that saturates the event loop under high streaming
+    # concurrency. Fall back to the default loop if uvloop is unavailable.
+    try:
+        import uvloop  # noqa: F401
+
+        loop_impl = "uvloop"
+    except ImportError:
+        loop_impl = "auto"
+        logger.warning(
+            "uvloop not installed; falling back to the default asyncio loop."
+        )
+
+    logger.info(
+        f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
+    )
+    uvicorn.run(app, host=args.host, port=args.server_port, loop=loop_impl)
 
 
 if __name__ == "__main__":

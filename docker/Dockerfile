@@ -21,6 +21,22 @@ ENV MAX_JOBS=${MAX_JOBS}
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
+# Preserve the base image's custom RCCL before any OOT apt runs.
+# The native base builds RCCL from the pinned RCCL_BRANCH (build_rccl stage) and
+# installs it to /usr/local/lib with an /etc/ld.so.conf.d/rccl.conf entry, so
+# ldconfig resolves the custom build. The custom `dpkg -i --force-all` leaves
+# rocm-hip's rccl version dep "broken" on purpose; the OOT `apt --fix-broken
+# install` below satisfies it by reinstalling the STOCK ROCm rccl into
+# /opt/rocm, which then shadows the custom build via ldconfig. That regresses
+# GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
+# even though its collective kernels are never called in decode). Back it up here
+# and restore after all OOT installs (mirrors the Triton backup/restore below).
+RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
+    mkdir -p /tmp/rccl-base-backup && \
+    (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
+    ls -l /tmp/rccl-base-backup/ || true
+
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
@@ -96,6 +112,7 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
       "s3transfer>=0.17.0,<0.18.0" && \
     if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi && \
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
+    "${VENV_PYTHON}" -m pip install 'fastapi>=0.115,<0.137' && \
     "${VENV_PYTHON}" -c "import boto3, botocore, s3transfer; print(f'boto3: {boto3.__version__}'); print(f'botocore: {botocore.__version__}'); print(f's3transfer: {s3transfer.__version__}')" && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
     "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom amd-mori-nightly || true
@@ -118,6 +135,29 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton || true
 
+# Restore the base image's custom RCCL over any stock rccl that OOT apt pulled
+# into /opt/rocm, so the OOT image runs the SAME custom RCCL as the native image.
+# Must run after ALL OOT apt/pip installs. Removes the stock /opt/rocm librccl so
+# ldconfig unambiguously resolves the custom build in /usr/local/lib (leaving the
+# stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied — only the .so
+# is swapped, exactly the runtime state the native image ships).
+RUN echo "========== [OOT] Restore base-image custom RCCL ==========" && \
+    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
+      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      rm -f /opt/rocm*/lib/librccl.so* && \
+      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
+        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
+      else \
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
+      fi && \
+      ldconfig && \
+      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
+    else \
+      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
+    fi && \
+    rm -rf /tmp/rccl-base-backup
+
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
@@ -132,14 +172,24 @@ ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGLANG_REF="v0.5.12"
-ARG SGLANG_TRITON_VERSION="3.6.0"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
-RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL versions before SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl || true
+RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
+    echo "========== [SGLANG-ATOM 0/6] Back up base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
+    mkdir -p /tmp/triton-base-backup && \
+    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
+    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" /tmp/triton-base-backup/; \
+    done && \
+    echo "Base image Triton backed up: import_version=${BASE_TRITON_VERSION}" && \
+    ls /tmp/triton-base-backup/
 
 RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     rm -rf /app/sglang && \
@@ -202,28 +252,35 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     rm -f /tmp/sglang-runtime-common.txt && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
-RUN echo "========== [SGLANG-ATOM 4/6] Validate vision/audio wheels ==========" && \
+# Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
+# runtime installs can perturb Triton; restore the base package before final
+# validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
+# runtime stack, matching the vLLM/OOT image policy above.
+RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
+    rm -rf "${SITE_PACKAGES}/triton" \
+           "${SITE_PACKAGES}"/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
+    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" "${SITE_PACKAGES}/"; \
+    done && \
+    rm -rf /tmp/triton-base-backup && \
+    "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show triton
+
+RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
     "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
     echo "Validated sglang launch_server entrypoint"
-
-# Only the derived SGLang image needs the newer Triton compiler. SGLang serving
-# for DeepSeek-R1 hit `ConvertTritonAMDGPUToLLVM` failures with the Triton that
-# ships in the shared ATOM base image, while Triton 3.6.0 fixes that compiler
-# path for this flow. Install Triton after the torchvision/torchaudio wheel pin
-# so pip does not downgrade it back to the torch-pinned 3.5.1 dependency. Keep
-# this override local to `atom_sglang` so the OOT/atom_release flow preserves
-# its prior Triton behavior.
-RUN echo "========== [SGLANG-ATOM 5/6] Install validated Triton ==========" && \
-    "${VENV_PYTHON}" -m pip install --no-cache-dir "triton==${SGLANG_TRITON_VERSION}" && \
-    "${VENV_PYTHON}" -m pip show triton
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
     "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl || true
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
 
 CMD ["/bin/bash"]
 
@@ -425,5 +482,57 @@ RUN echo "========== Install atomesh binary ==========" && \
     strip target/release/atomesh && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
+
+# ========== LMCache (HIP c_ops) for KV offload ==========
+# ATOM's KV offload uses the LMCache connector, which needs LMCache's c_ops
+# built for ROCm. NEVER `pip install lmcache` — it pulls CUDA torch and breaks
+# the ROCm stack. Build from source pinned to a release tag, against the image's
+# torch. KEY: the install must be EDITABLE (`pip install -e .`); at this tag a
+# non-editable `pip install .` silently SKIPS the c_ops extension and falls back
+# to the slow python backend. Verified end-to-end (tp8 offload store via c_ops)
+# on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
+# (device_id= to init_process_group); that belongs in aiter (tracked separately),
+# not here — the CI build_aiter stage picks it up once merged.
+ARG LMCACHE_TAG=v0.4.5
+# PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
+# hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
+# ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
+RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+    git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
+    cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
+    "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
+    CXX=hipcc BUILD_WITH_HIP=1 \
+      "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
+    "${VENV_PYTHON}" -m pip install --no-deps \
+        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
+    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
+from lmcache.v1.memory_management import MemoryFormat; \
+from lmcache.v1.lookup_client.factory import LookupClientFactory; \
+from lmcache.v1.config import LMCacheEngineConfig; \
+from lmcache.v1.metadata import LMCacheMetadata; \
+assert 'rocm' in torch.__version__, torch.__version__; \
+assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
+print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+
+# ========== SemiAnalysis aiperf agentic benchmark tool ==========
+# Install the SemiAnalysis fork pinned to the commit that supports the SA
+# agentic datasets (semianalysis_cc_traces_weka_062126*).
+ARG INSTALL_SA_AIPERF=1
+ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        rm -rf /opt/aiperf && \
+        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
+        cd /opt/aiperf && \
+        git checkout "${SA_AIPERF_COMMIT}" && \
+        "${VENV_PYTHON}" -m pip install -e . && \
+        "${VENV_PYTHON}" -m pip install --no-cache-dir "transformers==5.2.0" && \
+        "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
+        "${VENV_PYTHON}" -m pip show aiperf || true && \
+        command -v aiperf && aiperf --help >/dev/null; \
+    else \
+        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
 
 CMD ["/bin/bash"]
