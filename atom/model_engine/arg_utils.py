@@ -63,10 +63,10 @@ class EngineArgs:
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
-    enable_tbo: Optional[str] = None
-    all2all_backend: Optional[str] = None
+    enable_tbo: str | None = None
+    all2all_backend: str | None = None
     moe_backend: str = "standard"
-    method: Optional[str] = None
+    method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
     draft_model: str | None = None
