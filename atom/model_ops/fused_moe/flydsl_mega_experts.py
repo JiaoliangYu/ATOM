@@ -36,8 +36,6 @@ import os
 
 import torch
 
-from atom.utils.forward_context import get_forward_context
-
 logger = logging.getLogger("atom")
 
 _MEGA_CACHE: dict = {}
