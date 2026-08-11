@@ -262,29 +262,35 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         act = activation if activation is not None else ActivationType.Silu
         qt = quant_type if quant_type is not None else QuantType.No
 
-        def experts(lo, hi, seg, num_local_tokens=None):
-            """One fused_moe over rows[lo:hi] against a ``seg``-slot slice."""
+        def experts(lo, hi, seg, num_local_tokens=None, take=None, ids=None):
+            """One fused_moe over rows[lo:hi] against a ``seg``-slot slice.
+
+            ``take`` overrides where the weights come from (used for overflow
+            groups, which read the owner rank's pool); ``ids`` overrides the
+            per-row slot ids to match that tensor's expert count.
+            """
             if hi <= lo:
                 return
             n = hi - lo
+            sl = take if take is not None else (lambda e: self._slice(e, seg))
             fused_out = fused_moe(
                 rows[lo:hi],
-                self._slice(pools[0], seg),
-                self._slice(pools[1], seg),
+                sl(pools[0]),
+                sl(pools[1]),
                 torch.ones((n, 1), dtype=torch.float32, device=rows.device),
-                slot_ids[lo:hi],
+                slot_ids[lo:hi] if ids is None else ids,
                 None,
                 act,
                 quant_type=qt,
-                w1_scale=self._slice(pools[2], seg),
-                w2_scale=self._slice(pools[3], seg),
+                w1_scale=sl(pools[2]),
+                w2_scale=sl(pools[3]),
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 num_local_tokens=num_local_tokens,
                 hidden_pad=hidden_pad,
                 intermediate_pad=intermediate_pad,
-                bias1=self._slice(pools[4], seg) if pools[4][0] is not None else bias1,
-                bias2=self._slice(pools[5], seg) if pools[5][0] is not None else bias2,
+                bias1=sl(pools[4]) if pools[4][0] is not None else bias1,
+                bias2=sl(pools[5]) if pools[5][0] is not None else bias2,
                 dtype=dtype if dtype is not None else rows.dtype,
                 **(extra_kwargs or {}),
             )
@@ -295,11 +301,50 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # Decode: nothing migrated, so one call covers every row and the
             # row count stays on device -- no host sync anywhere in the step.
             experts(0, out.shape[0], (0, epn), self._op.valid_rows())
-            return out
-        home_end, total, nb = self._op.expert_call_split()
-        experts(0, home_end, (0, epn))
-        experts(home_end, total, (epn, epn + nb))
-        return out
+            return self._apply_route_weights(out)
+        home_lo, home_hi, mig_lo, mig_hi, nb = self._op.expert_call_split()
+        experts(home_lo, home_hi, (0, epn))
+        experts(mig_lo, mig_hi, (epn, epn + nb))
+
+        # Overflow: remote experts the planner routed rows to without giving
+        # this rank a prefetch slot.  MoonEP's contract covers this -- the
+        # weights are read from the owner over the symmetric mapping instead
+        # of a local slot, which is why the balancer may ignore B.  One call
+        # per group: rows are laid out in group order so each is contiguous,
+        # and a single-expert weight tensor keeps every declared expert
+        # routed-to (see expert_call_split on why spare slots zero the result).
+        for expert_id, lo, hi in self._op.overflow_groups():
+            owner, idx = divmod(expert_id, epn)
+            experts(
+                lo,
+                hi,
+                None,
+                take=lambda e, o=owner, i=idx: self._peer_slice(e, o, i),
+                ids=torch.zeros(
+                    (hi - lo, 1), dtype=torch.int32, device=rows.device
+                ),
+            )
+        return self._apply_route_weights(out)
+
+    def _apply_route_weights(self, out: torch.Tensor) -> torch.Tensor:
+        """Scale every dispatched row by its route weight, in place.
+
+        Nothing else in this path applies the router's weighting: the
+        ``fused_moe`` calls above pass ``torch.ones`` because their topk-1 ids
+        name pool *slots*, not experts, and MoonEP's combine kernel is built
+        with ``apply_route_weights=False`` so it sums the top-k contributions
+        with a weight of 1.0.  Dropping the weighting does not fail loudly --
+        every expert simply contributes equally, which reads as a plain
+        accuracy loss far downstream.  ``moonep_ep.py``, the reference caller
+        of this same op, weights here for exactly this reason.
+
+        Row order matches ``dispatched_weights`` by construction: both are
+        indexed by dispatch row.  Rows past ``cu_seqlens[-1]`` are scaled too
+        and hold whatever the last step left there, but no route points at
+        them, so combine never reads them.
+        """
+
+        return out.mul_(self._op.dispatched_weights()[:, None])
 
     ADOPTED = (
         "w13_weight",
@@ -397,6 +442,25 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return pool, flat
 
     @staticmethod
+    def _peer_slice(entry, owner, idx):
+        """A single expert read from ``owner``'s pool, shaped for fused_moe.
+
+        For overflow groups this rank never prefetched.  Exactly one expert,
+        so the caller passes all-zero slot ids -- a wider tensor would declare
+        experts no row routes to, which the quantised path answers with zeros.
+        """
+        pool, flat, shuffled = entry
+        if pool is None:
+            return None
+        t = pool.peer_home_view(owner)[idx : idx + 1]
+        t = t.reshape(-1, *t.shape[2:]) if flat else t
+        if shuffled:
+            # Same attribute-loss trap as _slice: a view does not inherit it,
+            # and fused_moe reads the layout off the attribute, not the data.
+            t.is_shuffled = True
+        return t
+
+    @staticmethod
     def _slice(entry, seg):
         """Slots ``seg`` of a pool, in the shape fused_moe expects.
 
@@ -426,5 +490,42 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # kernel must have written into get_expert_output_buffer(), otherwise
         # peers would gather a stale or unrelated allocation.
         result = self._op.combine_grouped(fused_expert_output)
+        self._check_weight_roundtrip(topk_weights, num_token)
         return result[:num_token]
+
+    _WEIGHT_CHECKED = False
+
+    def _check_weight_roundtrip(self, topk_weights, num_token) -> None:
+        """Assert the weight a row was scaled by is the weight it was routed with.
+
+        Off by default: it costs a device sync. Enable with
+        ``ATOM_MOONEP_CHECK_WEIGHTS=1``, once per process.
+
+        Combine gathers each route's scalar back from whichever rank ran the
+        expert, so this closes the loop over the whole weight path -- the
+        dispatch kernel's scatter, the duplicate rows the epilogue fills in,
+        and the peer indexing in combine -- against the router's own output.
+        A silent mismatch here would scale rows by the wrong token's weight,
+        which preserves neither magnitude nor direction but crashes nothing.
+        """
+        import os
+
+        if MoonEPPrepareAndFinalize._WEIGHT_CHECKED:
+            return
+        if os.environ.get("ATOM_MOONEP_CHECK_WEIGHTS", "0") != "1":
+            return
+        MoonEPPrepareAndFinalize._WEIGHT_CHECKED = True
+        got = self._op.gathered_weights()[:num_token].float()
+        want = topk_weights[:num_token].float()
+        diff = (got - want).abs().max().item()
+        logger.info(
+            "MoonEP weight round-trip: max|gathered - topk| = %.3e "
+            "(gathered sum %.4f absmax %.4f / topk sum %.4f absmax %.4f) %s",
+            diff,
+            got.sum().item(),
+            got.abs().max().item(),
+            want.sum().item(),
+            want.abs().max().item(),
+            "ok" if diff < 1e-6 else "MISMATCH",
+        )
 
