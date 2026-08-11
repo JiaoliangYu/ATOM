@@ -299,6 +299,16 @@ class FusedMoEModularKernel(torch.nn.Module):
         exact received-token trim for DP+EP mixed batches and overrides this
         method via a plugin patch -- keep this body frontend-agnostic.
         """
+        # Identity for backends that run their own experts step (MoonEP). This
+        # trim cuts the dead tail off mori's worst-case dispatch buffer; MoonEP
+        # has no dead tail (row count pinned by the planner's cu_seqlens) and
+        # its rows are ordered by expert group, so a graph_bs*topk*dp prefix
+        # would cut a group in half and corrupt the boundaries silently.
+        # Keyed off the same duck-typed hook the experts delegation uses, so
+        # there is exactly one place that decides "this is the MoonEP path".
+        if getattr(self.prepare_finalize, "run_experts", None) is not None:
+            return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
         context = get_forward_context().context
         if context is None:
             return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
@@ -395,6 +405,42 @@ class FusedMoEModularKernel(torch.nn.Module):
         # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
         # quant method's apply() via `moe_extra_args`.
         extra_kwargs = dict(moe_extra_args or {})
+
+        # MoonEP runs its own experts step. Its dispatched rows are already
+        # grouped by expert (boundaries in the planner's cu_seqlens), and some
+        # groups are served by *migrated* expert weights sitting in the prefetch
+        # buffer rather than by this rank's own w1/w2 -- neither of which
+        # fused_moe knows how to handle. Delegating keeps every MoonEP-specific
+        # assumption inside the MoonEP prepare/finalize instead of leaking the
+        # E+B group layout into this file.
+        run_experts = getattr(self.prepare_finalize, "run_experts", None)
+        if run_experts is not None:
+            fused_out = run_experts(
+                dispatch_a1,
+                w1,
+                w2,
+                activation=activation,
+                quant_type=quant_type,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
+                a2_scale=a2_scale,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                dtype=hidden_states.dtype,
+                extra_kwargs=extra_kwargs,
+            )
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
+
         fused_out = fused_moe(
             dispatch_a1,
             w1,

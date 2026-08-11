@@ -378,6 +378,10 @@ def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
 
 
+# MoonEP transports, shared across MoE layers; see _maybe_make_prepare_finalize.
+_MOONEP_OP_CACHE: dict = {}
+
+
 class FusedMoEMethodBase(QuantizeMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -475,6 +479,108 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         assert all2all_manager is not None
 
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+
+        # MoonEP EP backend (ATOM_EP_BACKEND=moonep).
+        #
+        # Deliberately does NOT go through all2all_manager: MoonEP is
+        # plan-driven rather than routing-driven, and registering it in
+        # aiter's all2all/communicator factory would mean editing files the
+        # mori and flydsl backends share.  Constructing the op here keeps the
+        # MoonEP path additive on the aiter side.
+        #
+        # MoonEP owns expert placement itself (it migrates weights via
+        # experts_to_copy), so EPLB must be off -- the two would fight over
+        # where experts live.
+        # This branch defaults to MoonEP rather than requiring the env var: it
+        # is a dedicated experiment branch, and a MoonEP run that silently fell
+        # back to mori would look like a working baseline instead of a
+        # misconfiguration.  Set ATOM_EP_BACKEND=mori to get the old path back.
+        #
+        # The gate above (use_all2all_kernels = dp_size > 1 and use_ep and
+        # _has_module("mori")) is already satisfied whenever EP is on, since
+        # MoonEP uses mori's shmem heap too, so nothing else needs relaxing.
+        import os as _os
+
+        if _os.environ.get("ATOM_EP_BACKEND", "moonep").lower() == "moonep":
+            from aiter.ops.flydsl.kernels.moonep_dispatch_combine_op import (
+                MoonEPDispatchCombineConfig,
+                MoonEPDispatchCombineIntraNodeOp,
+            )
+
+            from atom.model_ops.fused_moe.moonep_prepare_finalize import (
+                MoonEPPrepareAndFinalize,
+            )
+
+            num_local_experts = moe.num_experts // all2all_manager.world_size
+            moonep_cfg = MoonEPDispatchCombineConfig(
+                rank=all2all_manager.rank,
+                world_size=all2all_manager.world_size,
+                hidden_dim=moe.hidden_dim,
+                # The plan and every symmetric buffer are sized here and cannot
+                # grow later; a batch above this is rejected, not reallocated.
+                # It also sets the *cost*: the plan is fixed-shape, so every
+                # step -- including a one-token decode -- runs the experts over
+                # max_num_tokens * topk rows. moe.max_num_tokens is 16384, which
+                # makes each decode step as expensive as a 16k prefill. Override
+                # it down to whatever --max-num-batched-tokens actually allows;
+                # exceeding it raises rather than corrupts.
+                max_num_inp_token_per_rank=int(
+                    _os.environ.get("MOONEP_MAX_TOKENS", 0)
+                )
+                or moe.max_num_tokens,
+                num_experts_per_rank=num_local_experts,
+                num_experts_per_token=moe.experts_per_token,
+                # Matches what this function already passes mori:
+                # quant_dtype=moe.in_dtype ("We now use bfloat16 for mori").
+                data_type=moe.in_dtype,
+                # Migration slots. Each one costs a full expert's weights in
+                # the symmetric heap, so this is the knob that decides how much
+                # memory MoonEP adds; the planner's default is one per local
+                # expert, which doubles the MoE weights. Too few is loud, not
+                # silent -- local_group_sizes() raises when a destination is
+                # given a remote expert it has no slot for.
+                prefetch_slots=int(
+                    _os.environ.get("MOONEP_PREFETCH_SLOTS", "8")
+                ),
+                # Decode gets its own small, unbalanced plan; 0 disables it.
+                max_decode_token_per_rank=int(
+                    _os.environ.get("MOONEP_DECODE_TOKENS", "256")
+                ),
+            )
+            # Log unconditionally: ATOM has a history of EP backends silently
+            # falling back, and "no error" is not evidence the path was taken.
+            # Grep the server log for this line before trusting any number.
+            logger.info(
+                "MoonEP EP backend active: rank=%d world=%d hidden=%d "
+                "local_experts=%d topk=%d max_tokens=%d dtype=%s slots=%d",
+                moonep_cfg.rank,
+                moonep_cfg.world_size,
+                moonep_cfg.hidden_dim,
+                num_local_experts,
+                moonep_cfg.num_experts_per_token,
+                moonep_cfg.max_num_inp_token_per_rank,
+                moonep_cfg.data_type,
+                moonep_cfg.prefetch_slots,
+            )
+            # One op for the whole model, not one per layer. Its symmetric
+            # buffers are sized by max_num_tokens * topk and are reused within
+            # a layer (dispatch -> experts -> combine completes before the next
+            # layer starts), so a per-layer op would multiply tens of GB by the
+            # layer count for no benefit. This mirrors mori, whose op comes
+            # from the shared all2all_manager.
+            global _MOONEP_OP_CACHE
+            key = tuple(sorted(vars(moonep_cfg).items(), key=lambda kv: kv[0]))
+            op = _MOONEP_OP_CACHE.get(key)
+            if op is None:
+                op = MoonEPDispatchCombineIntraNodeOp(moonep_cfg)
+                _MOONEP_OP_CACHE[key] = op
+            return MoonEPPrepareAndFinalize(
+                op,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager.world_size,
+                num_local_experts=num_local_experts,
+                ep_group=get_ep_group(),
+            )
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
@@ -609,6 +715,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         prepare_finalize = self.maybe_make_prepare_finalize()
 
         if prepare_finalize is not None:
+            # MoonEP migrates expert weights between ranks, so peers must be
+            # able to P2P-read them -- only possible from mori's symmetric
+            # heap. This rebinds the layer's expert parameters onto that heap
+            # in place (no second copy) and adds B migration slots, the way
+            # EPLB sizes its redundant replicas. It has to run here, after
+            # process_weights_after_loading has produced the final shuffled,
+            # quantised tensors.
+            adopt_weights = getattr(prepare_finalize, "adopt_weights", None)
+            if adopt_weights is not None:
+                adopt_weights(layer)
+
             # logger.debug(
             #     "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             # )
