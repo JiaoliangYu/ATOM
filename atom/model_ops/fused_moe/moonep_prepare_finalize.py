@@ -258,6 +258,14 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     pool.prefetch(sel)
 
         slot_ids = self._op.row_slot_ids()
+        # The router's weighting. MoonEP's combine sums the top-k
+        # contributions unweighted -- upstream's combine is documented as a
+        # plain "K-sum back to token-major", with the route weights only
+        # gathered, not applied -- so weighting is this caller's job. Handing
+        # it to fused_moe puts it in the stage-2 epilogue, where it folds into
+        # the GEMM's accumulator: no separate pass over expert_output, and no
+        # rounding the weighted result through bf16 on the way.
+        row_w = self._op.dispatched_weights()
         out = self._op.get_expert_output_buffer()
         act = activation if activation is not None else ActivationType.Silu
         qt = quant_type if quant_type is not None else QuantType.No
@@ -268,16 +276,19 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             ``take`` overrides where the weights come from (used for overflow
             groups, which read the owner rank's pool); ``ids`` overrides the
             per-row slot ids to match that tensor's expert count.
+
+            The synthetic ids are topk-1 slot numbers rather than experts, but
+            the route weights are still the real ones: naming a slot instead of
+            an expert says nothing about how much that expert's output counts.
             """
             if hi <= lo:
                 return
-            n = hi - lo
             sl = take if take is not None else (lambda e: self._slice(e, seg))
             fused_out = fused_moe(
                 rows[lo:hi],
                 sl(pools[0]),
                 sl(pools[1]),
-                torch.ones((n, 1), dtype=torch.float32, device=rows.device),
+                row_w[lo:hi].unsqueeze(1),
                 slot_ids[lo:hi] if ids is None else ids,
                 None,
                 act,
@@ -301,7 +312,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # Decode: nothing migrated, so one call covers every row and the
             # row count stays on device -- no host sync anywhere in the step.
             experts(0, out.shape[0], (0, epn), self._op.valid_rows())
-            return self._apply_route_weights(out)
+            return out
         home_lo, home_hi, mig_lo, mig_hi, nb = self._op.expert_call_split()
         experts(home_lo, home_hi, (0, epn))
         experts(mig_lo, mig_hi, (epn, epn + nb))
@@ -324,27 +335,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     (hi - lo, 1), dtype=torch.int32, device=rows.device
                 ),
             )
-        return self._apply_route_weights(out)
-
-    def _apply_route_weights(self, out: torch.Tensor) -> torch.Tensor:
-        """Scale every dispatched row by its route weight, in place.
-
-        Nothing else in this path applies the router's weighting: the
-        ``fused_moe`` calls above pass ``torch.ones`` because their topk-1 ids
-        name pool *slots*, not experts, and MoonEP's combine kernel is built
-        with ``apply_route_weights=False`` so it sums the top-k contributions
-        with a weight of 1.0.  Dropping the weighting does not fail loudly --
-        every expert simply contributes equally, which reads as a plain
-        accuracy loss far downstream.  ``moonep_ep.py``, the reference caller
-        of this same op, weights here for exactly this reason.
-
-        Row order matches ``dispatched_weights`` by construction: both are
-        indexed by dispatch row.  Rows past ``cu_seqlens[-1]`` are scaled too
-        and hold whatever the last step left there, but no route points at
-        them, so combine never reads them.
-        """
-
-        return out.mul_(self._op.dispatched_weights()[:, None])
+        return out
 
     ADOPTED = (
         "w13_weight",
