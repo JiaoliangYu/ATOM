@@ -280,6 +280,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Fuse the shared expert into the MoRI all2all dispatch under DP attention,
+    # instead of running it as a standalone dense module on the alt stream.
+    # Off by default: it trades the dual-stream overlap (which hides the shared
+    # GEMM behind the routed all2all) for a per-rank replica of the shared
+    # weights, so it has to earn its keep on real traffic before it ships on.
+    "ATOM_FUSE_SHARED_EXPERT_MORI": lambda: (
+        os.getenv("ATOM_FUSE_SHARED_EXPERT_MORI", "0").lower() == "1"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",

@@ -39,6 +39,7 @@ from atom.model_ops.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
 )
 from atom.model_ops.fused_moe.expert_layout import (
+    SharedExpertDispatchLayout,
     count_local_base_experts,
     determine_expert_map,
     expert_region,
@@ -2615,7 +2616,35 @@ class FusedMoE(torch.nn.Module):
                 ),
                 dim=0,
             )
-        if fuse_shared_experts and self.num_fused_shared_experts > 0:
+        # Which shared-expert plumbing this layer uses. The AITER path keeps the
+        # single tail id + `init_aiter_topK_meta_data` round-robin buffer; the
+        # all2all path instead gives every rank its own dispatch id, because MoRI
+        # resolves a token's destination from the raw expert id and a shared id
+        # common to all ranks has no unique owner there.
+        self.fuse_shared_into_dispatch = (
+            fuse_shared_experts
+            and self.num_fused_shared_experts > 0
+            and self.moe_parallel_config.use_all2all_kernels
+        )
+        self.shared_dispatch_layout = (
+            SharedExpertDispatchLayout(
+                eplb_num_physical=self.global_num_experts,
+                ep_size=self.ep_size,
+                num_shared=self.num_fused_shared_experts,
+            )
+            if self.fuse_shared_into_dispatch
+            else None
+        )
+        # `init_aiter_topK_meta_data` prebuilds a topK buffer whose shared column
+        # is live only on tokens with `i % tp_size == tp_rank` -- a static
+        # round-robin that assumes every rank holds the SAME batch (TP). Under DP
+        # attention each rank owns different tokens, so that split would drop most
+        # of them; the all2all path builds its shared column per call instead.
+        if (
+            fuse_shared_experts
+            and self.num_fused_shared_experts > 0
+            and not self.fuse_shared_into_dispatch
+        ):
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -2672,6 +2701,7 @@ class FusedMoE(torch.nn.Module):
             experts_per_token=self.top_k,
             hidden_dim=hidden_size,
             num_local_experts=self.local_num_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,

@@ -320,6 +320,31 @@ class FusedMoEConfig:
 
     is_lora_enabled: bool = False
 
+    # Shared experts folded into the routed dispatch, if any. `num_experts`
+    # counts routed physical slots only (that is the space EPLB places and
+    # migrates in), so a fused shared expert lives OUTSIDE it -- one extra slot
+    # per rank, appended after that rank's routed slots. Use the two
+    # `*_dispatch` properties below to size an all2all backend; deriving them
+    # from `num_experts` drops the shared slot.
+    num_fused_shared_experts: int = 0
+
+    @property
+    def num_local_experts_dispatch(self) -> int:
+        """Local expert slots an all2all backend must be sized for.
+
+        NOT ``num_experts // world_size``: that is the routed-only count and
+        would make a backend that derives a token's destination from
+        ``id // num_experts_per_rank`` (MoRI) resolve the wrong rank for every
+        id past the first block. ``num_local_experts`` already carries the fused
+        shared slot, so it is the value to pass through.
+        """
+        return self.num_local_experts
+
+    @property
+    def experts_per_token_dispatch(self) -> int:
+        """Expert slots per token on the wire, including the shared column."""
+        return self.experts_per_token + self.num_fused_shared_experts
+
     def __post_init__(self):
         if self.dp_size > 1:
             logger.debug("Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens)

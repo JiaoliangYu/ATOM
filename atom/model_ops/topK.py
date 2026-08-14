@@ -8,6 +8,7 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
@@ -25,8 +26,15 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
+    # MoRI derives a token's destination rank from the raw expert id
+    # (`id // num_experts_per_rank`), so the fused shared expert cannot keep the
+    # single tail id that `expert_map` lets the AITER path share across ranks --
+    # it needs one dispatch id per rank. That translation lives behind
+    # ATOM_FUSE_SHARED_EXPERT_MORI; without it, fusion here would hand MoRI an
+    # out-of-range rank. Keep the standalone dual-stream path as the default.
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
-        return False
+        if not envs.ATOM_FUSE_SHARED_EXPERT_MORI:
+            return False
 
     if quant_config is not None and shared_expert_prefix is not None:
         shared_spec = quant_config.get_layer_quant_config(
