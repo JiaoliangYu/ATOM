@@ -824,17 +824,6 @@ class ModelRunner:
         setups that share the GPU with another process."""
         return 0
 
-    def _dummy_token_ids(self, n: int) -> list[int]:
-        """Build token ids for warmup, CUDAGraph capture, and DP-sync batches.
-
-        MegaMoE cannot use an all-zero dummy input: hash routing sends every
-        token to the same expert set and can overflow its dispatch/combine
-        buffers. Other backends retain the original all-zero behavior.
-        """
-        if self.config.moe_backend == "mega":
-            return [i % 8192 for i in range(n)]
-        return [0] * n
-
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
@@ -1161,7 +1150,7 @@ class ModelRunner:
         num_tokens_original = mtp_factor
 
         seq = Sequence(
-            self._dummy_token_ids(num_tokens_original),
+            [0] * num_tokens_original,
             block_size=self.block_size,
             id=-1,
         )
@@ -1223,7 +1212,7 @@ class ModelRunner:
 
         seqs = [
             Sequence(
-                self._dummy_token_ids(seq_len),
+                [0] * seq_len,
                 block_size=self.block_size,
             )
             for _ in range(num_seqs)
