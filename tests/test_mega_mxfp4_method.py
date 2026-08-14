@@ -73,6 +73,14 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
     method.is_guinterleave = True
     method.hidden_pad = 0
     method.intermediate_pad = 0
+    # Skip both pre-routing early returns so apply() reaches the post-routing
+    # block. use_triton_decode=False also short-circuits get_forward_context().
+    method.use_triton = False
+    method.use_triton_decode = False
+    method.select_experts_with_record = lambda **_kwargs: (
+        "topk_weights",
+        "topk_ids",
+    )
     layer = SimpleNamespace(
         w13_weight="w1",
         w2_weight="w2",
@@ -86,12 +94,12 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
         swiglu_limit=7.0,
     )
 
-    result = method._apply_after_routing(
+    result = method.apply(
         layer=layer,
         x="x",
-        topk_weights="topk_weights",
-        topk_ids="topk_ids",
+        router_logits="router_logits",
         top_k=4,
+        renormalize=False,
         global_num_experts=16,
         expert_map="expert_map",
         activation="silu",

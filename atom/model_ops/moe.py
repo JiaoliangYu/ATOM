@@ -1403,33 +1403,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
         )
-        return self._apply_after_routing(
-            layer=layer,
-            x=x,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=top_k,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
-
-    def _apply_after_routing(
-        self,
-        *,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        top_k: int,
-        global_num_experts: int,
-        expert_map: torch.Tensor | None,
-        activation: ActivationType,
-        apply_router_weight_on_input: bool,
-    ) -> torch.Tensor:
-        """Execute the standard MXFP4 path after routing and EPLB remapping."""
-        del top_k  # The standard kernels infer top-k from the routing tensors.
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
@@ -1445,7 +1418,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
-
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -1593,37 +1565,18 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 
     def init_prepare_finalize(self, layer: torch.nn.Module):
         # Mega includes dispatch, both GEMMs, and combine, so it must not
-        # allocate the standard MORI prepare/finalize modular kernel.
+        # allocate the standard MORI prepare/finalize modular kernel. Instead it
+        # installs itself as the whole-pipeline `fused_experts` backend, so the
+        # post-routing tail of the inherited `apply` dispatches to it exactly the
+        # way it dispatches to the MORI modular kernel.
+        from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
+
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-
-    def _apply_after_routing(
-        self,
-        *,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        top_k: int,
-        global_num_experts: int,
-        expert_map: torch.Tensor | None,
-        activation: ActivationType,
-        apply_router_weight_on_input: bool,
-    ) -> torch.Tensor:
-        del expert_map, activation, apply_router_weight_on_input
-        from atom.model_ops.fused_moe.flydsl_mega_experts import run_mega_moe
-
-        return run_mega_moe(
+        self.fused_experts = MegaFusedExperts(
             layer,
-            x,
-            topk_weights,
-            topk_ids,
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
-            experts=global_num_experts,
-            topk=top_k,
-            # todo decode use graph_bs for perf
             mtpr=self.moe.max_num_tokens,
-            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
             quant="a8w4",
         )
 

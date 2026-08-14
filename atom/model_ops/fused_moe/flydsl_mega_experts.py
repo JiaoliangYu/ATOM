@@ -219,3 +219,86 @@ def run_mega_moe(
         # construction (see the cache key above).
         out = mega.forward(x.contiguous(), wts, ids)
     return out
+
+
+class MegaFusedExperts:
+    """MegaMoE as a whole-pipeline ``fused_experts`` backend.
+
+    Mega owns dispatch + GEMM1 + activation + GEMM2 + combine, so it replaces
+    the entire modular kernel rather than plugging into its prepare/finalize
+    seam. It is installed on ``quant_method.fused_experts`` and is therefore
+    reached through the same ``if self.fused_experts: return self.fused_experts(...)``
+    dispatch at the tail of ``Mxfp4MoEMethod.apply`` that the MORI path uses --
+    Mega adds no dispatch layer and overrides no method on the quant method.
+
+    The layer is bound at construction (``init_prepare_finalize`` already
+    receives it) because Mega reads its weights from ``layer._mega_*``, which
+    the modular-kernel call signature does not carry.
+
+    Deliberately NOT an ``nn.Module``: it is reached purely by duck typing
+    (``if self.fused_experts: return self.fused_experts(...)``, no isinstance
+    checks anywhere), and holding ``layer`` on an ``nn.Module`` would register
+    it as a submodule -- layer -> quant_method -> fused_experts -> layer is a
+    cycle that breaks module traversal and duplicates the layer in state_dict.
+    """
+
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        *,
+        model_dim: int,
+        inter_dim: int,
+        mtpr: int,
+        quant: str = "a8w4",
+    ) -> None:
+        self._layer = layer
+        self._model_dim = model_dim
+        self._inter_dim = inter_dim
+        self._mtpr = mtpr
+        self._quant = quant
+
+    def __call__(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor | None = None,
+        w2: torch.Tensor | None = None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int = -1,
+        activation=None,
+        apply_router_weight_on_input: bool = False,
+        expert_map: torch.Tensor | None = None,
+        **_ignored,
+    ) -> torch.Tensor:
+        from aiter import ActivationType
+
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "mega does not support apply_router_weight_on_input=True"
+            )
+        if activation is not None and activation != ActivationType.Silu:
+            raise NotImplementedError(
+                f"mega hardcodes SwiGLU; got activation={activation}"
+            )
+        # w1/w2 are the emptied AITER staging buffers -- mega reads layer._mega_*.
+        # expert_map is intentionally unused: mega consumes *global physical*
+        # expert ids (see run_mega_moe), while expert_map is the global->local
+        # index remap the per-rank kernels need. It is always non-None under EP.
+        del w1, w2, expert_map
+
+        return run_mega_moe(
+            self._layer,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            model_dim=self._model_dim,
+            inter_dim=self._inter_dim,
+            experts=global_num_experts,
+            # Infer top-k from the routing tensors, same as the standard kernels.
+            topk=int(topk_ids.shape[1]),
+            # todo decode use graph_bs for perf
+            mtpr=self._mtpr,
+            swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
+            quant=self._quant,
+        )
