@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -9,6 +10,7 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 from aiter import QuantType, dtypes
 from aiter.jit.utils.chip_info import get_cu_num
@@ -41,6 +43,8 @@ def init_mori_op(
     max_token_type_size: int,
     low_latency: bool = False,
     instance_id: int = 0,
+    scale_type_size: int = torch.float32.itemsize,
+    quant_type: str = "none",
 ) -> Any:
     """
     Create a mori op instance.
@@ -77,7 +81,8 @@ def init_mori_op(
         data_type=data_type,
         hidden_dim=hidden_dim,
         scale_dim=scale_dim,
-        scale_type_size=torch.float32.itemsize,
+        scale_type_size=scale_type_size,
+        quant_type=quant_type,
         max_token_type_size=max_token_type_size,
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_local_experts,
@@ -98,6 +103,73 @@ def init_mori_op(
     return mori_op
 
 
+_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+)
+
+# Read once at import: the wire format is fixed for the life of the process, and
+# make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
+# not cache, so binding here also keeps it to a single getenv.
+_FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
+
+
+@dataclass(frozen=True)
+class MoriDispatchFormat:
+    """The one description of what goes on the wire, resolved once up front.
+
+    MoRI selects its dispatch kernel purely from the dtype of the tensor handed
+    to dispatch(), while the staging buffers it allocates come from the config
+    built at init. Those two have to agree: get a scale_dim/scale_type_size that
+    does not match what prepare() actually sends and MoRI strides the staging
+    scale buffer wrong and walks off the end of it (GPU memory fault on the first
+    real batch). Deriving all of them here, from one branch, is what keeps them
+    from drifting -- previously the fp4 decision was re-made in four places.
+    """
+
+    dtype: torch.dtype  # what dispatch() receives -> picks the MoRI kernel
+    quant_type: Any | None  # aiter QuantType for the pre-dispatch quantizer
+    scale_dim: int
+    scale_type_size: int
+
+    @property
+    def is_fp4(self) -> bool:
+        return self.dtype == dtypes.fp4x2
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.dtype in _FP8_DTYPES
+
+
+def resolve_mori_dispatch(
+    in_dtype: torch.dtype,
+    hidden_dim: int,
+    quant_config: FusedMoEQuantConfig | None = None,
+) -> MoriDispatchFormat:
+    """Decide the MoRI wire format. Call once per layer construction."""
+    if _FP4_DISPATCH:
+        # fp4 blockwise is one scale per 32 elements, not per 128 as fp8 uses,
+        # and get_hip_quant(per_1x32) emits e8m0 scales (1 byte), not fp32.
+        return MoriDispatchFormat(
+            dtype=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            scale_dim=hidden_dim // 32,
+            scale_type_size=torch.float8_e8m0fnu.itemsize,
+        )
+    # Everything else goes over the wire unquantized. fp8 dispatch is wired up
+    # below (is_fp8 / the fp8 branch in prepare) but not currently selected: the
+    # old code computed use_fp8_dispatch from the checkpoint dtype and then
+    # unconditionally cleared it again unless fp4 was on.
+    return MoriDispatchFormat(
+        dtype=in_dtype,
+        quant_type=None,
+        scale_dim=0,
+        scale_type_size=torch.float32.itemsize,
+    )
+
+
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     Prepare/Finalize using MoRI kernels.
@@ -108,8 +180,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         mori_op: Any,
         max_tokens_per_rank: int,
         num_dispatchers: int,
-        use_fp8_dispatch: bool = False,
-        quant_type=None,
+        dispatch_format: MoriDispatchFormat,
         quant_dtype: torch.dtype = None,
         is_async: bool = False,
         tbo_mori_ops: list | None = None,
@@ -125,11 +196,24 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self._tbo_mori_ops = tbo_mori_ops  # per-ubatch ops for TBO (IntraNode)
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
-        self.use_fp8_dispatch = use_fp8_dispatch
-        self.quant_type = quant_type
+        self.dispatch_format = dispatch_format
         self.quant_dtype = quant_dtype
         self._is_async = is_async
         self._low_latency = low_latency
+
+    # Derived from the resolved format so there is no second copy to keep in
+    # sync with the staging config.
+    @property
+    def use_fp4_dispatch(self) -> bool:
+        return self.dispatch_format.is_fp4
+
+    @property
+    def use_fp8_dispatch(self) -> bool:
+        return self.dispatch_format.is_fp8
+
+    @property
+    def quant_type(self):
+        return self.dispatch_format.quant_type
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -205,7 +289,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
         scale = None
-        if self.use_fp8_dispatch:
+        if self.use_fp4_dispatch:
+            from aiter import get_hip_quant
+
+            quant_func = get_hip_quant(self.quant_type or quant_type)
+            a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
+        elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
             quant_func = get_hip_quant(quant_type)
@@ -272,7 +361,24 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         ), "mori does not support apply_router_weight_on_input=True now."
 
         scale = None
-        if self.use_fp8_dispatch:
+        if self.use_fp4_dispatch:
+            from aiter import get_hip_quant
+
+            num_tokens = a1.shape[0]
+            if num_tokens > 0:
+                quant_func = get_hip_quant(self.quant_type or QuantType.per_1x32)
+                a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
+            else:
+                hidden_size = a1.shape[1] if a1.dim() > 1 else 0
+                a1 = torch.empty(a1.shape, dtype=dtypes.fp4x2, device=a1.device)
+                # per_1x32 emits e8m0 scales, one byte each -- must match the
+                # scale_type_size handed to MoRI in moe.py.
+                scale = torch.empty(
+                    (0, hidden_size // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=a1.device,
+                )
+        elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
             num_tokens = a1.shape[0]
