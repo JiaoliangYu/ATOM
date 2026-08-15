@@ -236,10 +236,16 @@ class SharedExpertDispatchLayout:
         in_range = (topk_ids >= 0) & (topk_ids < self.eplb_num_physical)
         routed = torch.where(in_range, shifted, topk_ids)
 
-        shared_ids = torch.tensor(
-            [self.shared_dispatch_id(ep_rank, j) for j in range(self.num_shared)],
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
+        # Build the shared ids on-device. `torch.tensor(python_list, device=...)`
+        # is a host->device copy, and CUDA graph capture rejects those unless the
+        # source is pinned -- decode captures this path, so it failed at rank
+        # init. The ids are the contiguous run starting at `shared_dispatch_id`,
+        # so `arange + base` gives the same values with no H2D traffic.
+        shared_ids = (
+            torch.arange(
+                self.num_shared, dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            + self.shared_dispatch_id(ep_rank, 0)
         ).expand(num_tokens, self.num_shared)
         shared_w = torch.full(
             (num_tokens, self.num_shared),
