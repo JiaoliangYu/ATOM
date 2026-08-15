@@ -457,13 +457,18 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             num_routing_experts=layer.global_num_experts - layer.num_redundant_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
+            # The dispatch adapter appends shared experts only after EPLB has
+            # mapped and recorded the routed IDs. The legacy AITER path still
+            # asks the router to populate its preallocated shared columns.
+            num_fused_shared_experts=(
+                0 if layer.fuse_shared_into_dispatch else layer.num_fused_shared_experts
+            ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         # Fused logical->physical remap + expert-load record
         topk_physical = eplb_map_and_record_fused(layer, topk_logical)
-        return topk_weights, topk_physical
+        return layer.prepare_dispatch_topk(topk_weights, topk_physical)
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -625,19 +630,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
-            # Hand the shared-expert dispatch layout to the modular kernel here
-            # rather than threading it through every quant method's apply(): this
-            # is the one place that already has the layer, so the four apply()
-            # signatures stay untouched. No-op when the layer does not fuse.
-            self.fused_experts.configure_shared_expert_dispatch(
-                layout=getattr(layer, "shared_dispatch_layout", None),
-                ep_rank=getattr(layer, "ep_rank", 0),
-                shared_weight=(
-                    1.0
-                    if is_rocm_aiter_fuse_routed_scaling_factor()
-                    else 1.0 / getattr(layer, "routed_scaling_factor", 1.0)
-                ),
-            )
 
     @property
     def using_modular_kernel(self) -> bool:
@@ -729,10 +721,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             num_routing_experts=global_num_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
+            num_fused_shared_experts=(
+                0 if layer.fuse_shared_into_dispatch else layer.num_fused_shared_experts
+            ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        topk_ids = eplb_map_and_record_fused(layer, topk_ids)
+        topk_weights, topk_ids = layer.prepare_dispatch_topk(topk_weights, topk_ids)
         if self.fused_experts:
             return self.fused_experts(
                 hidden_states=x,
@@ -1960,11 +1956,16 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
+            num_fused_shared_experts=(
+                0 if layer.fuse_shared_into_dispatch else layer.num_fused_shared_experts
+            ),
             num_routing_experts=layer.global_num_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+
+        topk_ids = eplb_map_and_record_fused(layer, topk_ids)
+        topk_weights, topk_ids = layer.prepare_dispatch_topk(topk_weights, topk_ids)
 
         # Get activation scales (may be None for dynamic quantization)
         a1_scale = getattr(layer, "w13_input_scale", None)
@@ -2398,9 +2399,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             num_routing_experts=global_num_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
+            num_fused_shared_experts=(
+                0 if layer.fuse_shared_into_dispatch else layer.num_fused_shared_experts
+            ),
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        topk_ids = eplb_map_and_record_fused(layer, topk_ids)
+        topk_weights, topk_ids = layer.prepare_dispatch_topk(topk_weights, topk_ids)
         # Match the 1x32 preshuffled layout above; other FP8 quant modes keep
         # the historical separated gate/up layout.
         gate_mode = (
@@ -2622,45 +2627,6 @@ class FusedMoE(torch.nn.Module):
             else None
         )
         if self.use_ep:
-            if self.fuse_shared_into_dispatch:
-                # `expert_mask` and `expert_map` live in DIFFERENT id spaces on
-                # this path, deliberately:
-                #   * expert_map stays in EPLB space (+ the AITER tail) because
-                #     its consumer is the weight loader, which speaks checkpoint
-                #     expert ids.
-                #   * expert_mask must speak *dispatch* space: MoRI hands the ids
-                #     we sent straight back, and modular_kernel forwards them to
-                #     aiter's fused_moe alongside this mask, which indexes it by
-                #     raw id. An EPLB-space mask would be read out of bounds.
-                layout = self.shared_dispatch_layout
-                expert_mask = torch.zeros(
-                    (layout.num_physical,),
-                    dtype=torch.int32,
-                    device=self.expert_map.device,
-                )
-                # Derive from expert_map rather than assuming the block is
-                # contiguous, so this keeps agreeing with determine_expert_map.
-                routed_local = self.expert_map > -1
-                routed_dispatch = torch.tensor(
-                    [
-                        layout.routed_to_dispatch(p)
-                        for p in range(self.global_num_experts)
-                    ],
-                    dtype=torch.long,
-                )
-                expert_mask[routed_dispatch[routed_local.cpu()]] = 1
-                for i in range(self.num_fused_shared_experts):
-                    expert_mask[layout.shared_dispatch_id(self.ep_rank, i)] = 1
-                self.expert_mask = expert_mask
-            else:
-                expert_mask = torch.ones(
-                    (self.global_num_experts + self.num_fused_shared_experts + 1,),
-                    dtype=torch.int32,
-                    device=self.expert_map.device,
-                )
-                expert_mask[-1] = 0
-                expert_mask[: self.global_num_experts] = self.expert_map > -1
-                self.expert_mask = expert_mask
             self.expert_map = torch.cat(
                 (
                     self.expert_map,
@@ -2679,6 +2645,7 @@ class FusedMoE(torch.nn.Module):
                 ),
                 dim=0,
             )
+            self.rebuild_expert_mask()
         # `init_aiter_topK_meta_data` prebuilds a topK buffer whose shared column
         # is live only on tokens with `i % tp_size == tp_rank` -- a static
         # round-robin that assumes every rank holds the SAME batch (TP). Under DP
@@ -2802,6 +2769,52 @@ class FusedMoE(torch.nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+
+    def prepare_dispatch_topk(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert routed physical IDs into the backend dispatch space.
+
+        Routing and EPLB deliberately see routed experts only. This final,
+        backend-neutral adapter inserts the per-rank shared slot before either
+        the modular MoRI backend or a future whole-pipeline backend consumes the
+        plan.
+        """
+        if self.shared_dispatch_layout is None:
+            return topk_weights, topk_ids
+        shared_weight = (
+            1.0
+            if is_rocm_aiter_fuse_routed_scaling_factor()
+            else 1.0 / self.routed_scaling_factor
+        )
+        return self.shared_dispatch_layout.apply_to_topk(
+            topk_ids, topk_weights, self.ep_rank, shared_weight
+        )
+
+    def rebuild_expert_mask(self) -> None:
+        """Rebuild the kernel mask after construction or an EPLB map update."""
+        if not self.use_ep or self.expert_map is None:
+            return
+        if self.shared_dispatch_layout is None:
+            self.expert_mask = (self.expert_map > -1).to(torch.int32)
+            return
+
+        layout = self.shared_dispatch_layout
+        device = self.expert_map.device
+        mask = torch.zeros(layout.num_physical, dtype=torch.int32, device=device)
+        routed_local = self.expert_map[: self.global_num_experts] > -1
+        routed_dispatch = torch.tensor(
+            [
+                layout.routed_to_dispatch(physical_id)
+                for physical_id in range(self.global_num_experts)
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        mask[routed_dispatch[routed_local]] = 1
+        for shared_index in range(self.num_fused_shared_experts):
+            mask[layout.shared_dispatch_id(self.ep_rank, shared_index)] = 1
+        self.expert_mask = mask
 
     def process_weights_after_loading(self):
         self._online_quant()

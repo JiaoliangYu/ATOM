@@ -147,25 +147,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         # self.fused_experts = fused_experts
         self.shared_experts = shared_experts
         self.quant_config = quant_config
-        # Set by `configure_shared_expert_dispatch` when the layer folds its
-        # shared expert into this dispatch. None (the default) leaves the topk
-        # untouched, so every other backend and frontend is unaffected.
-        self._shared_dispatch: tuple | None = None
-
-    def configure_shared_expert_dispatch(
-        self, layout, ep_rank: int, shared_weight: float
-    ) -> None:
-        """Fold a per-rank shared expert into this kernel's dispatch.
-
-        Kept here rather than in the quant methods' ``apply`` because the id
-        space belongs to the all2all boundary, which this class owns: the
-        backend resolves a token's destination rank from the raw expert id, so
-        the translation has to happen on the last hop before ``prepare`` and on
-        every quant method alike. Passing ``layout=None`` is a no-op.
-        """
-        self._shared_dispatch = (
-            None if layout is None else (layout, int(ep_rank), float(shared_weight))
-        )
 
     def output_is_reduced(self) -> bool:
         """
@@ -365,18 +346,6 @@ class FusedMoEModularKernel(torch.nn.Module):
             output = hidden_states
         else:
             output = None
-
-        # Translate the routed topk into the backend's id space and append this
-        # rank's shared column. Deliberately after any EPLB remap (which runs in
-        # the quant method's select_experts) and before `_prepare`: the shared
-        # expert must not exist in the EPLB id space, and must exist by the time
-        # the backend derives destination ranks. Rebinding both locals also
-        # carries the extra column into `_finalize`, so combine sums it back.
-        if self._shared_dispatch is not None:
-            _layout, _ep_rank, _shared_weight = self._shared_dispatch
-            topk_ids, topk_weights = _layout.apply_to_topk(
-                topk_ids, topk_weights, _ep_rank, _shared_weight
-            )
 
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
