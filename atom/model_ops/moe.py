@@ -727,7 +727,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        topk_ids = eplb_map_and_record_fused(layer, topk_ids)
         topk_weights, topk_ids = layer.prepare_dispatch_topk(topk_weights, topk_ids)
         if self.fused_experts:
             return self.fused_experts(
@@ -1964,7 +1963,6 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
 
-        topk_ids = eplb_map_and_record_fused(layer, topk_ids)
         topk_weights, topk_ids = layer.prepare_dispatch_topk(topk_weights, topk_ids)
 
         # Get activation scales (may be None for dynamic quantization)
@@ -2404,7 +2402,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ),
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        topk_ids = eplb_map_and_record_fused(layer, topk_ids)
         topk_weights, topk_ids = layer.prepare_dispatch_topk(topk_weights, topk_ids)
         # Match the 1x32 preshuffled layout above; other FP8 quant modes keep
         # the historical separated gate/up layout.
@@ -2617,6 +2614,14 @@ class FusedMoE(torch.nn.Module):
             and self.num_fused_shared_experts > 0
             and self.moe_parallel_config.use_all2all_kernels
         )
+        if self.fuse_shared_into_dispatch and custom_routing_function is not None:
+            raise NotImplementedError(
+                "Fusing shared experts into the all2all dispatch does not yet "
+                "support custom routing functions. The current implementation "
+                "targets DeepSeek-R1 grouped top-k; custom routers such as "
+                "DeepSeek-V4 hash routing still depend on the legacy AITER "
+                "shared-expert metadata."
+            )
         self.shared_dispatch_layout = (
             SharedExpertDispatchLayout(
                 eplb_num_physical=self.global_num_experts,
