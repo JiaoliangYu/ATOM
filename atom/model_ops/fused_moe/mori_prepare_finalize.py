@@ -119,17 +119,6 @@ _FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
 
 @dataclass(frozen=True)
 class MoriDispatchFormat:
-    """The one description of what goes on the wire, resolved once up front.
-
-    MoRI selects its dispatch kernel purely from the dtype of the tensor handed
-    to dispatch(), while the staging buffers it allocates come from the config
-    built at init. Those two have to agree: get a scale_dim/scale_type_size that
-    does not match what prepare() actually sends and MoRI strides the staging
-    scale buffer wrong and walks off the end of it (GPU memory fault on the first
-    real batch). Deriving all of them here, from one branch, is what keeps them
-    from drifting -- previously the fp4 decision was re-made in four places.
-    """
-
     dtype: torch.dtype  # what dispatch() receives -> picks the MoRI kernel
     quant_type: Any | None  # aiter QuantType for the pre-dispatch quantizer
     scale_dim: int
@@ -159,10 +148,6 @@ def resolve_mori_dispatch(
             scale_dim=hidden_dim // 32,
             scale_type_size=torch.float8_e8m0fnu.itemsize,
         )
-    # Everything else goes over the wire unquantized. fp8 dispatch is wired up
-    # below (is_fp8 / the fp8 branch in prepare) but not currently selected: the
-    # old code computed use_fp8_dispatch from the checkpoint dtype and then
-    # unconditionally cleared it again unless fp4 was on.
     return MoriDispatchFormat(
         dtype=in_dtype,
         quant_type=None,
