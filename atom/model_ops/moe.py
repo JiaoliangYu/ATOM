@@ -625,6 +625,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
+            # Hand the shared-expert dispatch layout to the modular kernel here
+            # rather than threading it through every quant method's apply(): this
+            # is the one place that already has the layer, so the four apply()
+            # signatures stay untouched. No-op when the layer does not fuse.
+            self.fused_experts.configure_shared_expert_dispatch(
+                layout=getattr(layer, "shared_dispatch_layout", None),
+                ep_rank=getattr(layer, "ep_rank", 0),
+                shared_weight=(
+                    1.0
+                    if is_rocm_aiter_fuse_routed_scaling_factor()
+                    else 1.0 / getattr(layer, "routed_scaling_factor", 1.0)
+                ),
+            )
 
     @property
     def using_modular_kernel(self) -> bool:
@@ -2589,33 +2602,6 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
-        if self.use_ep:
-            expert_mask = torch.ones(
-                (self.global_num_experts + self.num_fused_shared_experts + 1,),
-                dtype=torch.int32,
-                device=self.expert_map.device,
-            )
-            expert_mask[-1] = 0
-            expert_mask[: self.global_num_experts] = self.expert_map > -1
-            self.expert_mask = expert_mask
-            self.expert_map = torch.cat(
-                (
-                    self.expert_map,
-                    torch.tensor(
-                        [
-                            self.local_num_experts + i
-                            for i in range(self.num_fused_shared_experts)
-                        ],
-                        dtype=torch.int32,
-                    ),
-                    # Sentinel entry for the fake expert ID
-                    # (global_num_experts + num_fused_shared_experts) used by
-                    # aiter topK to mark non-local tokens when EP is active.
-                    # Must map to -1 so that EP remapping zeros their weights.
-                    torch.tensor([-1], dtype=torch.int32),
-                ),
-                dim=0,
-            )
         # Which shared-expert plumbing this layer uses. The AITER path keeps the
         # single tail id + `init_aiter_topK_meta_data` round-robin buffer; the
         # all2all path instead gives every rank its own dispatch id, because MoRI
@@ -2635,6 +2621,64 @@ class FusedMoE(torch.nn.Module):
             if self.fuse_shared_into_dispatch
             else None
         )
+        if self.use_ep:
+            if self.fuse_shared_into_dispatch:
+                # `expert_mask` and `expert_map` live in DIFFERENT id spaces on
+                # this path, deliberately:
+                #   * expert_map stays in EPLB space (+ the AITER tail) because
+                #     its consumer is the weight loader, which speaks checkpoint
+                #     expert ids.
+                #   * expert_mask must speak *dispatch* space: MoRI hands the ids
+                #     we sent straight back, and modular_kernel forwards them to
+                #     aiter's fused_moe alongside this mask, which indexes it by
+                #     raw id. An EPLB-space mask would be read out of bounds.
+                layout = self.shared_dispatch_layout
+                expert_mask = torch.zeros(
+                    (layout.num_physical,),
+                    dtype=torch.int32,
+                    device=self.expert_map.device,
+                )
+                # Derive from expert_map rather than assuming the block is
+                # contiguous, so this keeps agreeing with determine_expert_map.
+                routed_local = self.expert_map > -1
+                routed_dispatch = torch.tensor(
+                    [
+                        layout.routed_to_dispatch(p)
+                        for p in range(self.global_num_experts)
+                    ],
+                    dtype=torch.long,
+                )
+                expert_mask[routed_dispatch[routed_local.cpu()]] = 1
+                for i in range(self.num_fused_shared_experts):
+                    expert_mask[layout.shared_dispatch_id(self.ep_rank, i)] = 1
+                self.expert_mask = expert_mask
+            else:
+                expert_mask = torch.ones(
+                    (self.global_num_experts + self.num_fused_shared_experts + 1,),
+                    dtype=torch.int32,
+                    device=self.expert_map.device,
+                )
+                expert_mask[-1] = 0
+                expert_mask[: self.global_num_experts] = self.expert_map > -1
+                self.expert_mask = expert_mask
+            self.expert_map = torch.cat(
+                (
+                    self.expert_map,
+                    torch.tensor(
+                        [
+                            self.local_num_experts + i
+                            for i in range(self.num_fused_shared_experts)
+                        ],
+                        dtype=torch.int32,
+                    ),
+                    # Sentinel entry for the fake expert ID
+                    # (global_num_experts + num_fused_shared_experts) used by
+                    # aiter topK to mark non-local tokens when EP is active.
+                    # Must map to -1 so that EP remapping zeros their weights.
+                    torch.tensor([-1], dtype=torch.int32),
+                ),
+                dim=0,
+            )
         # `init_aiter_topK_meta_data` prebuilds a topK buffer whose shared column
         # is live only on tokens with `i % tp_size == tp_rank` -- a static
         # round-robin that assumes every rank holds the SAME batch (TP). Under DP

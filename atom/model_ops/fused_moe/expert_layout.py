@@ -206,44 +206,51 @@ class SharedExpertDispatchLayout:
         """Dispatch id -> owning rank, the way the all2all backend computes it."""
         return dispatch_id // self.slots_per_rank
 
-    def eplb_gather_index(
-        self, device: torch.device | None = None
-    ) -> torch.Tensor | None:
-        """Index that folds a dispatch-space load histogram back to EPLB space.
+    def apply_to_topk(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        ep_rank: int,
+        shared_weight: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rewrite a routed topk into dispatch space and append the shared column.
 
-        ``out[p] = histogram[routed_to_dispatch(p)]`` for every EPLB physical id
-        ``p``.  Needed because the histogram is recorded in dispatch space (so the
-        shared slots get their own bins instead of colliding with routed ids),
-        while ``physical_load_to_logical_load`` and the placement policies expect
-        EPLB-space widths.
+        Must run AFTER any EPLB logical->physical remap: it consumes EPLB
+        *physical* ids. Running it earlier would put the shared column into the
+        EPLB id space, where it would collide with a routed slot and pollute the
+        expert-load histogram -- the whole reason the shared expert is kept out
+        of that space is that it is hit by every token, so its per-rank load is a
+        large constant that would drive balancedness toward 1 and mask the routed
+        imbalance the rebalance gate exists to detect.
 
-        Returns ``None`` when no shared expert is fused -- the two spaces are then
-        identical and the caller should skip the gather entirely.
+        Ids outside ``[0, eplb_num_physical)`` are passed through untouched, so
+        any sentinel a caller uses survives. This matters for correctness, not
+        just tidiness: floor division sends -1 to -2 under the shift.
         """
-        if self.num_shared == 0:
-            return None
-        eplb_ids = torch.arange(self.eplb_num_physical, dtype=torch.long, device=device)
-        return eplb_ids + self.num_shared * (eplb_ids // self.routed_slots_per_rank)
+        assert self.num_shared > 0, "apply_to_topk requires a fused shared expert"
+        num_tokens = topk_ids.shape[0]
 
-    def shared_slot_index(
-        self, device: torch.device | None = None
-    ) -> torch.Tensor | None:
-        """Dispatch-space bins holding shared experts, one block per rank.
+        shifted = topk_ids + self.num_shared * (
+            topk_ids // self.routed_slots_per_rank
+        )
+        in_range = (topk_ids >= 0) & (topk_ids < self.eplb_num_physical)
+        routed = torch.where(in_range, shifted, topk_ids)
 
-        The load histogram must zero these before it is consumed: a shared expert
-        is hit by every token, so its per-rank load is a large constant.  Feeding
-        that into ``_compute_balancedness`` would add the same offset to every
-        GPU's total and drive mean/max toward 1, masking the routed imbalance the
-        gate is supposed to detect.
-
-        Returns ``None`` when no shared expert is fused.
-        """
-        if self.num_shared == 0:
-            return None
-        ranks = torch.arange(self.ep_size, dtype=torch.long, device=device)
-        block = ranks * self.slots_per_rank + self.routed_slots_per_rank
-        offsets = torch.arange(self.num_shared, dtype=torch.long, device=device)
-        return (block[:, None] + offsets[None, :]).reshape(-1)
+        shared_ids = torch.tensor(
+            [self.shared_dispatch_id(ep_rank, j) for j in range(self.num_shared)],
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(num_tokens, self.num_shared)
+        shared_w = torch.full(
+            (num_tokens, self.num_shared),
+            shared_weight,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        return (
+            torch.cat((routed, shared_ids), dim=1),
+            torch.cat((topk_weights, shared_w), dim=1),
+        )
 
 
 def expert_shard_dim(shard_id: str, is_transposed: bool = False) -> int:
