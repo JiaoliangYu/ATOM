@@ -79,6 +79,34 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
+# One INFO line per rank, the first time a layer folds its shared expert into the
+# dispatch. `ATOM_FUSE_SHARED_EXPERT_MORI` has several silent fall-through paths
+# (dp_size, whether mori is importable, the quant config), and a switch that was
+# silently ignored looks exactly like a feature that did not help -- which is the
+# one thing an A/B must never confuse. Logging the resolved layout also surfaces
+# the per-rank shared id, the detail the whole design turns on.
+_shared_fuse_logged = False
+
+
+def _log_shared_fuse_once(layout, ep_rank: int, ep_size: int, top_k: int) -> None:
+    global _shared_fuse_logged
+    if _shared_fuse_logged:
+        return
+    _shared_fuse_logged = True
+    logger.info(
+        "Fused shared expert -> MoRI dispatch: rank %d/%d holds %d routed + %d "
+        "shared slots (dispatch width %d, this rank's shared id %d); "
+        "topk %d -> %d on the wire",
+        ep_rank,
+        ep_size,
+        layout.routed_slots_per_rank,
+        layout.num_shared,
+        layout.num_physical,
+        layout.shared_dispatch_id(ep_rank),
+        top_k,
+        top_k + layout.num_shared,
+    )
+
 
 class MoEActivationQuant(Enum):
     BF16 = "bf16"
@@ -2631,6 +2659,10 @@ class FusedMoE(torch.nn.Module):
             if self.fuse_shared_into_dispatch
             else None
         )
+        if self.fuse_shared_into_dispatch:
+            _log_shared_fuse_once(
+                self.shared_dispatch_layout, self.ep_rank, self.ep_size, self.top_k
+            )
         if self.use_ep:
             self.expert_map = torch.cat(
                 (
