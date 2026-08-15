@@ -2792,9 +2792,13 @@ class FusedMoE(torch.nn.Module):
             if is_rocm_aiter_fuse_routed_scaling_factor()
             else 1.0 / self.routed_scaling_factor
         )
-        return self.shared_dispatch_layout.apply_to_topk(
+        # `apply_to_topk` mirrors its own argument order and hands back
+        # (ids, weights); every caller here takes (weights, ids). Swap once, at
+        # the boundary, rather than making one of the two orders lie.
+        topk_ids, topk_weights = self.shared_dispatch_layout.apply_to_topk(
             topk_ids, topk_weights, self.ep_rank, shared_weight
         )
+        return topk_weights, topk_ids
 
     def rebuild_expert_mask(self) -> None:
         """Rebuild the kernel mask after construction or an EPLB map update."""
