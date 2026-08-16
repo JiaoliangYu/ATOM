@@ -29,7 +29,7 @@ from atom.config import (
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.eplb import eplb_map_and_record_fused
+from atom.model_ops.eplb import eplb_map_record_and_dispatch
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -79,12 +79,8 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-# One INFO line per rank, the first time a layer folds its shared expert into the
-# dispatch. `ATOM_FUSE_SHARED_EXPERT_MORI` has several silent fall-through paths
-# (dp_size, whether mori is importable, the quant config), and a switch that was
-# silently ignored looks exactly like a feature that did not help -- which is the
-# one thing an A/B must never confuse. Logging the resolved layout also surfaces
-# the per-rank shared id, the detail the whole design turns on.
+# `ATOM_FUSE_SHARED_EXPERT_MORI` has several silent fall-through paths, so a
+# switch that was ignored looks the same as a feature that did not help.
 _shared_fuse_logged = False
 
 
@@ -494,9 +490,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        # Fused logical->physical remap + expert-load record
-        topk_physical = eplb_map_and_record_fused(layer, topk_logical)
-        return layer.prepare_dispatch_topk(topk_weights, topk_physical)
+        # Fused logical->physical remap + expert-load record + dispatch space
+        return layer.map_record_and_dispatch(topk_weights, topk_logical)
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -2807,16 +2802,26 @@ class FusedMoE(torch.nn.Module):
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
 
+    def map_record_and_dispatch(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """EPLB remap + load record + dispatch space, in one Triton launch."""
+        return self._dispatch_topk(topk_weights, topk_ids, skip_eplb=False)
+
     def prepare_dispatch_topk(
         self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert routed physical IDs into the backend dispatch space.
 
-        Routing and EPLB deliberately see routed experts only. This final,
-        backend-neutral adapter inserts the per-rank shared slot before either
-        the modular MoRI backend or a future whole-pipeline backend consumes the
-        plan.
+        No EPLB remap: these callers are not exercised today, so the fusion
+        leaves their routing behaviour untouched.
         """
+        return self._dispatch_topk(topk_weights, topk_ids, skip_eplb=True)
+
+    def _dispatch_topk(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor, *, skip_eplb: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shared body: one Triton launch, with or without the EPLB remap."""
         if self.shared_dispatch_layout is None:
             return topk_weights, topk_ids
         shared_weight = (
@@ -2824,13 +2829,14 @@ class FusedMoE(torch.nn.Module):
             if is_rocm_aiter_fuse_routed_scaling_factor()
             else 1.0 / self.routed_scaling_factor
         )
-        # `apply_to_topk` mirrors its own argument order and hands back
-        # (ids, weights); every caller here takes (weights, ids). Swap once, at
-        # the boundary, rather than making one of the two orders lie.
-        topk_ids, topk_weights = self.shared_dispatch_layout.apply_to_topk(
-            topk_ids, topk_weights, self.ep_rank, shared_weight
+        return eplb_map_record_and_dispatch(
+            self,
+            topk_weights,
+            topk_ids,
+            self.shared_dispatch_layout,
+            shared_weight,
+            skip_eplb=skip_eplb,
         )
-        return topk_weights, topk_ids
 
     def rebuild_expert_mask(self) -> None:
         """Rebuild the kernel mask after construction or an EPLB map update."""

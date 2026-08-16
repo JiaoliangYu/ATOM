@@ -2598,6 +2598,79 @@ if _EPLB_HAS_TRITON:
         bins = tl.arange(0, NUM_BINS)
         tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
+    @triton.jit
+    def _eplb_map_record_dispatch_kernel(
+        topk_ids_ptr,  # [ntok, topk]      logical ids
+        topk_w_ptr,  # [ntok, topk]      routed weights
+        dispatch_ptr,  # [num_logical]     logical->physical (int32); dummy if no EPLB
+        out_ids_ptr,  # [ntok, out_width] dispatch-space ids
+        out_w_ptr,  # [ntok, out_width] weights
+        load_ptr,  # [num_physical]    per-pass load counter; dummy if not RECORD
+        num_logical,
+        id_delta,
+        num_physical,
+        eplb_num_physical,
+        routed_per_rank,
+        shared_base,
+        shared_weight,
+        topk,
+        n_out,
+        out_width,
+        HAS_EPLB: tl.constexpr,
+        RECORD: tl.constexpr,
+        NUM_SHARED: tl.constexpr,
+        BLOCK: tl.constexpr,
+        NUM_BINS: tl.constexpr,
+    ):
+        """EPLB remap + load record + dispatch-space rewrite + shared column.
+
+        Iterates over output elements, not input, so the shared column is
+        written in place instead of concatenated.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_out
+
+        row = offs // out_width
+        col = offs % out_width
+        is_routed = col < topk
+        rmask = mask & is_routed
+
+        in_off = row * topk + col
+        lid = tl.load(topk_ids_ptr + in_off, mask=rmask, other=-1).to(tl.int64)
+
+        if HAS_EPLB:
+            valid = (lid >= 0) & (lid < num_logical)
+            is_tail = lid >= num_logical
+            safe_lid = tl.where(valid, lid, 0)
+            mapped = tl.load(dispatch_ptr + safe_lid, mask=rmask & valid, other=0).to(
+                tl.int64
+            )
+            phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
+        else:
+            phys = lid
+
+        # Out-of-range ids pass through: floor division would send -1 to -2.
+        in_range = (phys >= 0) & (phys < eplb_num_physical)
+        shifted = phys + NUM_SHARED * (phys // routed_per_rank)
+        disp = tl.where(in_range, shifted, phys)
+
+        sid = shared_base + (col - topk)
+        tl.store(out_ids_ptr + offs, tl.where(is_routed, disp, sid), mask=mask)
+
+        w = tl.load(topk_w_ptr + in_off, mask=rmask, other=0.0)
+        tl.store(out_w_ptr + offs, tl.where(is_routed, w, shared_weight), mask=mask)
+
+        if RECORD:
+            # Physical ids only, never the shared column: shared is hit by every
+            # token, so it would swamp the histogram and hide routed imbalance.
+            in_hist = rmask & (phys >= 0) & (phys < num_physical)
+            bin_idx = tl.where(in_hist, phys, num_physical).to(tl.int32)
+            hist = tl.histogram(bin_idx, NUM_BINS)
+            bins = tl.arange(0, NUM_BINS)
+            hmask = (bins < num_physical) & (hist > 0)
+            tl.atomic_add(load_ptr + bins, hist, mask=hmask)
+
 
 def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
     """Fused logical->physical remap + expert-load record (one Triton launch).
@@ -2699,3 +2772,118 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             TOP_K=top_k,
         )
     return out
+
+
+def eplb_map_record_and_dispatch(
+    layer: Any,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    layout: Any,
+    shared_weight: float,
+    skip_eplb: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """EPLB remap + load record + dispatch space + shared column, one launch.
+
+    Returns ``(weights, ids)``. Unfused this was 11 elementwise kernels plus 2
+    `torch.cat` per layer per step -- plain torch inside the `aiter.moe_forward`
+    custom op, which inductor cannot fuse into.
+
+    `skip_eplb=True` skips the remap: the quant methods' `apply` are not
+    exercised today, so the fusion leaves their routing behaviour alone.
+    """
+    if layout is None or not _EPLB_HAS_TRITON:
+        return _map_record_and_dispatch_torch(layer, topk_weights, topk_ids, layout,
+                                              shared_weight, skip_eplb)
+
+    meta = get_live_expert_location_metadata()
+    layer_id = getattr(layer, "layer_id", None)
+    has_eplb = (
+        not skip_eplb and meta is not None and isinstance(layer_id, int)
+    )
+
+    ntok, topk = topk_ids.shape
+    num_shared = layout.num_shared
+    out_width = topk + num_shared
+    n_out = ntok * out_width
+    if n_out == 0:
+        return _map_record_and_dispatch_torch(layer, topk_weights, topk_ids, layout,
+                                              shared_weight)
+
+    if has_eplb:
+        dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
+        if dispatch.device != topk_ids.device:
+            dispatch = dispatch.to(topk_ids.device)
+        num_logical = int(dispatch.numel())
+        num_physical = int(meta.num_physical_experts)
+    else:
+        dispatch = topk_ids
+        num_logical = 0
+        num_physical = layout.eplb_num_physical
+    id_delta = num_physical - num_logical
+
+    from atom.config import get_current_atom_config
+
+    load_buf = None
+    if has_eplb and bool(getattr(get_current_atom_config(), "eplb_enable", False)):
+        atom_cfg = get_current_atom_config()
+        monitor = get_expert_load_monitor(
+            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+        )
+        load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+    record = load_buf is not None
+
+    out_ids = torch.empty(
+        (ntok, out_width), dtype=topk_ids.dtype, device=topk_ids.device
+    )
+    out_w = torch.empty(
+        (ntok, out_width), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+    # Unused pointers must still be real tensors; constexpr guards elide access.
+    if load_buf is None:
+        load_buf = out_ids
+
+    def grid(meta_kw):
+        return (triton.cdiv(n_out, meta_kw["BLOCK"]),)
+
+    _eplb_map_record_dispatch_kernel[grid](
+        topk_ids.contiguous(),
+        topk_weights.contiguous(),
+        dispatch,
+        out_ids,
+        out_w,
+        load_buf,
+        num_logical,
+        id_delta,
+        num_physical,
+        layout.eplb_num_physical,
+        layout.routed_slots_per_rank,
+        layout.shared_dispatch_id(layer.ep_rank, 0),
+        shared_weight,
+        topk,
+        n_out,
+        out_width,
+        HAS_EPLB=has_eplb,
+        RECORD=record,
+        NUM_SHARED=num_shared,
+        BLOCK=256,
+        NUM_BINS=1 << num_physical.bit_length(),
+    )
+    return out_w, out_ids
+
+
+def _map_record_and_dispatch_torch(
+    layer: Any,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    layout: Any,
+    shared_weight: float,
+    skip_eplb: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference path: the original two steps, unfused. Also the CPU fallback."""
+    topk_physical = topk_ids if skip_eplb else eplb_map_and_record_fused(layer, topk_ids)
+    if layout is None:
+        return topk_weights, topk_physical
+    ids, weights = layout.apply_to_topk(
+        topk_physical, topk_weights, layer.ep_rank, shared_weight
+    )
+    return weights, ids

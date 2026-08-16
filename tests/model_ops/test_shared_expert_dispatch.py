@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+import atom.model_ops.eplb as eplb_module
 import atom.model_ops.moe as moe_module
 from atom.model_ops.fused_moe.expert_layout import SharedExpertDispatchLayout
 from atom.model_ops.moe import FusedMoE, FusedMoEMethodBase
@@ -9,7 +10,7 @@ from atom.model_ops.moe import FusedMoE, FusedMoEMethodBase
 
 def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
     layout = SharedExpertDispatchLayout(eplb_num_physical=8, ep_size=2, num_shared=1)
-    return SimpleNamespace(
+    ns = SimpleNamespace(
         fuse_shared_into_dispatch=True,
         num_fused_shared_experts=1,
         global_num_experts=8,
@@ -17,10 +18,15 @@ def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
         routed_scaling_factor=2.0,
         shared_dispatch_layout=layout,
         ep_rank=ep_rank,
+        layer_id=None,
         use_ep=True,
         expert_map=torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3, 4, -1]),
         expert_mask=torch.empty(0, dtype=torch.int32),
     )
+    ns._dispatch_topk = lambda w, i, *, skip_eplb: FusedMoE._dispatch_topk(
+        ns, w, i, skip_eplb=skip_eplb
+    )
+    return ns
 
 
 def test_prepare_dispatch_topk_is_backend_neutral(monkeypatch):
@@ -28,6 +34,8 @@ def test_prepare_dispatch_topk_is_backend_neutral(monkeypatch):
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: False
     )
+    # No GPU here; pin to the torch reference.
+    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
     routed_ids = torch.tensor([[0, 4], [3, -1]], dtype=torch.int32)
     routed_weights = torch.tensor([[0.7, 0.3], [0.6, 0.0]])
 
@@ -64,17 +72,20 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
         return routed_weights, routed_ids
 
     def fake_map_and_record(received_layer, received_ids):
+        # EPLB must see routed ids only.
         assert received_layer is layer
         assert received_ids.shape[1] == 2
         return received_ids
 
     monkeypatch.setattr(FusedMoE, "select_experts", fake_select_experts)
-    monkeypatch.setattr(moe_module, "eplb_map_and_record_fused", fake_map_and_record)
+    monkeypatch.setattr(eplb_module, "eplb_map_and_record_fused", fake_map_and_record)
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
-    layer.prepare_dispatch_topk = lambda weights, ids: FusedMoE.prepare_dispatch_topk(
-        layer, weights, ids
+    # Pins the ordering router -> EPLB -> shared, not the kernel arithmetic.
+    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
+    layer.map_record_and_dispatch = lambda weights, ids: (
+        FusedMoE.map_record_and_dispatch(layer, weights, ids)
     )
 
     weights, ids = FusedMoEMethodBase.select_experts_with_record(
