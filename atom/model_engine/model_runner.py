@@ -38,9 +38,12 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.sub_pool_spec import (
     InsufficientPoolBudget,
@@ -740,6 +743,7 @@ class ModelRunner:
         # builder through paths that ask for their entry counts, and those must
         # read 0 ("no pool yet") rather than trip over a missing attribute.
         self.pool_plan = PoolPlan.empty()
+        self.state_runtime = StateRuntime()
         # Sanity-check: any builder that allocates a per-request cache must
         # have its model_type listed in `InputOutputProcessor`'s
         # `per_req_cache_model_types` set; otherwise sequences will be
@@ -1149,7 +1153,11 @@ class ModelRunner:
         mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
+        seq = Sequence(
+            [0] * num_tokens_original,
+            block_size=self.block_size,
+            id=-1,
+        )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
@@ -1207,7 +1215,11 @@ class ModelRunner:
             seq_len = max_model_len
 
         seqs = [
-            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
+            Sequence(
+                [0] * seq_len,
+                block_size=self.block_size,
+            )
+            for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 
@@ -1564,7 +1576,7 @@ class ModelRunner:
             )
         return int(overhead)
 
-    def get_num_blocks(self) -> dict[str, int]:
+    def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1665,11 +1677,44 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        # Two scalars rather than the StateTransfer itself: this travels to the
-        # engine process in a plain dict, where `StateGroupPool` rebuilds it.
+        # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
-        config.state_transfer_kind = transfer.kind
-        config.state_fork_tokens = transfer.fork_tokens
+        uses_paged_state = transfer.copies
+        if uses_paged_state and config.pipeline_parallel_size > 1:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support pipeline "
+                "parallelism: every stage must first agree on one atomic "
+                "checkpoint/unit ownership transaction"
+            )
+        if uses_paged_state and config.enable_rapidserve:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support RapidServe "
+                "prefill/decode disaggregation"
+            )
+        checkpoint_spec = None
+        if uses_paged_state:
+            if plan.paged_class is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints require a PAGE sub-pool"
+                )
+            checkpoint_spec = PagedStateCheckpointSpec(
+                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                slot_bytes=int(plan.entry_bytes[STATE_SLOT_CLASS]),
+                layout_id=transfer.paged_layout_id,
+            )
+            logger.info(
+                "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
+                "slot_bytes=%d, units_per_checkpoint=%d, layout=%s",
+                checkpoint_spec.page_unit_bytes,
+                checkpoint_spec.slot_bytes,
+                checkpoint_spec.units_per_checkpoint,
+                checkpoint_spec.layout_id,
+            )
+        state_runtime = StateRuntime(
+            transfer=transfer,
+            checkpoint_spec=checkpoint_spec,
+        )
+        self.state_runtime = state_runtime
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -1693,11 +1738,7 @@ class ModelRunner:
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
-        # STATE classes sit in their own reservation (already excluded from
-        # the paged count at sizing time), so they add no per-block cost and
-        # never bind either: sizing reserves every STATE floor at exactly
-        # `max_num_seqs` requests' worth, so the request cap is max_num_seqs
-        # and the paged pool is the only thing that can run out first.
+        # Active Slots are reserved; PAGE checkpoints borrow from the paged pool.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
         pct_lines = []
@@ -1742,8 +1783,7 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
-            "state_transfer_kind": config.state_transfer_kind,
-            "state_fork_tokens": config.state_fork_tokens,
+            "state_runtime": state_runtime.to_wire(),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -2109,6 +2149,7 @@ class ModelRunner:
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
             self._dspark_decode_replay = True
+            self._eplb_any_rank_has_prefill = None
             return (
                 num_input_tokens,
                 None,
@@ -2132,6 +2173,9 @@ class ModelRunner:
             local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
         )
 
+        # Stash the DP-wide prefill OR for the EPLB prefill gate. Reused for free
+        # by on_forward_pass_end when the DP group == the migration (EP) group.
+        self._eplb_any_rank_has_prefill = sync.any_rank_has_prefill
         max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
@@ -4102,11 +4146,20 @@ class RapidServeModelRunner(ModelRunner):
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
-    def get_num_blocks(self) -> dict[str, int]:
+    def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
         if self.config.disagg_is_decode:
-            return {"num_kvcache_blocks": 0}
+            transfer = self.attn_metadata_builder.state_transfer()
+            if transfer.copies:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints do not yet support RapidServe "
+                    "prefill/decode disaggregation"
+                )
+            return {
+                "num_kvcache_blocks": 0,
+                "state_runtime": StateRuntime(transfer=transfer).to_wire(),
+            }
         return super().get_num_blocks()
 
     def allocate_kv_cache(self, num_kvcache_blocks):
