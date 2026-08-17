@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="full dispatch tests require aiter")
+
 import atom.model_ops.eplb as eplb_module
 import atom.model_ops.moe as moe_module
 import atom.model_ops.topK as topK_module

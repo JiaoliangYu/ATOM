@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="Triton dispatch tests require aiter")
+pytest.importorskip("triton", reason="Triton dispatch tests require triton")
+
 from atom.model_ops import eplb
 from atom.model_ops.eplb import (
     _map_record_and_dispatch_torch,

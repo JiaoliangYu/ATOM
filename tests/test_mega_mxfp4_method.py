@@ -135,6 +135,7 @@ def test_mega_eplb_views_are_expert_major_aliases():
         _mega_w2_scale=torch.arange(8),
     )
     method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
+    method.moe = SimpleNamespace(num_local_experts_dispatch=4)
 
     views = method.get_eplb_weight_views(layer, 4)
 
@@ -151,6 +152,59 @@ def test_mega_eplb_views_reject_non_expert_major_storage():
         _mega_w2_scale=torch.arange(8),
     )
     method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
+    method.moe = SimpleNamespace(num_local_experts_dispatch=4)
 
     with pytest.raises(RuntimeError, match="evenly divisible"):
         method.get_eplb_weight_views(layer, 4)
+
+
+def test_mega_eplb_views_exclude_the_fixed_shared_tail():
+    layer = SimpleNamespace(
+        _mega_w1=torch.arange(30),
+        _mega_w1_scale=torch.arange(15),
+        _mega_w2=torch.arange(45),
+        _mega_w2_scale=torch.arange(10),
+    )
+    method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
+    method.moe = SimpleNamespace(num_local_experts_dispatch=5)
+
+    views = method.get_eplb_weight_views(layer, num_local_experts=4)
+
+    assert [tuple(view.shape) for view in views] == [(4, 6), (4, 3), (4, 9), (4, 2)]
+    assert torch.equal(views[0], layer._mega_w1.view(5, -1)[:4])
+    assert layer._mega_w1.view(5, -1)[4].tolist() == list(range(24, 30))
+
+
+def test_mega_backend_uses_global_dispatch_width(monkeypatch):
+    from atom.model_ops.fused_moe import flydsl_mega_experts as mega_module
+
+    captured = {}
+
+    def fake_run(_layer, _hidden, _weights, _ids, **kwargs):
+        captured.update(kwargs)
+        return "output"
+
+    monkeypatch.setattr(mega_module, "run_mega_moe", fake_run)
+    layer = SimpleNamespace(
+        _mega_w1=torch.empty(33, 1),
+        swiglu_limit=0.0,
+    )
+    backend = mega_module.MegaFusedExperts(
+        layer,
+        model_dim=16,
+        inter_dim=8,
+        num_global_dispatch_experts=264,
+        num_local_dispatch_experts=33,
+        mtpr=256,
+    )
+
+    output = backend(
+        hidden_states="hidden",
+        topk_weights="weights",
+        topk_ids=SimpleNamespace(shape=(1, 9)),
+        global_num_experts=256,
+    )
+
+    assert output == "output"
+    assert captured["experts"] == 264
+    assert captured["topk"] == 9

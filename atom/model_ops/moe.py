@@ -1610,6 +1610,8 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             layer,
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
+            num_global_dispatch_experts=self.moe.num_global_experts_dispatch,
+            num_local_dispatch_experts=self.moe.num_local_experts_dispatch,
             mtpr=self.moe.max_num_tokens,
             quant="a8w4",
         )
@@ -1617,8 +1619,19 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
     def get_eplb_weight_views(
         self, layer: torch.nn.Module, num_local_experts: int
     ) -> list[torch.Tensor]:
-        """Expose live Mega weights as expert-major aliases for EPLB."""
+        """Expose only the routed prefix of live Mega weights to EPLB.
+
+        Mega owns the full local dispatch buffer, including the fixed shared
+        tail. EPLB's ``num_local_experts`` is routed-only; slicing the reshaped
+        expert-major view keeps migration from ever moving the shared slot.
+        """
         views: list[torch.Tensor] = []
+        num_local_dispatch = int(self.moe.num_local_experts_dispatch)
+        if not 0 < num_local_experts <= num_local_dispatch:
+            raise RuntimeError(
+                "invalid MegaMoE EPLB routed width: "
+                f"routed={num_local_experts}, dispatch={num_local_dispatch}"
+            )
         for name in (
             "_mega_w1",
             "_mega_w1_scale",
@@ -1628,13 +1641,14 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             tensor = getattr(layer, name, None)
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"MegaMoE weight {name!r} was not prepared")
-            if not tensor.is_contiguous() or tensor.numel() % num_local_experts != 0:
+            if not tensor.is_contiguous() or tensor.numel() % num_local_dispatch != 0:
                 raise RuntimeError(
-                    "MegaMoE EPLB weight must be contiguous and evenly divisible "
-                    f"by local experts: name={name!r}, shape={tuple(tensor.shape)}, "
-                    f"num_local_experts={num_local_experts}."
+                    "MegaMoE weight must be contiguous and evenly divisible by "
+                    "the local dispatch width: "
+                    f"name={name!r}, shape={tuple(tensor.shape)}, "
+                    f"num_local_dispatch={num_local_dispatch}."
                 )
-            views.append(tensor.view(num_local_experts, -1))
+            views.append(tensor.view(num_local_dispatch, -1)[:num_local_experts])
         return views
 
 
@@ -2815,8 +2829,12 @@ class FusedMoE(torch.nn.Module):
         )
 
     def rebuild_expert_mask(self) -> None:
-        """Build the kernel mask. Init only -- slot ownership never changes
-        across a rebalance, so replacing the tensor here is safe.
+        """Build the kernel mask after construction or EPLB runtime binding.
+
+        Both calls happen before graph capture. Later rebalances only change
+        which logical expert occupies a routed physical slot; rank ownership of
+        that slot and the fixed-local shared tail never change, so the mask can
+        then remain stable.
         """
         if not self.use_ep or self.expert_map is None:
             return

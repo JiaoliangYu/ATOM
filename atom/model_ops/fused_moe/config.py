@@ -325,6 +325,15 @@ class FusedMoEConfig:
     num_fused_shared_experts: int = 0
 
     @property
+    def num_routed_physical_experts(self) -> int:
+        """Global routed physical width owned by EPLB.
+
+        This deliberately excludes the per-rank shared tail. Placement,
+        migration, and routed load accounting must stay in this id space.
+        """
+        return self.num_experts
+
+    @property
     def num_local_experts_dispatch(self) -> int:
         """Local slots to size an all2all backend for, shared slot included.
 
@@ -332,6 +341,16 @@ class FusedMoEConfig:
         from ``id // num_experts_per_rank`` would resolve the wrong rank.
         """
         return self.num_local_experts
+
+    @property
+    def num_global_experts_dispatch(self) -> int:
+        """Global width consumed by a whole-pipeline dispatch backend.
+
+        Each EP rank contributes its own fixed-local shared slots. Unlike the
+        routed physical width, this is the valid range for the ids handed to
+        MoRI or Mega after ``SharedExpertDispatchLayout`` widens each rank block.
+        """
+        return self.num_experts + self.num_fused_shared_experts * self.ep_size
 
     @property
     def experts_per_token_dispatch(self) -> int:
