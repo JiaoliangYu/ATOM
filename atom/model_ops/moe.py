@@ -554,8 +554,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "max_num_tokens_per_dp_rank": moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
                 "input_dtype": moe.in_dtype,
-                "num_local_experts": moe.num_experts // all2all_manager.world_size,
-                "num_experts_per_token": moe.experts_per_token,
+                # Dispatch-space sizing: `moe.num_experts // world_size` would
+                # drop the shared slot and resolve the wrong destination rank.
+                "num_local_experts": moe.num_local_experts_dispatch,
+                "num_experts_per_token": moe.experts_per_token_dispatch,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
             }
             if mori_combine_quant_type != "none":
@@ -579,8 +581,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
                 # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
                 "max_num_inp_token_per_rank": moe.max_num_tokens,
-                "num_local_experts": moe.num_experts // all2all_manager.world_size,
-                "num_experts_per_token": moe.experts_per_token,
+                # Dispatch-space sizing -- see the note above.
+                "num_local_experts": moe.num_local_experts_dispatch,
+                "num_experts_per_token": moe.experts_per_token_dispatch,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
                 "data_type_itemsize": moe.in_dtype.itemsize,
                 "max_token_type_size": moe.in_dtype.itemsize,

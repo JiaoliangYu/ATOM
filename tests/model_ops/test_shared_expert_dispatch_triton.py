@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_ops import eplb
 from atom.model_ops.eplb import (
     _map_record_and_dispatch_torch,
     eplb_map_record_and_dispatch,
@@ -98,3 +99,65 @@ def test_empty_batch_matches_torch():
 
     assert ids_got.shape == (0, 9)
     assert w_got.shape == (0, 9)
+
+
+def _fake_metadata(num_logical: int, num_physical: int, replicas: int, seed: int):
+    """EPLB tables with a mix of local slots and -1 (forced remote)."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    l2p = torch.randint(
+        0,
+        num_physical,
+        (1, num_logical, replicas),
+        dtype=torch.int32,
+        device="cuda",
+        generator=g,
+    )
+    cnt = torch.randint(
+        1,
+        replicas + 1,
+        (1, num_logical),
+        dtype=torch.int32,
+        device="cuda",
+        generator=g,
+    )
+    dispatch = l2p[:, :, 0].clone()
+    dispatch[torch.rand(dispatch.shape, device="cuda", generator=g) < 0.7] = -1
+    return SimpleNamespace(
+        logical_to_rank_dispatch_physical_map=dispatch,
+        logical_to_physical_map=l2p,
+        logical_replica_count=cnt,
+        num_physical_experts=num_physical,
+    )
+
+
+@pytest.mark.parametrize("replicas", [1, 3])
+def test_forced_remote_matches_upstream_remap(monkeypatch, replicas):
+    """dispatch[e] == -1 must take the same token-spread replica as upstream."""
+    import atom.config as config_module
+
+    num_logical = num_physical = 64
+    layout = SharedExpertDispatchLayout(
+        num_routed_physical=num_physical, ep_size=8, num_shared=1
+    )
+    meta = _fake_metadata(num_logical, num_physical, replicas, seed=7 + replicas)
+    monkeypatch.setattr(eplb, "get_live_expert_location_metadata", lambda: meta)
+    monkeypatch.setattr(
+        config_module,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False),
+    )
+    layer = SimpleNamespace(ep_rank=3, layer_id=0)
+
+    ids = torch.randint(0, num_logical, (128, 8), dtype=torch.int32, device="cuda")
+    ids[torch.rand_like(ids, dtype=torch.float) < 0.1] = -1
+    weights = torch.rand((128, 8), dtype=torch.float32, device="cuda")
+
+    w_ref, ids_ref = _map_record_and_dispatch_torch(
+        layer, weights.clone(), ids.clone(), layout, 0.4
+    )
+    w_got, ids_got = eplb_map_record_and_dispatch(
+        layer, weights.clone(), ids.clone(), layout, 0.4
+    )
+
+    assert torch.equal(ids_got, ids_ref)
+    assert torch.equal(w_got, w_ref)

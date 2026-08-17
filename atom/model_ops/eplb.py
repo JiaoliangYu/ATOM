@@ -2602,7 +2602,9 @@ if _EPLB_HAS_TRITON:
     def _eplb_map_record_dispatch_kernel(
         topk_ids_ptr,  # [ntok, topk]      logical ids
         topk_w_ptr,  # [ntok, topk]      routed weights
-        dispatch_ptr,  # [num_logical]     logical->physical (int32); dummy if no EPLB
+        dispatch_ptr,  # [num_logical]     logical->local physical, or -1; dummy if no EPLB
+        l2p_ptr,  # [num_logical*R]   logical->physical replicas; dummy if no EPLB
+        cnt_ptr,  # [num_logical]     replica count per logical; dummy if no EPLB
         out_ids_ptr,  # [ntok, out_width] dispatch-space ids
         out_w_ptr,  # [ntok, out_width] weights
         load_ptr,  # [num_physical]    per-pass load counter; dummy if not RECORD
@@ -2616,6 +2618,7 @@ if _EPLB_HAS_TRITON:
         topk,
         n_out,
         out_width,
+        R,
         HAS_EPLB: tl.constexpr,
         RECORD: tl.constexpr,
         NUM_SHARED: tl.constexpr,
@@ -2646,6 +2649,16 @@ if _EPLB_HAS_TRITON:
             mapped = tl.load(dispatch_ptr + safe_lid, mask=rmask & valid, other=0).to(
                 tl.int64
             )
+            # Forced-remote (mapped < 0): same token-granularity replica spread
+            # as _eplb_map_record_hist_kernel. `row` is already the token index.
+            need_spread = valid & (mapped < 0)
+            cnt = tl.load(cnt_ptr + safe_lid, mask=rmask & valid, other=1).to(tl.int64)
+            cnt = tl.maximum(cnt, 1)
+            replica_idx = ((row.to(tl.int64) * 2654435769) & 0xFFFFFFFF) % cnt
+            remote = tl.load(
+                l2p_ptr + safe_lid * R + replica_idx, mask=rmask & need_spread, other=0
+            ).to(tl.int64)
+            mapped = tl.where(need_spread, remote, mapped)
             phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
         else:
             phys = lid
@@ -2669,8 +2682,7 @@ if _EPLB_HAS_TRITON:
             bin_idx = tl.where(in_hist, phys, num_physical).to(tl.int32)
             hist = tl.histogram(bin_idx, NUM_BINS)
             bins = tl.arange(0, NUM_BINS)
-            hmask = (bins < num_physical) & (hist > 0)
-            tl.atomic_add(load_ptr + bins, hist, mask=hmask)
+            tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
 
 def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -2808,14 +2820,22 @@ def eplb_map_record_and_dispatch(
 
     if has_eplb:
         dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
+        l2p = meta.logical_to_physical_map[layer_id]
+        cnt = meta.logical_replica_count[layer_id]
         if dispatch.device != topk_ids.device:
             dispatch = dispatch.to(topk_ids.device)
+        if l2p.device != topk_ids.device:
+            l2p = l2p.to(topk_ids.device)
+        if cnt.device != topk_ids.device:
+            cnt = cnt.to(topk_ids.device)
         num_logical = int(dispatch.numel())
         num_physical = int(meta.num_physical_experts)
+        num_replicas = int(l2p.shape[-1])
     else:
-        dispatch = topk_ids
+        dispatch = l2p = cnt = topk_ids
         num_logical = 0
         num_physical = layout.num_routed_physical
+        num_replicas = 1
     id_delta = num_physical - num_logical
 
     load_buf = None
@@ -2847,6 +2867,8 @@ def eplb_map_record_and_dispatch(
         topk_ids.contiguous(),
         topk_weights.contiguous(),
         dispatch,
+        l2p,
+        cnt,
         out_ids,
         out_w,
         load_buf,
@@ -2860,6 +2882,7 @@ def eplb_map_record_and_dispatch(
         topk,
         n_out,
         out_width,
+        num_replicas,
         HAS_EPLB=has_eplb,
         RECORD=record,
         NUM_SHARED=num_shared,
