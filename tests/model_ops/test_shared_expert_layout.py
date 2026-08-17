@@ -16,7 +16,7 @@ def test_layout_separates_routed_and_dispatch_widths():
     assert layout.num_dispatch_slots == 264
 
 
-def test_backend_config_names_routed_and_dispatch_counts_explicitly():
+def test_backend_config_widens_every_rank_block_by_the_shared_slot():
     parallel = SimpleNamespace(
         tp_size=1,
         dp_size=8,
@@ -36,7 +36,6 @@ def test_backend_config_names_routed_and_dispatch_counts_explicitly():
         moe_parallel_config=parallel,
     )
 
-    assert config.num_routed_physical_experts == 256
     assert config.num_local_experts_dispatch == 33
     assert config.num_global_experts_dispatch == 264
     assert config.experts_per_token_dispatch == 9

@@ -2865,6 +2865,13 @@ class FusedMoE(torch.nn.Module):
                 "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
                 f"got {type(self.quant_method).__name__}"
             )
+        if self.num_fused_shared_experts > 0 and not self.fuse_shared_into_dispatch:
+            # Mega is sized for the widened dispatch space; the legacy AITER
+            # fusion keeps one global shared id that space has no room for.
+            raise NotImplementedError(
+                "moe_backend='mega' requires the shared expert to be fused into "
+                "the dispatch space; the legacy AITER fusion is unsupported."
+            )
 
     def _online_quant(self):
         """Handle online quantization: (optionally dequant →) quantize weights,

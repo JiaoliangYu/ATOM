@@ -175,6 +175,23 @@ def test_mega_eplb_views_exclude_the_fixed_shared_tail():
     assert layer._mega_w1.view(5, -1)[4].tolist() == list(range(24, 30))
 
 
+def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
+    monkeypatch.setattr(
+        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(moe_backend="mega")
+    )
+    layer = SimpleNamespace(
+        quant_method=object.__new__(moe_mod.MegaMxfp4MoEMethod),
+        num_fused_shared_experts=1,
+        fuse_shared_into_dispatch=False,
+    )
+
+    with pytest.raises(NotImplementedError, match="dispatch space"):
+        moe_mod.FusedMoE._validate_moe_backend(layer)
+
+    layer.fuse_shared_into_dispatch = True
+    moe_mod.FusedMoE._validate_moe_backend(layer)
+
+
 def test_mega_backend_uses_global_dispatch_width(monkeypatch):
     from atom.model_ops.fused_moe import flydsl_mega_experts as mega_module
 
