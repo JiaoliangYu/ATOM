@@ -2599,7 +2599,7 @@ if _EPLB_HAS_TRITON:
         tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
     @triton.jit
-    def _map_record_dispatch_kernel(
+    def _topk_to_dispatch_kernel(
         topk_ids_ptr,  # [ntok, topk]      logical ids
         topk_w_ptr,  # [ntok, topk]      routed weights
         dispatch_ptr,  # [num_logical]     logical->local physical, or -1; dummy if no EPLB
@@ -2787,7 +2787,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     return out
 
 
-def map_record_and_dispatch_fused(
+def topk_to_dispatch_fused(
     layer: Any,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -2804,7 +2804,7 @@ def map_record_and_dispatch_fused(
     custom op, which inductor cannot fuse into.
     """
     if layout is None or not _EPLB_HAS_TRITON:
-        return _map_record_and_dispatch_torch(
+        return _topk_to_dispatch_torch(
             layer, topk_weights, topk_ids, layout, shared_weight
         )
 
@@ -2817,7 +2817,7 @@ def map_record_and_dispatch_fused(
     out_width = topk + num_shared
     n_out = ntok * out_width
     if n_out == 0:
-        return _map_record_and_dispatch_torch(
+        return _topk_to_dispatch_torch(
             layer, topk_weights, topk_ids, layout, shared_weight
         )
 
@@ -2866,7 +2866,7 @@ def map_record_and_dispatch_fused(
     def grid(meta_kw):
         return (triton.cdiv(n_out, meta_kw["BLOCK"]),)
 
-    _map_record_dispatch_kernel[grid](
+    _topk_to_dispatch_kernel[grid](
         topk_ids.contiguous(),
         topk_weights.contiguous(),
         dispatch,
@@ -2895,7 +2895,7 @@ def map_record_and_dispatch_fused(
     return out_w, out_ids
 
 
-def _map_record_and_dispatch_torch(
+def _topk_to_dispatch_torch(
     layer: Any,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

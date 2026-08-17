@@ -33,7 +33,7 @@ def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
     return ns
 
 
-def test_map_record_and_dispatch_is_backend_neutral(monkeypatch):
+def test_topk_to_dispatch_is_backend_neutral(monkeypatch):
     layer = _dispatch_layer(ep_rank=1)
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: False
@@ -43,7 +43,7 @@ def test_map_record_and_dispatch_is_backend_neutral(monkeypatch):
     routed_ids = torch.tensor([[0, 4], [3, -1]], dtype=torch.int32)
     routed_weights = torch.tensor([[0.7, 0.3], [0.6, 0.0]])
 
-    weights, ids = FusedMoE.map_record_and_dispatch(layer, routed_weights, routed_ids)
+    weights, ids = FusedMoE.topk_to_dispatch(layer, routed_weights, routed_ids)
 
     assert ids.tolist() == [[0, 5, 9], [3, -1, 9]]
     assert torch.equal(weights[:, :2], routed_weights)
@@ -88,8 +88,8 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
     )
     # Pins the ordering router -> EPLB -> shared, not the kernel arithmetic.
     monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
-    layer.map_record_and_dispatch = lambda weights, ids: (
-        FusedMoE.map_record_and_dispatch(layer, weights, ids)
+    layer.topk_to_dispatch = lambda weights, ids: (
+        FusedMoE.topk_to_dispatch(layer, weights, ids)
     )
 
     weights, ids = FusedMoEMethodBase.select_experts_with_record(

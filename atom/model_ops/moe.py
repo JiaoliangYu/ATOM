@@ -31,7 +31,7 @@ from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
     eplb_map_and_record_fused,
-    map_record_and_dispatch_fused,
+    topk_to_dispatch_fused,
 )
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -493,7 +493,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         # Fused logical->physical remap + expert-load record + dispatch space
-        return layer.map_record_and_dispatch(topk_weights, topk_logical)
+        return layer.topk_to_dispatch(topk_weights, topk_logical)
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -2777,7 +2777,7 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
-        # Only the MXFP4 apply() routes topk through `map_record_and_dispatch`.
+        # Only the MXFP4 apply() routes topk through `topk_to_dispatch`.
         # The others would hand the backend the legacy tail id, which resolves
         # to the wrong rank instead of failing.
         if self.fuse_shared_into_dispatch and not isinstance(
@@ -2809,10 +2809,10 @@ class FusedMoE(torch.nn.Module):
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
 
-    def map_record_and_dispatch(
+    def topk_to_dispatch(
         self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """EPLB remap + load record + dispatch space, in one Triton launch."""
+        """Routing output -> the ids the backend dispatches on."""
         if self.shared_dispatch_layout is None:
             return topk_weights, eplb_map_and_record_fused(self, topk_ids)
         shared_weight = (
@@ -2820,7 +2820,7 @@ class FusedMoE(torch.nn.Module):
             if is_rocm_aiter_fuse_routed_scaling_factor()
             else 1.0 / self.routed_scaling_factor
         )
-        return map_record_and_dispatch_fused(
+        return topk_to_dispatch_fused(
             self,
             topk_weights,
             topk_ids,
