@@ -66,6 +66,7 @@ class EngineArgs:
     enable_tbo: str | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
+    fuse_shared_expert: bool = False
     method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
@@ -273,6 +274,14 @@ class EngineArgs:
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
             "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+        )
+        parser.add_argument(
+            "--fuse-shared-expert",
+            action="store_true",
+            help="Fuse the shared expert into the all2all dispatch as one extra "
+            "expert slot per rank, instead of running it standalone on the alt "
+            "stream. Costs a per-rank replica of the shared weights. Ignored "
+            "unless the all2all backend is in use.",
         )
         parser.add_argument(
             "--method",

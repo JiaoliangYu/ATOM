@@ -2599,7 +2599,7 @@ if _EPLB_HAS_TRITON:
         tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
     @triton.jit
-    def _eplb_map_record_dispatch_kernel(
+    def _map_record_dispatch_kernel(
         topk_ids_ptr,  # [ntok, topk]      logical ids
         topk_w_ptr,  # [ntok, topk]      routed weights
         dispatch_ptr,  # [num_logical]     logical->local physical, or -1; dummy if no EPLB
@@ -2787,14 +2787,17 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     return out
 
 
-def eplb_map_record_and_dispatch(
+def map_record_and_dispatch_fused(
     layer: Any,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     layout: Any,
     shared_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """EPLB remap + load record + dispatch space + shared column, one launch.
+    """Routed topk -> backend dispatch ids, one launch.
+
+    The EPLB remap and the load record only happen when EPLB is live; the
+    dispatch-space widening and the shared column always do.
 
     Returns ``(weights, ids)``. The torch equivalent is 11 elementwise kernels
     plus 2 `torch.cat` per layer per step: it runs inside the `aiter.moe_forward`
@@ -2863,7 +2866,7 @@ def eplb_map_record_and_dispatch(
     def grid(meta_kw):
         return (triton.cdiv(n_out, meta_kw["BLOCK"]),)
 
-    _eplb_map_record_dispatch_kernel[grid](
+    _map_record_dispatch_kernel[grid](
         topk_ids.contiguous(),
         topk_weights.contiguous(),
         dispatch,

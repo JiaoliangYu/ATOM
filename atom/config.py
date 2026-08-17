@@ -1375,9 +1375,7 @@ class Config:
     # Fuse the shared expert into the all2all dispatch as one extra expert slot
     # per rank, instead of running it standalone on the alt stream. Costs a
     # per-rank replica of the shared weights.
-    fuse_shared_expert: bool = field(
-        default_factory=lambda: envs.ATOM_FUSE_SHARED_EXPERT
-    )
+    fuse_shared_expert: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)

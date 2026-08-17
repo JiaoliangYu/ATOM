@@ -280,12 +280,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
-    # Fuse the shared expert into the all2all dispatch under DP attention,
-    # instead of running it standalone on the alt stream. Costs a per-rank
-    # replica of the shared weights.
-    "ATOM_FUSE_SHARED_EXPERT": lambda: (
-        os.getenv("ATOM_FUSE_SHARED_EXPERT", "0").lower() == "1"
-    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",

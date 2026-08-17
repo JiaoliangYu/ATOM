@@ -11,7 +11,7 @@ pytest.importorskip("triton", reason="Triton dispatch tests require triton")
 from atom.model_ops import eplb
 from atom.model_ops.eplb import (
     _map_record_and_dispatch_torch,
-    eplb_map_record_and_dispatch,
+    map_record_and_dispatch_fused,
 )
 from atom.model_ops.fused_moe.expert_layout import SharedExpertDispatchLayout
 
@@ -45,7 +45,7 @@ def test_triton_matches_torch_reference(ep_rank, num_tokens):
     w_ref, ids_ref = _map_record_and_dispatch_torch(
         layer, weights.clone(), ids.clone(), layout, 0.4
     )
-    w_got, ids_got = eplb_map_record_and_dispatch(
+    w_got, ids_got = map_record_and_dispatch_fused(
         layer, weights.clone(), ids.clone(), layout, 0.4
     )
 
@@ -63,7 +63,7 @@ def test_shared_column_is_this_ranks_constant():
     weights = torch.rand((32, 8), dtype=torch.float32, device="cuda")
 
     for ep_rank in range(8):
-        _, out_ids = eplb_map_record_and_dispatch(
+        _, out_ids = map_record_and_dispatch_fused(
             _layer(ep_rank), weights.clone(), ids.clone(), layout, 0.4
         )
         shared_col = out_ids[:, -1]
@@ -81,7 +81,7 @@ def test_routed_ids_land_on_the_owning_rank():
     ids = torch.arange(256, dtype=torch.int32, device="cuda").reshape(32, 8)
     weights = torch.zeros((32, 8), dtype=torch.float32, device="cuda")
 
-    _, out_ids = eplb_map_record_and_dispatch(_layer(0), weights, ids, layout, 0.4)
+    _, out_ids = map_record_and_dispatch_fused(_layer(0), weights, ids, layout, 0.4)
     routed = out_ids[:, :8].flatten()
     for physical_id, dispatch_id in enumerate(routed.tolist()):
         # mori: destPe = destExpert / numExpertPerRank (internode.hpp).
@@ -98,7 +98,7 @@ def test_empty_batch_matches_torch():
     ids = torch.empty((0, 8), dtype=torch.int32, device="cuda")
     weights = torch.empty((0, 8), dtype=torch.float32, device="cuda")
 
-    w_got, ids_got = eplb_map_record_and_dispatch(layer, weights, ids, layout, 0.4)
+    w_got, ids_got = map_record_and_dispatch_fused(layer, weights, ids, layout, 0.4)
 
     assert ids_got.shape == (0, 9)
     assert w_got.shape == (0, 9)
@@ -158,7 +158,7 @@ def test_forced_remote_matches_upstream_remap(monkeypatch, replicas):
     w_ref, ids_ref = _map_record_and_dispatch_torch(
         layer, weights.clone(), ids.clone(), layout, 0.4
     )
-    w_got, ids_got = eplb_map_record_and_dispatch(
+    w_got, ids_got = map_record_and_dispatch_fused(
         layer, weights.clone(), ids.clone(), layout, 0.4
     )
 

@@ -31,7 +31,7 @@ from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
     eplb_map_and_record_fused,
-    eplb_map_record_and_dispatch,
+    map_record_and_dispatch_fused,
 )
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -82,7 +82,7 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-# `ATOM_FUSE_SHARED_EXPERT` has several silent fall-through paths, so a switch
+# `--fuse-shared-expert` has several silent fall-through paths, so a switch
 # that was ignored looks the same as a feature that did not help.
 _shared_fuse_logged = False
 
@@ -2820,7 +2820,7 @@ class FusedMoE(torch.nn.Module):
             if is_rocm_aiter_fuse_routed_scaling_factor()
             else 1.0 / self.routed_scaling_factor
         )
-        return eplb_map_record_and_dispatch(
+        return map_record_and_dispatch_fused(
             self,
             topk_weights,
             topk_ids,
