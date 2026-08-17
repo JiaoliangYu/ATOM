@@ -1372,6 +1372,12 @@ class Config:
     # per-DP MoE layout and leave it False. Set by the frontend in
     # atom/plugin/config.py, not queried via is_vllm() at the call site.
     moe_ep_flatten_tp_across_dp: bool = False
+    # Fuse the shared expert into the all2all dispatch as one extra expert slot
+    # per rank, instead of running it standalone on the alt stream. Costs a
+    # per-rank replica of the shared weights.
+    fuse_shared_expert: bool = field(
+        default_factory=lambda: envs.ATOM_FUSE_SHARED_EXPERT
+    )
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)

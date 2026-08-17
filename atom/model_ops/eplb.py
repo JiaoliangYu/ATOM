@@ -2609,7 +2609,7 @@ if _EPLB_HAS_TRITON:
         num_logical,
         id_delta,
         num_physical,
-        eplb_num_physical,
+        num_routed_physical,
         routed_per_rank,
         shared_base,
         shared_weight,
@@ -2624,8 +2624,8 @@ if _EPLB_HAS_TRITON:
     ):
         """EPLB remap + load record + dispatch-space rewrite + shared column.
 
-        Iterates over output elements, not input, so the shared column is
-        written in place instead of concatenated.
+        Iterates over output elements, so the shared column is written in place
+        instead of concatenated.
         """
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -2650,8 +2650,9 @@ if _EPLB_HAS_TRITON:
         else:
             phys = lid
 
-        # Out-of-range ids pass through: floor division would send -1 to -2.
-        in_range = (phys >= 0) & (phys < eplb_num_physical)
+        # SharedExpertDispatchLayout.routed_to_dispatch, inlined. Out-of-range
+        # ids pass through: floor division would send -1 to -2.
+        in_range = (phys >= 0) & (phys < num_routed_physical)
         shifted = phys + NUM_SHARED * (phys // routed_per_rank)
         disp = tl.where(in_range, shifted, phys)
 
@@ -2780,34 +2781,30 @@ def eplb_map_record_and_dispatch(
     topk_ids: torch.Tensor,
     layout: Any,
     shared_weight: float,
-    skip_eplb: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """EPLB remap + load record + dispatch space + shared column, one launch.
 
-    Returns ``(weights, ids)``. Unfused this was 11 elementwise kernels plus 2
-    `torch.cat` per layer per step -- plain torch inside the `aiter.moe_forward`
+    Returns ``(weights, ids)``. The torch equivalent is 11 elementwise kernels
+    plus 2 `torch.cat` per layer per step: it runs inside the `aiter.moe_forward`
     custom op, which inductor cannot fuse into.
-
-    `skip_eplb=True` skips the remap: the quant methods' `apply` are not
-    exercised today, so the fusion leaves their routing behaviour alone.
     """
     if layout is None or not _EPLB_HAS_TRITON:
-        return _map_record_and_dispatch_torch(layer, topk_weights, topk_ids, layout,
-                                              shared_weight, skip_eplb)
+        return _map_record_and_dispatch_torch(
+            layer, topk_weights, topk_ids, layout, shared_weight
+        )
 
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    has_eplb = (
-        not skip_eplb and meta is not None and isinstance(layer_id, int)
-    )
+    has_eplb = meta is not None and isinstance(layer_id, int)
 
     ntok, topk = topk_ids.shape
     num_shared = layout.num_shared
     out_width = topk + num_shared
     n_out = ntok * out_width
     if n_out == 0:
-        return _map_record_and_dispatch_torch(layer, topk_weights, topk_ids, layout,
-                                              shared_weight)
+        return _map_record_and_dispatch_torch(
+            layer, topk_weights, topk_ids, layout, shared_weight
+        )
 
     if has_eplb:
         dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
@@ -2818,18 +2815,19 @@ def eplb_map_record_and_dispatch(
     else:
         dispatch = topk_ids
         num_logical = 0
-        num_physical = layout.eplb_num_physical
+        num_physical = layout.num_routed_physical
     id_delta = num_physical - num_logical
 
-    from atom.config import get_current_atom_config
-
     load_buf = None
-    if has_eplb and bool(getattr(get_current_atom_config(), "eplb_enable", False)):
+    if has_eplb:
+        from atom.config import get_current_atom_config
+
         atom_cfg = get_current_atom_config()
-        monitor = get_expert_load_monitor(
-            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
-        )
-        load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+        if bool(getattr(atom_cfg, "eplb_enable", False)):
+            monitor = get_expert_load_monitor(
+                enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+            )
+            load_buf = monitor.pass_count_buffer(layer_id, num_physical)
     record = load_buf is not None
 
     out_ids = torch.empty(
@@ -2855,7 +2853,7 @@ def eplb_map_record_and_dispatch(
         num_logical,
         id_delta,
         num_physical,
-        layout.eplb_num_physical,
+        layout.num_routed_physical,
         layout.routed_slots_per_rank,
         layout.shared_dispatch_id(layer.ep_rank, 0),
         shared_weight,
@@ -2877,10 +2875,9 @@ def _map_record_and_dispatch_torch(
     topk_ids: torch.Tensor,
     layout: Any,
     shared_weight: float,
-    skip_eplb: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference path: the original two steps, unfused. Also the CPU fallback."""
-    topk_physical = topk_ids if skip_eplb else eplb_map_and_record_fused(layer, topk_ids)
+    topk_physical = eplb_map_and_record_fused(layer, topk_ids)
     if layout is None:
         return topk_weights, topk_physical
     ids, weights = layout.apply_to_topk(

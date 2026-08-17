@@ -115,96 +115,72 @@ def physical_expert_id(
 
 
 class SharedExpertDispatchLayout:
-    """Translation between the EPLB physical id space and the dispatch id space.
+    """Translation between the routed physical id space and the dispatch id space.
 
-    Two id spaces coexist once a shared expert is fused into an all2all-dispatched
-    MoE:
+    Routed space (width ``num_routed_physical`` == ``global_num_experts``) holds
+    routed experts only, base plus EPLB redundant replicas; it is what
+    ``expert_map`` indexes and, when EPLB is on, what placement and the load
+    histogram speak. Dispatch space (width ``num_dispatch_slots``) is what the
+    all2all backend and the local weight buffers speak, with one extra slot per
+    rank for the fused shared expert. They have to differ because MoRI derives a
+    token's destination rank from the raw expert id, so a shared expert
+    replicated everywhere cannot share a single global id the way ``expert_map``
+    allows.
 
-    * **EPLB space** (width ``eplb_num_physical``) is what placement, migration and
-      the load histogram speak.  It contains routed experts only -- base plus EPLB
-      redundant replicas -- and is what ``determine_expert_map`` partitions.
-    * **dispatch space** (width ``num_physical``) is what the all2all backend and
-      the local weight buffers speak.  Every rank gets one extra slot per fused
-      shared expert, appended after that rank's routed slots.
-
-    The split exists because MoRI derives a token's destination rank from the raw
-    expert id (``id // num_experts_per_rank``), so a shared expert replicated on
-    every rank cannot share a single global id the way ``expert_map`` allows.
-    Giving each rank its own shared id is the whole point of this layout.
-
-    The per-rank slot order is ``[routed ...][shared ...]``, matching the buffer
-    that ``FusedMoE.__init__`` already allocates (``local_num_experts`` is bumped
-    by ``num_fused_shared_experts`` there).  Keeping routed as a *prefix* is load
-    bearing: ``count_local_base_experts`` and ``is_batched_expert_slot`` both rely
-    on it.
-
-    ``num_shared == 0`` degrades every translation to the identity, so callers can
-    build this unconditionally and stay branch-free.
+    Per-rank slot order is ``[routed ...][shared ...]``; keeping routed as a
+    prefix is load bearing for ``count_local_base_experts`` and
+    ``is_batched_expert_slot``.
     """
 
-    __slots__ = ("eplb_num_physical", "ep_size", "num_shared")
+    __slots__ = ("ep_size", "num_routed_physical", "num_shared")
 
     def __init__(
-        self, eplb_num_physical: int, ep_size: int, num_shared: int = 0
+        self, num_routed_physical: int, ep_size: int, num_shared: int = 0
     ) -> None:
         assert ep_size > 0, f"ep_size must be positive, got {ep_size}"
-        assert eplb_num_physical % ep_size == 0, (
-            "EPLB physical experts must divide evenly across ranks: "
-            f"eplb_num_physical={eplb_num_physical}, ep_size={ep_size}"
+        assert num_routed_physical % ep_size == 0, (
+            "routed physical experts must divide evenly across ranks: "
+            f"num_routed_physical={num_routed_physical}, ep_size={ep_size}"
         )
         assert num_shared >= 0, f"num_shared must be non-negative, got {num_shared}"
-        self.eplb_num_physical = int(eplb_num_physical)
+        self.num_routed_physical = int(num_routed_physical)
         self.ep_size = int(ep_size)
         self.num_shared = int(num_shared)
 
     @property
     def routed_slots_per_rank(self) -> int:
-        """Routed physical slots each rank owns (EPLB space, per rank)."""
-        return self.eplb_num_physical // self.ep_size
+        """Routed physical slots each rank owns."""
+        return self.num_routed_physical // self.ep_size
 
     @property
     def slots_per_rank(self) -> int:
-        """Total local slots each rank owns (dispatch space, per rank).
-
-        This is what the all2all backend must be told as its
-        ``num_experts_per_rank`` -- NOT ``num_experts // world_size``, which
-        would drop the shared slot and make the backend route to the wrong rank.
-        """
+        """Local slots per rank (dispatch space); the backend's num_experts_per_rank."""
         return self.routed_slots_per_rank + self.num_shared
 
     @property
-    def num_physical(self) -> int:
+    def num_dispatch_slots(self) -> int:
         """Total dispatch-space slots across all ranks."""
         return self.slots_per_rank * self.ep_size
 
-    def routed_to_dispatch(self, eplb_id: int) -> int:
-        """EPLB physical id -> dispatch id.
+    def routed_to_dispatch(self, physical_id: "int | torch.Tensor"):
+        """Routed physical id -> dispatch id. Scalar or tensor.
 
-        Each rank's block grows by ``num_shared``, so an id in rank ``r``'s block
-        shifts right by ``num_shared * r``.  The local offset within the block is
-        preserved, which is why the weight buffer needs no reordering.
+        The offset within a rank's block is preserved, so the weight buffer
+        needs no reordering. Callers must screen ids outside
+        ``[0, num_routed_physical)`` themselves: floor division sends -1 to -2.
+        The Triton kernel inlines this same arithmetic.
         """
-        return eplb_id + self.num_shared * (eplb_id // self.routed_slots_per_rank)
+        return physical_id + self.num_shared * (
+            physical_id // self.routed_slots_per_rank
+        )
 
     def shared_dispatch_id(self, ep_rank: int, shared_index: int = 0) -> int:
-        """Dispatch id of this rank's ``shared_index``-th shared expert.
-
-        Constant per rank: the fixed-local choice that makes a token's shared
-        column resolve to its own rank, costing no cross-GPU traffic.
-        """
+        """Dispatch id of this rank's shared expert: fixed-local, no xGMI traffic."""
         assert 0 <= shared_index < self.num_shared, (
             f"shared_index={shared_index} out of range for "
             f"num_shared={self.num_shared}"
         )
         return ep_rank * self.slots_per_rank + self.routed_slots_per_rank + shared_index
-
-    def local_slot_of_dispatch_id(self, dispatch_id: int) -> int:
-        """Dispatch id -> index within its owning rank's local buffer."""
-        return dispatch_id % self.slots_per_rank
-
-    def owner_rank_of_dispatch_id(self, dispatch_id: int) -> int:
-        """Dispatch id -> owning rank, the way the all2all backend computes it."""
-        return dispatch_id // self.slots_per_rank
 
     def apply_to_topk(
         self,
@@ -215,33 +191,26 @@ class SharedExpertDispatchLayout:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rewrite a routed topk into dispatch space and append the shared column.
 
-        Must run AFTER any EPLB logical->physical remap: it consumes EPLB
-        *physical* ids. Running it earlier would put the shared column into the
-        EPLB id space, where it would collide with a routed slot and pollute the
-        expert-load histogram -- the whole reason the shared expert is kept out
-        of that space is that it is hit by every token, so its per-rank load is a
-        large constant that would drive balancedness toward 1 and mask the routed
-        imbalance the rebalance gate exists to detect.
+        Reference implementation for the fused Triton kernel; also the CPU path.
 
-        Ids outside ``[0, eplb_num_physical)`` are passed through untouched, so
-        any sentinel a caller uses survives. This matters for correctness, not
-        just tidiness: floor division sends -1 to -2 under the shift.
+        Must run AFTER the EPLB logical->physical remap. Earlier, the shared
+        column would land in EPLB space and enter the load histogram -- it is hit
+        by every token, so it would drive balancedness toward 1 and mask the
+        routed imbalance the rebalance gate exists to detect.
+
+        Ids outside ``[0, num_routed_physical)`` pass through untouched: floor
+        division would send the -1 sentinel to -2.
         """
         assert self.num_shared > 0, "apply_to_topk requires a fused shared expert"
         num_tokens = topk_ids.shape[0]
 
-        shifted = topk_ids + self.num_shared * (
-            topk_ids // self.routed_slots_per_rank
-        )
-        in_range = (topk_ids >= 0) & (topk_ids < self.eplb_num_physical)
-        routed = torch.where(in_range, shifted, topk_ids)
+        in_range = (topk_ids >= 0) & (topk_ids < self.num_routed_physical)
+        routed = torch.where(in_range, self.routed_to_dispatch(topk_ids), topk_ids)
 
         # Built on-device: `torch.tensor(list, device=...)` is a H2D copy, which
         # CUDA graph capture rejects unless pinned.
         shared_ids = (
-            torch.arange(
-                self.num_shared, dtype=topk_ids.dtype, device=topk_ids.device
-            )
+            torch.arange(self.num_shared, dtype=topk_ids.dtype, device=topk_ids.device)
             + self.shared_dispatch_id(ep_rank, 0)
         ).expand(num_tokens, self.num_shared)
         shared_w = torch.full(
