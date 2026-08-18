@@ -1,30 +1,69 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fold a per-rank shared expert into an all2all dispatch.
+"""Remap a routed topk into the all2all backend's id space.
 
-Used when EPLB is off. With EPLB on the shared expert is instead one more
-routed logical expert, so placement and the existing remap handle it and none
-of this runs.
+The backend resolves a token's destination rank by dividing the raw expert id
+(MoRI: `destExpert / numExpertPerRank`), so pinning one shared expert on every
+rank costs each rank a slot and pushes the routed ids out of alignment:
+
+    rank r owns dispatch slots [r*S, r*S + S), S = routed_per_rank + num_shared
+    routed physical p  ->  p + num_shared * (p // routed_per_rank)
+    this rank's shared ->  r*S + routed_per_rank
+
+Used when EPLB is off. With EPLB on the shared expert is one more routed
+logical expert, so placement and the existing remap handle it instead.
 """
 
 import torch
-
-from atom.model_ops.fused_moe.expert_layout import SharedExpertDispatchLayout
 
 try:
     import triton
     import triton.language as tl
 
     _HAS_TRITON = True
-except ImportError:  # pragma: no cover - exercised only on CPU-only builds
+except ImportError:  # pragma: no cover - CPU-only builds
     _HAS_TRITON = False
+
+
+def _remap_torch(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_routed_physical: int,
+    routed_per_rank: int,
+    shared_base: int,
+    num_shared: int,
+    shared_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference path, and the fallback without triton."""
+    num_tokens = topk_ids.shape[0]
+    shifted = topk_ids + num_shared * (topk_ids // routed_per_rank)
+    # Out-of-range ids pass through: floor division would send -1 to -2.
+    in_range = (topk_ids >= 0) & (topk_ids < num_routed_physical)
+    routed = torch.where(in_range, shifted, topk_ids)
+
+    shared_ids = torch.arange(
+        shared_base,
+        shared_base + num_shared,
+        dtype=topk_ids.dtype,
+        device=topk_ids.device,
+    ).expand(num_tokens, num_shared)
+    shared_w = torch.full(
+        (num_tokens, num_shared),
+        shared_weight,
+        dtype=topk_weights.dtype,
+        device=topk_weights.device,
+    )
+    return (
+        torch.cat((topk_weights, shared_w), dim=1),
+        torch.cat((routed, shared_ids), dim=1),
+    )
 
 
 if _HAS_TRITON:
 
     @triton.jit
-    def _shared_dispatch_kernel(
+    def _remap_kernel(
         topk_ids_ptr,  # [ntok, topk]      routed physical ids
         topk_w_ptr,  # [ntok, topk]      routed weights
         out_ids_ptr,  # [ntok, out_width] dispatch-space ids
@@ -39,11 +78,8 @@ if _HAS_TRITON:
         NUM_SHARED: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """Rewrite routed ids into dispatch space and fill the shared column.
-
-        Iterates over output elements, so the shared column is written in place
-        instead of concatenated.
-        """
+        """Iterates over output elements, so the shared column is written in
+        place instead of concatenated."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_out
@@ -56,8 +92,6 @@ if _HAS_TRITON:
         in_off = row * topk + col
         phys = tl.load(topk_ids_ptr + in_off, mask=rmask, other=-1).to(tl.int64)
 
-        # SharedExpertDispatchLayout.routed_to_dispatch, inlined. Out-of-range
-        # ids pass through: floor division would send -1 to -2.
         in_range = (phys >= 0) & (phys < num_routed_physical)
         shifted = phys + NUM_SHARED * (phys // routed_per_rank)
         disp = tl.where(in_range, shifted, phys)
@@ -69,28 +103,33 @@ if _HAS_TRITON:
         tl.store(out_w_ptr + offs, tl.where(is_routed, w, shared_weight), mask=mask)
 
 
-def apply_shared_expert_dispatch(
+def remap_topk_to_dispatch(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    layout: SharedExpertDispatchLayout,
-    ep_rank: int,
+    num_routed_physical: int,
+    routed_per_rank: int,
+    shared_base: int,
+    num_shared: int,
     shared_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Widen a routed topk into dispatch space. Returns ``(weights, ids)``.
+    """Widen routed ids and append this rank's shared column. -> (weights, ids).
 
-    The torch equivalent is several elementwise kernels plus two ``torch.cat``
-    per layer per step, inside the ``aiter.moe_forward`` custom op that inductor
-    cannot fuse into -- hence the hand-written kernel.
+    The torch form is several elementwise kernels plus two `torch.cat` per layer
+    per step, inside the `aiter.moe_forward` custom op that inductor cannot fuse
+    into -- hence the hand-written kernel.
     """
+    args = (
+        num_routed_physical,
+        routed_per_rank,
+        shared_base,
+        num_shared,
+        shared_weight,
+    )
     ntok, topk = topk_ids.shape
-    num_shared = layout.num_shared
     out_width = topk + num_shared
     n_out = ntok * out_width
     if not _HAS_TRITON or n_out == 0:
-        ids, weights = layout.apply_to_topk(
-            topk_ids, topk_weights, ep_rank, shared_weight
-        )
-        return weights, ids
+        return _remap_torch(topk_weights, topk_ids, *args)
 
     out_ids = torch.empty(
         (ntok, out_width), dtype=topk_ids.dtype, device=topk_ids.device
@@ -102,14 +141,14 @@ def apply_shared_expert_dispatch(
     def grid(meta_kw):
         return (triton.cdiv(n_out, meta_kw["BLOCK"]),)
 
-    _shared_dispatch_kernel[grid](
+    _remap_kernel[grid](
         topk_ids.contiguous(),
         topk_weights.contiguous(),
         out_ids,
         out_w,
-        layout.num_routed_physical,
-        layout.routed_slots_per_rank,
-        layout.shared_dispatch_id(ep_rank, 0),
+        num_routed_physical,
+        routed_per_rank,
+        shared_base,
         shared_weight,
         topk,
         n_out,

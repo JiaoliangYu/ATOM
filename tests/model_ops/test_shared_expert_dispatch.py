@@ -8,7 +8,7 @@ pytest.importorskip("aiter", reason="full dispatch tests require aiter")
 import atom.model_ops.eplb as eplb_module
 import atom.model_ops.moe as moe_module
 import atom.model_ops.topK as topK_module
-from atom.model_ops.fused_moe.expert_layout import SharedExpertDispatchLayout
+from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
 from atom.model_ops.moe import FusedMoE, FusedMoEMethodBase, FusedMoEParallelConfig
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
@@ -16,14 +16,21 @@ from atom.model_ops.topK import (
 
 
 def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
-    layout = SharedExpertDispatchLayout(num_routed_physical=8, ep_size=2, num_shared=1)
+    layout = MoEExpertLayout.make(
+        num_routed=8,
+        num_shared=1,
+        num_configured_redundant=0,
+        ep_size=2,
+        use_all2all=True,
+        eplb_enabled=False,
+    )
     ns = SimpleNamespace(
-        fuse_shared_into_dispatch=True,
+        expert_layout=layout,
         num_fused_shared_experts=1,
         global_num_experts=8,
         num_redundant_experts=0,
         routed_scaling_factor=2.0,
-        shared_dispatch_layout=layout,
+        ep_size=2,
         ep_rank=ep_rank,
         layer_id=None,
         use_ep=True,
@@ -39,7 +46,6 @@ def test_to_dispatch_space_is_backend_neutral(monkeypatch):
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: False
     )
     # No GPU here; pin to the torch reference.
-    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
     routed_ids = torch.tensor([[0, 4], [3, -1]], dtype=torch.int32)
     routed_weights = torch.tensor([[0.7, 0.3], [0.6, 0.0]])
 
@@ -87,7 +93,6 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
     # Pins the ordering router -> EPLB -> shared, not the kernel arithmetic.
-    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
     layer.to_dispatch_space = lambda weights, ids: (
         FusedMoE.to_dispatch_space(layer, weights, ids)
     )
@@ -104,6 +109,45 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
     assert captured["num_fused_shared_experts"] == 0
     assert ids.tolist() == [[0, 5, 9]]
     assert weights.tolist() == [[0.75, 0.25, 1.0]]
+
+
+def test_eplb_appends_unscaled_shared_weight(monkeypatch):
+    layer = _dispatch_layer()
+    captured = {}
+    layer.expert_layout = MoEExpertLayout.make(
+        num_routed=8,
+        num_shared=1,
+        num_configured_redundant=0,
+        ep_size=2,
+        use_all2all=True,
+        eplb_enabled=True,
+    )
+    layer.append_shared_logical_column = lambda weights, ids: (
+        FusedMoE.append_shared_logical_column(layer, weights, ids)
+    )
+
+    def fake_select_experts(**kwargs):
+        captured["scale"] = kwargs["routed_scaling_factor"]
+        return torch.tensor([[1.5, 0.5]]), torch.tensor([[0, 4]])
+
+    monkeypatch.setattr(FusedMoE, "select_experts", fake_select_experts)
+    monkeypatch.setattr(eplb_module, "eplb_map_and_record_fused", lambda _, ids: ids)
+    monkeypatch.setattr(
+        moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
+    )
+
+    weights, ids = FusedMoEMethodBase.select_experts_with_record(
+        object(),
+        layer=layer,
+        hidden_states=torch.empty(1, 4),
+        router_logits=torch.empty(1, 8),
+        top_k=2,
+        renormalize=True,
+    )
+
+    assert weights.tolist() == [[1.5, 0.5, 1.0]]
+    assert ids.tolist() == [[0, 4, 8]]
+    assert captured["scale"] == 2.0
 
 
 def _parallel_config(*, dp_size: int, use_ep: bool) -> FusedMoEParallelConfig:
@@ -140,34 +184,30 @@ def test_ep_alone_does_not_imply_all2all(
     assert config.use_all2all_kernels is expected
 
 
-def _atom_config(*, dp_size: int, dp_attention: bool, switch: bool) -> SimpleNamespace:
+def _atom_config(*, eplb: bool) -> SimpleNamespace:
     return SimpleNamespace(
         quant_config=SimpleNamespace(exclude_layers=[], quant_dtype=None),
-        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+        parallel_config=SimpleNamespace(data_parallel_size=8),
         moe_ep_flatten_tp_across_dp=False,
-        enable_dp_attention=dp_attention,
-        fuse_shared_expert=switch,
+        eplb_enable=eplb,
     )
 
 
 @pytest.mark.parametrize(
-    "dp_size, dp_attention, switch, expected",
+    "eplb, switch, expected",
     [
-        # Only the DP + MoRI + dp-attention case is gated by the switch; the
-        # legacy AITER fusion must stay reachable everywhere else.
-        (1, False, False, True),
-        (8, True, False, False),
-        (8, True, True, True),
+        (False, False, False),
+        (False, True, True),
+        (True, False, True),
+        (True, True, True),
     ],
 )
-def test_switch_only_gates_the_all2all_case(
-    monkeypatch, dp_size, dp_attention, switch, expected
-):
-    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expected):
+    monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", switch)
     monkeypatch.setattr(
         topK_module,
         "get_current_atom_config",
-        lambda: _atom_config(dp_size=dp_size, dp_attention=dp_attention, switch=switch),
+        lambda: _atom_config(eplb=eplb),
     )
 
     enabled = is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)

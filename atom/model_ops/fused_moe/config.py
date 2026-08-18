@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 
 if TYPE_CHECKING:
+    from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
     from atom.model_ops.moe import FusedMoEParallelConfig
 
 logger = logging.getLogger("atom")
@@ -304,6 +305,7 @@ class FusedMoEConfig:
 
     num_local_experts: int
     moe_parallel_config: "FusedMoEParallelConfig"
+    expert_layout: "MoEExpertLayout"
 
     # The activation type.
     in_dtype: torch.dtype | str | None = None
@@ -319,36 +321,6 @@ class FusedMoEConfig:
     is_act_and_mul: bool = True
 
     is_lora_enabled: bool = False
-
-    # Shared experts folded into the routed dispatch. Whether they sit inside
-    # `num_experts` depends on the mode: with EPLB off they are pinned one per
-    # rank outside the placed space, with EPLB on they join it as ordinary
-    # logical experts. Either way the token carries this many extra columns.
-    num_fused_shared_experts: int = 0
-
-    @property
-    def num_local_experts_dispatch(self) -> int:
-        """Local slots to size an all2all backend for, shared slot included.
-
-        NOT ``num_experts // world_size``: a backend deriving the destination
-        from ``id // num_experts_per_rank`` would resolve the wrong rank.
-        """
-        return self.num_local_experts
-
-    @property
-    def num_global_experts_dispatch(self) -> int:
-        """Global width consumed by a whole-pipeline dispatch backend.
-
-        Each EP rank contributes its own fixed-local shared slots. Unlike the
-        routed physical width, this is the valid range for the ids handed to
-        MoRI or Mega after ``SharedExpertDispatchLayout`` widens each rank block.
-        """
-        return self.num_local_experts_dispatch * self.ep_size
-
-    @property
-    def experts_per_token_dispatch(self) -> int:
-        """Expert slots per token on the wire, including the shared column."""
-        return self.experts_per_token + self.num_fused_shared_experts
 
     def __post_init__(self):
         if self.dp_size > 1:
