@@ -320,8 +320,10 @@ class FusedMoEConfig:
 
     is_lora_enabled: bool = False
 
-    # `num_experts` counts routed physical slots only (the space EPLB places
-    # in), so a fused shared expert lives outside it: one extra slot per rank.
+    # Shared experts folded into the routed dispatch. Whether they sit inside
+    # `num_experts` depends on the mode: with EPLB off they are pinned one per
+    # rank outside the placed space, with EPLB on they join it as ordinary
+    # logical experts. Either way the token carries this many extra columns.
     num_fused_shared_experts: int = 0
 
     @property

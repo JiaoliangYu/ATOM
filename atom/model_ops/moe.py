@@ -29,10 +29,7 @@ from atom.config import (
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.eplb import (
-    eplb_map_and_record_fused,
-    topk_to_dispatch_fused,
-)
+from atom.model_ops.eplb import eplb_map_and_record_fused
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -49,6 +46,9 @@ from atom.model_ops.fused_moe.expert_layout import (
     expert_shard_dim,
     expert_shard_view,
     physical_expert_id,
+)
+from atom.model_ops.fused_moe.shared_expert_dispatch import (
+    apply_shared_expert_dispatch,
 )
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
@@ -483,17 +483,27 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=layer.global_num_experts - layer.num_redundant_experts,
-            # The shared column is appended after EPLB has mapped and recorded
-            # the routed ids; only the legacy AITER path wants it from the router.
+            # Routed only: the gate has no logit for the always-on shared expert.
+            num_routing_experts=layer.num_routed_logical_experts,
+            # Only the legacy AITER path wants the shared column from the router.
             num_fused_shared_experts=(
-                0 if layer.fuse_shared_into_dispatch else layer.num_fused_shared_experts
+                0
+                if (layer.fuse_shared_into_dispatch or layer.shared_as_routed_expert)
+                else layer.num_fused_shared_experts
             ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        # Fused logical->physical remap + expert-load record + dispatch space
-        return layer.topk_to_dispatch(topk_weights, topk_logical)
+        if layer.shared_as_routed_expert:
+            # EPLB owns the shared expert, so it has to be in the topk before the
+            # remap places it and counts its load.
+            topk_weights, topk_logical = layer.append_shared_logical_column(
+                topk_weights, topk_logical
+            )
+            return topk_weights, eplb_map_and_record_fused(layer, topk_logical)
+        # Ids come out physical; the pinned shared column goes on afterwards.
+        topk_physical = eplb_map_and_record_fused(layer, topk_logical)
+        return layer.to_dispatch_space(topk_weights, topk_physical)
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -2588,29 +2598,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.num_redundant_experts = (
-            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
-            if self.use_ep and getattr(atom_config, "eplb_enable", False)
-            else 0
-        )
-        # physical slots = routed experts + EPLB redundant replicas
-        self.global_num_experts = num_experts + self.num_redundant_experts
-        if self.use_ep:
-            assert self.global_num_experts % self.ep_size == 0, (
-                "EPLB physical experts must be divisible by ep_size: "
-                f"num_logical={num_experts}, "
-                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
-            )
-        self.register_buffer("expert_map", None, persistent=False)
-        self.register_buffer("expert_mask", None, persistent=False)
-        if self.use_ep:
-            self.local_num_experts, self.expert_map = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-            )
-        else:
-            self.local_num_experts = self.global_num_experts
         self.top_k = top_k
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
@@ -2636,14 +2623,56 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
-        # The AITER path keeps the single tail id shared by all ranks; the
-        # all2all path needs one dispatch id per rank, because MoRI resolves a
-        # token's destination from the raw expert id.
-        self.fuse_shared_into_dispatch = (
+        eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
+        fusable = (
             fuse_shared_experts
             and self.num_fused_shared_experts > 0
             and self.moe_parallel_config.use_all2all_kernels
         )
+        # EPLB off: pin one shared replica per rank and translate ids into that
+        # widened space. EPLB on: hand it over as one more routed logical expert.
+        # Mutually exclusive -- pinning would fight EPLB for the same slots.
+        self.fuse_shared_into_dispatch = fusable and not eplb_enabled
+        self.shared_as_routed_expert = fusable and eplb_enabled
+
+        num_logical_experts = num_experts + (
+            self.num_fused_shared_experts if self.shared_as_routed_expert else 0
+        )
+        configured_redundant = (
+            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
+            if eplb_enabled
+            else 0
+        )
+        redundant = configured_redundant
+        if self.shared_as_routed_expert:
+            # One more slot per rank, so the shared expert has somewhere to live
+            # on each of them and the total still splits evenly for MoRI. The
+            # configured budget stays entirely with the routed experts.
+            redundant += self.ep_size - self.num_fused_shared_experts
+        # Keep `global - redundant == logical`: physical_expert_id and
+        # count_local_base_experts both recover the logical count that way.
+        self.global_num_experts = num_logical_experts + redundant
+        self.num_redundant_experts = redundant
+        # These differ only under `shared_as_routed_expert`, where the shared
+        # expert takes the id right after the routed ones.
+        self.num_routed_logical_experts = num_experts
+        self.num_logical_experts = num_logical_experts
+        if self.use_ep:
+            assert self.global_num_experts % self.ep_size == 0, (
+                "EPLB physical experts must be divisible by ep_size: "
+                f"num_logical={num_logical_experts}, "
+                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
+            )
+        self.register_buffer("expert_map", None, persistent=False)
+        self.register_buffer("expert_mask", None, persistent=False)
+        if self.use_ep:
+            self.local_num_experts, self.expert_map = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts,
+            )
+        else:
+            self.local_num_experts = self.global_num_experts
         self.shared_dispatch_layout = None
         if self.fuse_shared_into_dispatch:
             if custom_routing_function is not None:
@@ -2661,30 +2690,35 @@ class FusedMoE(torch.nn.Module):
                 self.shared_dispatch_layout, self.ep_rank, self.ep_size, self.top_k
             )
         if self.use_ep:
-            self.expert_map = torch.cat(
-                (
-                    self.expert_map,
-                    torch.tensor(
-                        [
-                            self.local_num_experts + i
-                            for i in range(self.num_fused_shared_experts)
-                        ],
-                        dtype=torch.int32,
+            # No AITER tail when the shared expert joined the routed set: it then
+            # owns a real physical slot inside `global_num_experts`.
+            if not self.shared_as_routed_expert:
+                self.expert_map = torch.cat(
+                    (
+                        self.expert_map,
+                        torch.tensor(
+                            [
+                                self.local_num_experts + i
+                                for i in range(self.num_fused_shared_experts)
+                            ],
+                            dtype=torch.int32,
+                        ),
+                        # Sentinel entry for the fake expert ID
+                        # (global_num_experts + num_fused_shared_experts) used by
+                        # aiter topK to mark non-local tokens when EP is active.
+                        # Must map to -1 so that EP remapping zeros their weights.
+                        torch.tensor([-1], dtype=torch.int32),
                     ),
-                    # Sentinel entry for the fake expert ID
-                    # (global_num_experts + num_fused_shared_experts) used by
-                    # aiter topK to mark non-local tokens when EP is active.
-                    # Must map to -1 so that EP remapping zeros their weights.
-                    torch.tensor([-1], dtype=torch.int32),
-                ),
-                dim=0,
-            )
+                    dim=0,
+                )
             self.rebuild_expert_mask()
         # The prebuilt topK buffer keeps the shared column live only on tokens
         # with `i % tp_size == tp_rank`, which assumes every rank holds the same
-        # batch. Under DP attention that would drop most tokens, so the all2all
-        # path builds its shared column per call instead.
-        if self.num_fused_shared_experts > 0 and not self.fuse_shared_into_dispatch:
+        # batch. Under DP attention that would drop most tokens, so both all2all
+        # paths build their shared column per call instead.
+        if self.num_fused_shared_experts > 0 and not (
+            self.fuse_shared_into_dispatch or self.shared_as_routed_expert
+        ):
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -2699,7 +2733,9 @@ class FusedMoE(torch.nn.Module):
                 max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
-        if fuse_shared_experts:
+        # Extra local slot for the shared expert -- but not when it already owns
+        # a physical slot that determine_expert_map handed to one rank.
+        if fuse_shared_experts and not self.shared_as_routed_expert:
             self.local_num_experts += self.num_fused_shared_experts
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
@@ -2777,12 +2813,12 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
-        # Only the MXFP4 apply() routes topk through `topk_to_dispatch`.
+        # Only the MXFP4 apply() routes topk through `select_experts_with_record`.
         # The others would hand the backend the legacy tail id, which resolves
         # to the wrong rank instead of failing.
-        if self.fuse_shared_into_dispatch and not isinstance(
-            self.quant_method, Mxfp4MoEMethod
-        ):
+        if (
+            self.fuse_shared_into_dispatch or self.shared_as_routed_expert
+        ) and not isinstance(self.quant_method, Mxfp4MoEMethod):
             raise NotImplementedError(
                 "fuse_shared_expert is only wired up for the MXFP4 MoE path, got "
                 f"{type(self.quant_method).__name__}"
@@ -2809,23 +2845,52 @@ class FusedMoE(torch.nn.Module):
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
 
-    def topk_to_dispatch(
+    @property
+    def shared_expert_weight(self) -> float:
+        if is_rocm_aiter_fuse_routed_scaling_factor():
+            return 1.0
+        return 1.0 / self.routed_scaling_factor
+
+    def to_dispatch_space(
         self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Routing output -> the ids the backend dispatches on."""
+        """Widen physical ids and pin this rank's shared column onto them."""
         if self.shared_dispatch_layout is None:
-            return topk_weights, eplb_map_and_record_fused(self, topk_ids)
-        shared_weight = (
-            1.0
-            if is_rocm_aiter_fuse_routed_scaling_factor()
-            else 1.0 / self.routed_scaling_factor
-        )
-        return topk_to_dispatch_fused(
-            self,
+            return topk_weights, topk_ids
+        return apply_shared_expert_dispatch(
             topk_weights,
             topk_ids,
             self.shared_dispatch_layout,
-            shared_weight,
+            self.ep_rank,
+            self.shared_expert_weight,
+        )
+
+    def append_shared_logical_column(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add the shared expert as extra routed logical columns.
+
+        Its ids follow the routed ones, matching the loader's rename of
+        `shared_experts.*` to `experts.{n_routed}.*`.
+        """
+        num_tokens, num_shared = topk_ids.shape[0], self.num_fused_shared_experts
+        shared_ids = torch.arange(
+            self.num_routed_logical_experts,
+            self.num_routed_logical_experts + num_shared,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(num_tokens, num_shared)
+        shared_w = torch.full(
+            (num_tokens, num_shared),
+            self.shared_expert_weight,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        return (
+            torch.cat((topk_weights, shared_w), dim=1),
+            torch.cat((topk_ids, shared_ids), dim=1),
         )
 
     def rebuild_expert_mask(self) -> None:
