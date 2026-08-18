@@ -2699,5 +2699,3 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             TOP_K=top_k,
         )
     return out
-
-

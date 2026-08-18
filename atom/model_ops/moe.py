@@ -82,8 +82,8 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-# `--fuse-shared-expert` has several silent fall-through paths, so a switch
-# that was ignored looks the same as a feature that did not help.
+# Fusion has several silent fall-through paths, so a run that quietly did not
+# fuse looks the same as a feature that did not help.
 _shared_fuse_logged = False
 
 
@@ -2820,7 +2820,7 @@ class FusedMoE(torch.nn.Module):
             self.fuse_shared_into_dispatch or self.shared_as_routed_expert
         ) and not isinstance(self.quant_method, Mxfp4MoEMethod):
             raise NotImplementedError(
-                "fuse_shared_expert is only wired up for the MXFP4 MoE path, got "
+                "Shared-expert fusion is only wired up for the MXFP4 MoE path, got "
                 f"{type(self.quant_method).__name__}"
             )
 
