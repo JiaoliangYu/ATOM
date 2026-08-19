@@ -2579,6 +2579,7 @@ class FusedMoE(torch.nn.Module):
             use_all2all=self.moe_parallel_config.use_all2all_kernels,
             eplb_enabled=eplb_enabled,
         )
+        # Dispatch space: the id bound the kernels see, not the routed width.
         self.global_num_experts = self.expert_layout.num_physical
         self.num_redundant_experts = self.expert_layout.num_redundant
         if self.use_ep:
@@ -2590,6 +2591,7 @@ class FusedMoE(torch.nn.Module):
         self.register_buffer("expert_map", None, persistent=False)
         self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
+            # Routed width: expert_map is indexed by checkpoint expert ids.
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
