@@ -2552,8 +2552,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.top_k = top_k
-        self.shared_expert_scoring_func = shared_expert_scoring_func
         if shared_expert_prefix is None and prefix.endswith(".experts"):
             shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
         fuse_shared_experts = (
@@ -2567,11 +2565,6 @@ class FusedMoE(torch.nn.Module):
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
 
-        self.routed_scaling_factor = (
-            getattr(config, "routed_scaling_factor", 1.0)
-            if config is not None and atom_config.torch_dtype != torch.float16
-            else 1.0
-        )
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
         num_redundant_experts = (
             int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
@@ -2600,10 +2593,17 @@ class FusedMoE(torch.nn.Module):
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
+                global_num_experts=self.expert_layout.num_routed_physical,
             )
         else:
             self.local_num_experts = self.global_num_experts
+        self.top_k = top_k
+        self.shared_expert_scoring_func = shared_expert_scoring_func
+        self.routed_scaling_factor = (
+            getattr(config, "routed_scaling_factor", 1.0)
+            if config is not None and atom_config.torch_dtype != torch.float16
+            else 1.0
+        )
         if (
             self.expert_layout.uses_dispatch_remap
             and custom_routing_function is not None
@@ -2642,7 +2642,16 @@ class FusedMoE(torch.nn.Module):
                 self.top_k + self.num_fused_shared_experts,
             )
         if self.use_ep:
-            self.rebuild_expert_mask()
+            if self.expert_layout.uses_dispatch_remap:
+                self.expert_mask = torch.zeros(
+                    self.global_num_experts,
+                    dtype=torch.int32,
+                    device=self.expert_map.device,
+                )
+                start = self.ep_rank * self.local_num_experts
+                self.expert_mask[start : start + self.local_num_experts] = 1
+            else:
+                self.expert_mask = (self.expert_map > -1).to(torch.int32)
         if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
@@ -2777,7 +2786,8 @@ class FusedMoE(torch.nn.Module):
     def shared_dispatch_base(self) -> int:
         """This rank's first pinned shared slot, in dispatch space."""
         return (
-            self.ep_rank * self.local_num_experts + self.expert_layout.physical_per_rank
+            self.ep_rank * self.local_num_experts
+            + self.expert_layout.routed_physical_per_rank
         )
 
     def to_dispatch_space(
@@ -2789,8 +2799,8 @@ class FusedMoE(torch.nn.Module):
         return remap_topk_to_dispatch(
             topk_weights,
             topk_ids,
-            self.global_num_experts,
-            self.expert_layout.physical_per_rank,
+            self.expert_layout.num_routed_physical,
+            self.expert_layout.routed_physical_per_rank,
             self.shared_dispatch_base,
             self.num_fused_shared_experts,
             self.shared_expert_weight,
@@ -2819,21 +2829,6 @@ class FusedMoE(torch.nn.Module):
             torch.cat((topk_weights, shared_w), dim=1),
             torch.cat((topk_ids, shared_ids), dim=1),
         )
-
-    def rebuild_expert_mask(self) -> None:
-        """Rebuild the backend mask after construction or EPLB binding."""
-        if not self.use_ep or self.expert_map is None:
-            return
-        if not self.expert_layout.uses_dispatch_remap:
-            self.expert_mask = (self.expert_map > -1).to(torch.int32)
-            return
-
-        stride = self.local_num_experts
-        mask = torch.zeros(
-            stride * self.ep_size, dtype=torch.int32, device=self.expert_map.device
-        )
-        mask[self.ep_rank * stride : (self.ep_rank + 1) * stride] = 1
-        self.expert_mask = mask
 
     def process_weights_after_loading(self):
         self._online_quant()
@@ -3598,7 +3593,7 @@ class FusedMoE(torch.nn.Module):
         """Local slots holding a routed base expert, i.e. slots `[0, n)`."""
         return count_local_base_experts(
             expert_map=self.expert_map,
-            global_num_experts=self.global_num_experts,
+            global_num_experts=self.expert_layout.num_routed_physical,
             num_redundant_experts=self.num_redundant_experts,
             local_num_experts=self.local_num_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -3649,7 +3644,7 @@ class FusedMoE(torch.nn.Module):
         # process_weights_after_loading has already read every local slot.
         # create_weights hands them out as torch.empty, so zero them here --
         # the whole-buffer flush this replaced used to do it as a side effect.
-        for slot in range(n_base, self.expert_layout.physical_per_rank):
+        for slot in range(n_base, self.expert_layout.routed_physical_per_rank):
             dst[slot].zero_()
 
     def weight_loader(

@@ -27,11 +27,12 @@ def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
     ns = SimpleNamespace(
         expert_layout=layout,
         num_fused_shared_experts=1,
-        global_num_experts=8,
+        global_num_experts=10,
         num_redundant_experts=0,
         routed_scaling_factor=2.0,
         ep_size=2,
         ep_rank=ep_rank,
+        local_num_experts=5,
         layer_id=None,
         use_ep=True,
         expert_map=torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3, 4, -1]),
@@ -54,21 +55,6 @@ def test_to_dispatch_space_is_backend_neutral(monkeypatch):
     assert ids.tolist() == [[0, 5, 9], [3, -1, 9]]
     assert torch.equal(weights[:, :2], routed_weights)
     assert weights[:, 2].tolist() == [0.5, 0.5]
-
-
-def test_rebuild_expert_mask_preserves_dispatch_space_after_eplb_update():
-    layer = _dispatch_layer(ep_rank=1)
-
-    FusedMoE.rebuild_expert_mask(layer)
-
-    assert layer.expert_mask.numel() == 10
-    assert torch.nonzero(layer.expert_mask, as_tuple=False).flatten().tolist() == [
-        5,
-        6,
-        7,
-        8,
-        9,
-    ]
 
 
 def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):

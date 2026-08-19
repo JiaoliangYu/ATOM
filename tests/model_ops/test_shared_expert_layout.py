@@ -19,7 +19,7 @@ def test_backend_config_widens_every_rank_block_by_the_shared_slot():
         use_mori_kernels=True,
     )
     config = FusedMoEConfig(
-        num_experts=256,
+        num_experts=264,
         experts_per_token=9,
         hidden_dim=7168,
         num_local_experts=33,
@@ -36,7 +36,8 @@ def test_backend_config_widens_every_rank_block_by_the_shared_slot():
 
     assert config.expert_layout.mode is SharedExpertMode.LOCAL_REPLICA
     assert config.num_local_experts == 33
-    assert config.expert_layout.global_num_experts == 264
+    assert config.expert_layout.num_routed_physical == 256
+    assert config.expert_layout.num_physical == 264
     assert config.experts_per_token == 9
 
 

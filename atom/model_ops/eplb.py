@@ -1933,11 +1933,7 @@ class EPLBManager:
                 runtime_map[num_physical:].copy_(tail.to(runtime_map.device))
             layer.expert_map = runtime_map
             if getattr(layer, "expert_mask", None) is not None:
-                rebuild_mask = getattr(layer, "rebuild_expert_mask", None)
-                if callable(rebuild_mask):
-                    rebuild_mask()
-                else:
-                    layer.expert_mask = (runtime_map > -1).to(torch.int32)
+                layer.expert_mask = (runtime_map > -1).to(torch.int32)
 
     def _assert_placement_matches_loaded(self) -> None:
         """Sanity-check the trivial placement against the checkpoint loader.

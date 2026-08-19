@@ -39,7 +39,6 @@ class MoEExpertLayout:
     num_redundant: int
     num_physical: int
     physical_per_rank: int
-    global_num_experts: int
 
     @classmethod
     def make(
@@ -61,17 +60,15 @@ class MoEExpertLayout:
         else:
             mode = SharedExpertMode.LOCAL_REPLICA
         shared_is_routed = mode is SharedExpertMode.EPLB_ROUTED
-        local_shared = mode in (
-            SharedExpertMode.LEGACY_AITER,
-            SharedExpertMode.LOCAL_REPLICA,
-        )
         num_logical = num_routed + (num_shared if shared_is_routed else 0)
         num_redundant = num_configured_redundant
         if shared_is_routed:
             num_redundant += -(num_logical + num_redundant) % ep_size
-        num_physical = num_logical + num_redundant
+        num_routed_physical = num_logical + num_redundant
+        num_physical = num_routed_physical
+        if mode is SharedExpertMode.LOCAL_REPLICA:
+            num_physical += num_shared * ep_size
         physical_per_rank = num_physical // ep_size
-        dispatch_per_rank = physical_per_rank + (num_shared if local_shared else 0)
         return cls(
             mode=mode,
             num_routed=num_routed,
@@ -80,8 +77,20 @@ class MoEExpertLayout:
             num_redundant=num_redundant,
             num_physical=num_physical,
             physical_per_rank=physical_per_rank,
-            global_num_experts=dispatch_per_rank * ep_size,
         )
+
+    @property
+    def routed_physical_per_rank(self) -> int:
+        if self.mode is SharedExpertMode.LOCAL_REPLICA:
+            return self.physical_per_rank - self.num_shared
+        return self.physical_per_rank
+
+    @property
+    def num_routed_physical(self) -> int:
+        if self.mode is SharedExpertMode.LOCAL_REPLICA:
+            ep_size = self.num_physical // self.physical_per_rank
+            return self.num_physical - self.num_shared * ep_size
+        return self.num_physical
 
     @property
     def shared_is_routed(self) -> bool:
