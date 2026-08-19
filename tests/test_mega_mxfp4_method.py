@@ -204,7 +204,7 @@ def test_mega_backend_uses_global_dispatch_width(monkeypatch):
     monkeypatch.setattr(mega_module, "run_mega_moe", fake_run)
     layer = SimpleNamespace(
         _mega_w1=torch.empty(33, 1),
-        expert_layout=SimpleNamespace(local_num_experts=33),
+        local_num_experts=33,
         swiglu_limit=0.0,
     )
     backend = mega_module.MegaFusedExperts(

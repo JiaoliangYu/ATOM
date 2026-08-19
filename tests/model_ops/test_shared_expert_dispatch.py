@@ -8,6 +8,7 @@ pytest.importorskip("aiter", reason="full dispatch tests require aiter")
 import atom.model_ops.eplb as eplb_module
 import atom.model_ops.moe as moe_module
 import atom.model_ops.topK as topK_module
+from atom.model_ops.fused_moe import shared_expert_dispatch as dispatch_module
 from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
 from atom.model_ops.moe import FusedMoE, FusedMoEMethodBase, FusedMoEParallelConfig
 from atom.model_ops.topK import (
@@ -15,7 +16,12 @@ from atom.model_ops.topK import (
 )
 
 
-def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
+class _FakeMoELayer(SimpleNamespace):
+    shared_dispatch_base = FusedMoE.shared_dispatch_base
+    shared_expert_weight = FusedMoE.shared_expert_weight
+
+
+def _dispatch_layer(*, ep_rank: int = 1) -> _FakeMoELayer:
     layout = MoEExpertLayout.make(
         num_routed=8,
         num_fused_shared_experts=1,
@@ -24,7 +30,7 @@ def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
         use_all2all=True,
         eplb_enabled=False,
     )
-    ns = SimpleNamespace(
+    ns = _FakeMoELayer(
         expert_layout=layout,
         num_fused_shared_experts=1,
         global_num_experts=10,
@@ -43,6 +49,7 @@ def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
 
 def test_to_dispatch_space_is_backend_neutral(monkeypatch):
     layer = _dispatch_layer(ep_rank=1)
+    monkeypatch.setattr(dispatch_module, "_HAS_TRITON", False)
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: False
     )
@@ -59,6 +66,7 @@ def test_to_dispatch_space_is_backend_neutral(monkeypatch):
 
 def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
     layer = _dispatch_layer(ep_rank=1)
+    monkeypatch.setattr(dispatch_module, "_HAS_TRITON", False)
     captured = {}
     routed_weights = torch.tensor([[0.75, 0.25]])
     routed_ids = torch.tensor([[0, 4]], dtype=torch.int32)

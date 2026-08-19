@@ -29,9 +29,13 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         return False
     # Only MoRI needs the switch; the TP fusion is a different mechanism.
     # EPLB always fuses, otherwise the env decides.
-    if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
-        if not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT):
-            return False
+    if (
+        dp_size > 1
+        and _has_module("mori")
+        and config.enable_dp_attention
+        and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
+    ):
+        return False
 
     if quant_config is not None and shared_expert_prefix is not None:
         shared_spec = quant_config.get_layer_quant_config(
