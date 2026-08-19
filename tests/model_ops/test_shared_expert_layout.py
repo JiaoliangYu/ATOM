@@ -26,7 +26,7 @@ def test_backend_config_widens_every_rank_block_by_the_shared_slot():
         moe_parallel_config=parallel,
         expert_layout=MoEExpertLayout.make(
             num_routed=256,
-            num_shared=1,
+            num_fused_shared_experts=1,
             num_configured_redundant=0,
             ep_size=8,
             use_all2all=True,
@@ -44,7 +44,7 @@ def test_backend_config_widens_every_rank_block_by_the_shared_slot():
 def test_eplb_promotes_shared_to_routed_layout():
     layout = MoEExpertLayout.make(
         num_routed=256,
-        num_shared=1,
+        num_fused_shared_experts=1,
         num_configured_redundant=32,
         ep_size=8,
         use_all2all=True,
@@ -59,13 +59,19 @@ def test_eplb_promotes_shared_to_routed_layout():
 
 def test_remap_preserves_routed_owner_and_local_slot():
     """The point of the widening: MoRI must still resolve the same rank."""
-    routed_per_rank, num_shared = 4, 1
-    stride = routed_per_rank + num_shared
+    routed_per_rank, num_fused_shared_experts = 4, 1
+    stride = routed_per_rank + num_fused_shared_experts
     ids = torch.arange(8, dtype=torch.int32).reshape(1, 8)
     weights = torch.zeros((1, 8))
 
     _, out_ids = _remap_torch(
-        weights, ids, 8, routed_per_rank, routed_per_rank, num_shared, 0.5
+        weights,
+        ids,
+        8,
+        routed_per_rank,
+        routed_per_rank,
+        num_fused_shared_experts,
+        0.5,
     )
     dispatch = out_ids[0, :8]
 

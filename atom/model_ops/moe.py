@@ -2561,7 +2561,7 @@ class FusedMoE(torch.nn.Module):
                 routed_expert_prefix=prefix,
             )
         )
-        num_shared = (
+        num_fused_shared_experts = (
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
 
@@ -2573,7 +2573,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.expert_layout = MoEExpertLayout.make(
             num_routed=num_experts,
-            num_shared=num_shared,
+            num_fused_shared_experts=num_fused_shared_experts,
             num_configured_redundant=num_redundant_experts,
             ep_size=self.ep_size,
             use_all2all=self.moe_parallel_config.use_all2all_kernels,
@@ -2774,7 +2774,7 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def num_fused_shared_experts(self) -> int:
-        return self.expert_layout.num_shared
+        return self.expert_layout.num_fused_shared_experts
 
     @property
     def shared_expert_weight(self) -> float:
@@ -2812,15 +2812,16 @@ class FusedMoE(torch.nn.Module):
         topk_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append shared experts to routed logical columns."""
-        num_tokens, num_shared = topk_ids.shape[0], self.num_fused_shared_experts
+        num_tokens = topk_ids.shape[0]
+        num_fused_shared_experts = self.num_fused_shared_experts
         shared_ids = torch.arange(
             self.expert_layout.num_routed,
-            self.expert_layout.num_routed + num_shared,
+            self.expert_layout.num_routed + num_fused_shared_experts,
             dtype=topk_ids.dtype,
             device=topk_ids.device,
-        ).expand(num_tokens, num_shared)
+        ).expand(num_tokens, num_fused_shared_experts)
         shared_w = torch.full(
-            (num_tokens, num_shared),
+            (num_tokens, num_fused_shared_experts),
             self.shared_expert_weight,
             dtype=topk_weights.dtype,
             device=topk_weights.device,

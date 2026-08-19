@@ -18,7 +18,7 @@ from atom.model_ops.topK import (
 def _dispatch_layer(*, ep_rank: int = 1) -> SimpleNamespace:
     layout = MoEExpertLayout.make(
         num_routed=8,
-        num_shared=1,
+        num_fused_shared_experts=1,
         num_configured_redundant=0,
         ep_size=2,
         use_all2all=True,
@@ -102,7 +102,7 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
     captured = {}
     layer.expert_layout = MoEExpertLayout.make(
         num_routed=8,
-        num_shared=1,
+        num_fused_shared_experts=1,
         num_configured_redundant=0,
         ep_size=2,
         use_all2all=True,

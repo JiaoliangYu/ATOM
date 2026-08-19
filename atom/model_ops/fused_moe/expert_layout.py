@@ -34,7 +34,7 @@ class SharedExpertMode(Enum):
 class MoEExpertLayout:
     mode: SharedExpertMode
     num_routed: int
-    num_shared: int
+    num_fused_shared_experts: int
     num_logical: int
     num_redundant: int
     num_physical: int
@@ -45,13 +45,13 @@ class MoEExpertLayout:
         cls,
         *,
         num_routed: int,
-        num_shared: int,
+        num_fused_shared_experts: int,
         num_configured_redundant: int,
         ep_size: int,
         use_all2all: bool,
         eplb_enabled: bool,
     ) -> "MoEExpertLayout":
-        if num_shared == 0:
+        if num_fused_shared_experts == 0:
             mode = SharedExpertMode.NONE
         elif not use_all2all:
             mode = SharedExpertMode.LEGACY_AITER
@@ -60,19 +60,19 @@ class MoEExpertLayout:
         else:
             mode = SharedExpertMode.LOCAL_REPLICA
         shared_is_routed = mode is SharedExpertMode.EPLB_ROUTED
-        num_logical = num_routed + (num_shared if shared_is_routed else 0)
+        num_logical = num_routed + (num_fused_shared_experts if shared_is_routed else 0)
         num_redundant = num_configured_redundant
         if shared_is_routed:
             num_redundant += -(num_logical + num_redundant) % ep_size
         num_routed_physical = num_logical + num_redundant
         num_physical = num_routed_physical
         if mode is SharedExpertMode.LOCAL_REPLICA:
-            num_physical += num_shared * ep_size
+            num_physical += num_fused_shared_experts * ep_size
         physical_per_rank = num_physical // ep_size
         return cls(
             mode=mode,
             num_routed=num_routed,
-            num_shared=num_shared,
+            num_fused_shared_experts=num_fused_shared_experts,
             num_logical=num_logical,
             num_redundant=num_redundant,
             num_physical=num_physical,
@@ -82,14 +82,14 @@ class MoEExpertLayout:
     @property
     def routed_physical_per_rank(self) -> int:
         if self.mode is SharedExpertMode.LOCAL_REPLICA:
-            return self.physical_per_rank - self.num_shared
+            return self.physical_per_rank - self.num_fused_shared_experts
         return self.physical_per_rank
 
     @property
     def num_routed_physical(self) -> int:
         if self.mode is SharedExpertMode.LOCAL_REPLICA:
             ep_size = self.num_physical // self.physical_per_rank
-            return self.num_physical - self.num_shared * ep_size
+            return self.num_physical - self.num_fused_shared_experts * ep_size
         return self.num_physical
 
     @property
