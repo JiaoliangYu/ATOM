@@ -3,6 +3,8 @@
 
 """Unit tests for M-TOPO (WideEPTopology)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from atom.model_engine.topology import WideEPTopology, parse_dist_init_addr
@@ -73,7 +75,12 @@ class TestGate0Regression:
         assert topo.tp_size == 8
         assert topo.global_dp_size == raw_dp
         assert topo.local_engine_count == expected_count
-        assert topo.ep_size == topo.gpu_per_node * topo.nnodes
+        # Without the DP-attention flatten, FusedMoEParallelConfig.make leaves
+        # ep_size at tp_size: EP spans a TP group and there are raw_dp
+        # independent groups. Asserting the multinode identity here instead
+        # would only be checking the view against itself.
+        assert topo.ep_size == 8
+        assert topo.gpu_per_node == raw_dp * 8
 
 
 class TestMultinodeLayout:
@@ -123,6 +130,71 @@ class TestMultinodeLayout:
         assert topo.dist_init_host == "192.168.1.10"
 
 
+class _FakeParallelConfig(SimpleNamespace):
+    """Duck-typed stand-in: atom.config pulls torch, which unit tests avoid."""
+
+    def __init__(self, **kw):
+        kw.setdefault("data_parallel_master_ip", "10.0.0.1")
+        kw.setdefault("data_parallel_master_port", 29500)
+        super().__init__(**kw)
+
+
+class TestFromParallelConfig:
+    """Derivation from the DP fields CoreManager owns."""
+
+    def test_fold_is_a_change_of_units(self):
+        """Pre- and post-fold ParallelConfig must yield the same topology.
+
+        CoreManager rewrites the DP fields into engine units (scaling them by
+        tp_size and setting tp_size to 1). Every quantity this view exposes is
+        a ratio or a product of those, so the rewrite must not move it. This
+        test is what makes that invariant executable rather than assumed.
+        """
+        pre = _FakeParallelConfig(
+            data_parallel_size=2, data_parallel_size_local=1, data_parallel_rank=1
+        )
+        post = _FakeParallelConfig(
+            data_parallel_size=16, data_parallel_size_local=8, data_parallel_rank=8
+        )
+        a = WideEPTopology.from_parallel_config(
+            pre, tensor_parallel_size=8, dp_attention=True
+        )
+        b = WideEPTopology.from_parallel_config(
+            post, tensor_parallel_size=1, dp_attention=True
+        )
+        assert a == b
+        assert (a.nnodes, a.node_rank, a.ep_size, a.gpu_per_node) == (2, 1, 16, 8)
+
+    def test_single_node_defaults_local_to_global(self):
+        pc = _FakeParallelConfig(
+            data_parallel_size=1, data_parallel_size_local=None, data_parallel_rank=0
+        )
+        topo = WideEPTopology.from_parallel_config(
+            pc, tensor_parallel_size=8, dp_attention=True
+        )
+        assert not topo.is_multinode
+        assert (topo.nnodes, topo.ep_size, topo.gpu_per_node) == (1, 8, 8)
+
+    def test_ragged_split_rejected(self):
+        """EPLB's hierarchical placement asserts num_gpus % num_nodes == 0."""
+        pc = _FakeParallelConfig(
+            data_parallel_size=8, data_parallel_size_local=3, data_parallel_rank=0
+        )
+        with pytest.raises(ValueError, match="must be divisible by"):
+            WideEPTopology.from_parallel_config(
+                pc, tensor_parallel_size=1, dp_attention=True
+            )
+
+    def test_rank_offset_must_align_to_slice(self):
+        pc = _FakeParallelConfig(
+            data_parallel_size=8, data_parallel_size_local=4, data_parallel_rank=3
+        )
+        with pytest.raises(ValueError, match="must be a multiple of"):
+            WideEPTopology.from_parallel_config(
+                pc, tensor_parallel_size=1, dp_attention=True
+            )
+
+
 class TestValidation:
     def test_global_dp_not_divisible_suggests_nnodes(self):
         with pytest.raises(ValueError, match="Valid nnodes values"):
@@ -165,9 +237,7 @@ class TestValidation:
             )
 
     def test_rendezvous_ports_require_multinode(self):
-        topo = WideEPTopology.create(
-            dp_attention=True, raw_tp_size=8, raw_dp_size=1
-        )
+        topo = WideEPTopology.create(dp_attention=True, raw_tp_size=8, raw_dp_size=1)
         with pytest.raises(ValueError, match="rendezvous ports"):
             _ = topo.rendezvous_port_world
 
