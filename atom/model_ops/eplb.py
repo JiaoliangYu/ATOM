@@ -2476,17 +2476,23 @@ def _install_static_shared_placement(owner: Any) -> None:
     }
     if not layers:
         return
-    first = layers[min(layers)]
-    set_static_expert_location_metadata(
-        ExpertLocationMetadata.from_shared_replicated(
-            num_layers=max(layers) + 1,
-            num_routed_experts=int(first.num_routed_logical_experts),
-            num_shared_experts=int(first.num_fused_shared_experts),
-            ep_size=int(first.ep_size),
-            ep_rank=int(first.ep_rank),
-            device=first.w13_weight.device,
+    if not all(m.expert_mask is not None for m in layers.values()):
+        raise RuntimeError(
+            "fused shared experts reached placement without an expert mask; "
+            "the dispatch would treat every slot as local"
         )
+    first = layers[min(layers)]
+    meta = ExpertLocationMetadata.from_shared_replicated(
+        num_layers=max(layers) + 1,
+        num_routed_experts=int(first.num_routed_logical_experts),
+        num_shared_experts=int(first.num_fused_shared_experts),
+        ep_size=int(first.ep_size),
+        ep_rank=int(first.ep_rank),
+        device=first.w13_weight.device,
     )
+    set_static_expert_location_metadata(meta)
+    for layer in layers.values():
+        layer.bind_expert_placement(meta)
     logger.info(
         "Fused shared expert: static placement over %d layers, %d routed + %d "
         "shared per rank",

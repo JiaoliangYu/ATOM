@@ -2636,15 +2636,13 @@ class FusedMoE(torch.nn.Module):
             self.local_num_experts = self.global_num_experts
         if self.use_ep:
             if self.fuse_shared_into_dispatch:
-                # Every rank owns one contiguous run of the dispatch space.
-                per_rank = self.global_num_experts // self.ep_size
-                self.expert_mask = torch.zeros(
+                # Placeholder: the mask is indexed by dispatch id, which only the
+                # placement knows. Rebuilt from it in bind_expert_placement.
+                self.expert_mask = torch.ones(
                     self.global_num_experts,
                     dtype=torch.int32,
                     device=self.expert_map.device,
                 )
-                start = self.ep_rank * per_rank
-                self.expert_mask[start : start + per_rank] = 1
             else:
                 expert_mask = torch.ones(
                     (self.global_num_experts + self.num_fused_shared_experts + 1,),
@@ -2835,6 +2833,19 @@ class FusedMoE(torch.nn.Module):
         return (
             torch.cat((topk_weights, shared_w), dim=1),
             torch.cat((topk_ids, shared_ids), dim=1),
+        )
+
+    def bind_expert_placement(self, meta) -> None:
+        """Point the kernel mask at the dispatch space the placement defines.
+
+        `expert_map` stays in checkpoint id space for the loader, so it cannot
+        supply this: only the placement knows which dispatch slots are local.
+        """
+        if not self.fuse_shared_into_dispatch or not isinstance(self.layer_id, int):
+            return
+        placement_map = meta.expert_map[self.layer_id]
+        self.expert_mask = (placement_map > -1).to(
+            dtype=torch.int32, device=self.expert_mask.device
         )
 
     def process_weights_after_loading(self):
