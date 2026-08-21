@@ -114,7 +114,7 @@ def test_update_is_inplace_and_correct():
     skew = torch.tensor([[100, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 100]], dtype=torch.int32)
     from atom.model_ops.eplb import postprocess_eplb_maps, rebalance_experts
 
-    p2l_raw, phyrank, cnt = rebalance_experts(
+    p2l_raw, phyrank, cnt, p2l_unique_raw = rebalance_experts(
         skew,
         num_physical=8,
         num_groups=1,
@@ -123,7 +123,11 @@ def test_update_is_inplace_and_correct():
         enable_hierarchical=False,
     )
     p2l, l2p, cnt, p2l_unique = postprocess_eplb_maps(
-        p2l_raw, phyrank, cnt, num_gpus=2
+        p2l_raw,
+        phyrank,
+        cnt,
+        num_gpus=2,
+        p2l_unique=p2l_unique_raw,
     )
     new = ExpertLocationMetadata.from_rebalance_result(
         physical_to_logical_map=p2l,

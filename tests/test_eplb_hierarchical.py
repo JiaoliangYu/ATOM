@@ -37,7 +37,7 @@ def _weights(num_layers, num_logical, *, skew=None, seed=0):
 
 def _run(cfg, *, num_layers=2, weight=None, hierarchical=True):
     w = _weights(num_layers, cfg["num_logical"]) if weight is None else weight
-    p2l, phyrank, logcnt = rebalance_experts(
+    p2l, phyrank, logcnt, p2l_unique_raw = rebalance_experts(
         w,
         num_physical=cfg["num_physical"],
         num_groups=cfg["num_groups"],
@@ -45,7 +45,13 @@ def _run(cfg, *, num_layers=2, weight=None, hierarchical=True):
         num_gpus=cfg["num_gpus"],
         enable_hierarchical=hierarchical,
     )
-    return postprocess_eplb_maps(p2l, phyrank, logcnt, num_gpus=cfg["num_gpus"])
+    return postprocess_eplb_maps(
+        p2l,
+        phyrank,
+        logcnt,
+        num_gpus=cfg["num_gpus"],
+        p2l_unique=p2l_unique_raw,
+    )
 
 
 def _assert_placement_valid(p2l, logcnt, cfg):
