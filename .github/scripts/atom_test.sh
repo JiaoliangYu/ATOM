@@ -439,9 +439,9 @@ if [ "$TYPE" == "benchmark" ]; then
     --dataset-name=random
     --random-input-len="$ISL" --random-output-len="$OSL" --random-range-ratio="$RANDOM_RANGE_RATIO"
     --max-concurrency="$CONC"
-    --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 10 ))}"
+    --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 5 ))}"
     --trust-remote-code
-    --num-warmups="$(( CONC * 2 ))"
+    --num-warmups="${NUM_WARMUPS_OVERRIDE:-256}"
     --request-rate=inf --ignore-eos
     --save-result --percentile-metrics="ttft,tpot,itl,e2el"
     --result-dir=. --result-filename="${RESULT_FILENAME}.json"
@@ -462,7 +462,7 @@ if [ "$TYPE" == "benchmark" ]; then
   set +m
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
-  # 8k/1k c=1024 first prepares/encodes 10240 prompts and 2048 warmups. That
+  # 8k/1k c=4096 first prepares/encodes 20480 prompts and 256 warmups. That
   # client-only phase can be silent for more than three minutes, so do not let
   # the progress watchdog mistake it for an engine hang. Fault signatures are
   # still detected immediately by wait_infer_drain.sh.
