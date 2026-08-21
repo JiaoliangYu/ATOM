@@ -178,6 +178,100 @@ def _build_logical_to_physical_map(
     return torch.tensor(out_rows, dtype=torch.int32, device=physical_to_logical.device)
 
 
+def _alias_same_rank_replica_maps(
+    p2l: torch.Tensor,
+    l2p: torch.Tensor,
+    logcnt: torch.Tensor,
+    *,
+    num_gpus: int,
+) -> torch.Tensor:
+    """Build p2l_unique and redirect l2p aliases to each rank's primary slot."""
+    assert logcnt.shape[0] == p2l.shape[0]
+    num_layers, num_physical = p2l.shape
+    assert num_physical % num_gpus == 0
+    num_local = num_physical // num_gpus
+    _, num_logical = logcnt.shape
+
+    p2l_unique = p2l.clone()
+    p2l_rows = p2l.cpu().tolist()
+    cnt_rows = logcnt.cpu().tolist()
+
+    for layer in range(num_layers):
+        p2l_l = p2l_rows[layer]
+        cnt_l = cnt_rows[layer]
+
+        primary_by_rank_logical: dict[tuple[int, int], int] = {}
+        for p in range(num_physical):
+            logical = p2l_l[p]
+            if logical < 0:
+                continue
+            ep_rank = p // num_local
+            key = (ep_rank, logical)
+            cur = primary_by_rank_logical.get(key)
+            if cur is None or p < cur:
+                primary_by_rank_logical[key] = p
+
+        alias_to_primary: dict[int, int] = {}
+        for p in range(num_physical):
+            logical = p2l_l[p]
+            if logical < 0:
+                continue
+            ep_rank = p // num_local
+            primary = primary_by_rank_logical[(ep_rank, logical)]
+            if p != primary:
+                alias_to_primary[p] = primary
+                p2l_unique[layer, p] = -1
+
+        if not alias_to_primary:
+            continue
+
+        for logical in range(num_logical):
+            need = int(cnt_l[logical])
+            for replica_idx in range(need):
+                phys = int(l2p[layer, logical, replica_idx].item())
+                if phys >= 0:
+                    primary = alias_to_primary.get(phys)
+                    if primary is not None:
+                        l2p[layer, logical, replica_idx] = primary
+
+    return p2l_unique
+
+
+def postprocess_eplb_maps(
+    p2l: torch.Tensor,
+    phyrank: torch.Tensor,
+    logcnt: torch.Tensor,
+    *,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unified post-pass after module-C placement (call once at the pipeline end).
+
+    ``p2l`` is the original physical->logical map and is left unchanged. This
+    pass only derives:
+      - ``l2p`` -- rebuilt from raw ``p2l``, then aliased to primary slots
+      - ``p2l_unique`` -- same-rank dedup of ``p2l`` (alias slots -> -1)
+
+    Same-rank replica alias:
+      - ``p2l_unique[alias_slot] = -1`` (no independent weight slot)
+      - ``l2p[e][*]`` entries that pointed at alias slots -> primary slot
+
+    ``logcnt`` is unchanged (global replica count for dispatch hash spread).
+
+    Returns:
+        p2l: raw module-C placement (same tensor as input)
+        logical_to_physical_map: runtime l2p (aliased)
+        logical_replica_count: unchanged logcnt
+        p2l_unique: same-rank dedup of p2l
+    """
+    assert p2l.shape == phyrank.shape
+    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+    p2l_unique = _alias_same_rank_replica_maps(
+        p2l, l2p, logcnt, num_gpus=num_gpus
+    )
+
+    return p2l, l2p, logcnt, p2l_unique
+
+
 def _rebuild_placement_from_p2l(
     p2l_layer: torch.Tensor, num_logical: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -403,9 +497,12 @@ def rebalance_experts(
     live placement; passed per-layer to policies for a sticky/shortest-path
     fast-path (flat/non-hierarchical path only; hierarchical recomputes fresh).
 
+    Returns raw placement only. Call ``postprocess_eplb_maps`` once afterward to
+    build ``l2p`` and the auxiliary same-rank ``p2l_unique`` map.
+
     Returns:
-        physical_to_logical_map: [num_layers, num_physical] int32
-        logical_to_physical_map: [num_layers, num_logical, cur] int32 (cur=max(logcnt))
+        p2l: [num_layers, num_physical] int32 (module-C raw placement)
+        physical_rank: [num_layers, num_physical] int32 (replica index per slot)
         logcnt: [num_layers, num_logical] int32
     """
     assert weight.dim() == 2, "weight must be rank-2 [num_layers, num_logical]"
@@ -441,8 +538,7 @@ def rebalance_experts(
             p2l[layer] = p2l_l
             phyrank[layer] = rank_l
             logcnt[layer] = cnt_l
-        l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
-        return p2l, l2p, logcnt
+        return p2l, phyrank, logcnt
 
     # Hierarchical path: group->node assignment, then node-local rebalance.
     group_size = num_logical // num_groups
@@ -508,8 +604,7 @@ def rebalance_experts(
         phyrank[layer] = phyrank_l
         logcnt[layer] = cnt_l
 
-    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
-    return p2l, l2p, logcnt
+    return p2l, phyrank, logcnt
 
 
 def _pad_logical_to_physical(
@@ -606,7 +701,8 @@ class ExpertLocationMetadata:
     """Central EPLB shared state: physical/logical placement maps.
 
     Base maps (module-C output, deterministic & identical across ranks):
-      - physical_to_logical_map [L, P]        physical slot -> logical expert
+      - physical_to_logical_map [L, P]        raw slot -> logical (rebalance / migration)
+      - p2l_unique [L, P]                     optional same-rank alias of p2l (-1 slot)
       - logical_to_physical_map [L, Lg, R]    logical -> physical replicas (-1 padded to R)
       - logical_replica_count   [L, Lg]       replicas per logical (<= R)
     Per-rank derived maps (base maps + EP topology):
@@ -639,6 +735,7 @@ class ExpertLocationMetadata:
     logical_replica_count: torch.Tensor
     expert_map: torch.Tensor
     logical_to_rank_dispatch_physical_map: torch.Tensor
+    p2l_unique: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         L, P = self.num_layers, self.num_physical_experts
@@ -649,6 +746,8 @@ class ExpertLocationMetadata:
         assert self.expert_map.shape == (L, P)
         assert self.logical_to_rank_dispatch_physical_map.shape == (L, Lg)
         assert P == self.ep_size * self.num_local_physical_experts
+        if self.p2l_unique is not None:
+            assert self.p2l_unique.shape == (L, P)
 
     @classmethod
     def from_rebalance_result(
@@ -660,6 +759,7 @@ class ExpertLocationMetadata:
         ep_size: int,
         ep_rank: int,
         max_num_replicas: int,
+        p2l_unique: torch.Tensor | None = None,
     ) -> ExpertLocationMetadata:
         """Assemble metadata from module-C output (pad + derive per-rank maps)."""
         num_layers, num_physical = physical_to_logical_map.shape
@@ -695,6 +795,11 @@ class ExpertLocationMetadata:
             logical_replica_count=logical_replica_count.contiguous().to(torch.int32),
             expert_map=expert_map,
             logical_to_rank_dispatch_physical_map=dispatch,
+            p2l_unique=(
+                None
+                if p2l_unique is None
+                else p2l_unique.contiguous().to(torch.int32)
+            ),
         )
 
     @classmethod
@@ -741,7 +846,6 @@ class ExpertLocationMetadata:
             logcnt[:, :num_redundant] = 2
 
         # l2p: [num_layers, num_logical, actual_max_replicas]
-        # slot e → expert e (primary); slot e+num_logical → expert e (redundant, if e < num_redundant)
         actual_max = 2 if num_redundant > 0 else 1
         l2p = torch.full(
             (num_layers, num_logical_experts, actual_max),
@@ -763,6 +867,12 @@ class ExpertLocationMetadata:
             )
             l2p[:, :num_redundant, 1] = extra.unsqueeze(0).expand(num_layers, -1)
 
+        # Auxiliary postprocess only; the original p2l/logcnt/l2p construction
+        # above remains unchanged.
+        p2l_unique = _alias_same_rank_replica_maps(
+            p2l, l2p, logcnt, num_gpus=ep_size
+        )
+
         return cls.from_rebalance_result(
             physical_to_logical_map=p2l,
             logical_to_physical_map=l2p,
@@ -770,6 +880,7 @@ class ExpertLocationMetadata:
             ep_size=ep_size,
             ep_rank=ep_rank,
             max_num_replicas=num_redundant + 1,
+            p2l_unique=p2l_unique,
         )
 
     def update(self, other: ExpertLocationMetadata, layer_ids: list[int]) -> None:
@@ -807,6 +918,19 @@ class ExpertLocationMetadata:
             self.physical_to_logical_map[layer_id].copy_(
                 other.physical_to_logical_map[layer_id]
             )
+            self.logical_to_physical_map[layer_id].copy_(
+                other.logical_to_physical_map[layer_id]
+            )
+            self.logical_replica_count[layer_id].copy_(
+                other.logical_replica_count[layer_id]
+            )
+            self.logical_to_rank_dispatch_physical_map[layer_id].copy_(
+                other.logical_to_rank_dispatch_physical_map[layer_id]
+            )
+            if other.p2l_unique is not None:
+                if self.p2l_unique is None:
+                    self.p2l_unique = other.p2l_unique.clone()
+                self.p2l_unique[layer_id].copy_(other.p2l_unique[layer_id])
             self.logical_to_physical_map[layer_id].copy_(
                 other.logical_to_physical_map[layer_id]
             )
@@ -1010,6 +1134,17 @@ def _plan_single_layer_migration(
             continue
         local_old_slots_by_logical.setdefault(logical, []).append(lslot)
 
+    def _count_logical(local: list[int], logical: int) -> int:
+        return sum(1 for lg in local if lg == logical)
+
+    old_local_counts: dict[int, int] = {}
+    new_local_counts: dict[int, int] = {}
+    for lg in set(old_local + new_local):
+        if lg < 0:
+            continue
+        old_local_counts[lg] = _count_logical(old_local, lg)
+        new_local_counts[lg] = _count_logical(new_local, lg)
+
     # ranks that need remote receive for each logical
     recv_ranks_by_logical: dict[int, list[int]] = {}
     for r in range(world_size):
@@ -1034,12 +1169,17 @@ def _plan_single_layer_migration(
         if old_logical == new_logical:
             continue  # unchanged
 
+        # Same-rank extra replica of a logical already held locally: remap metadata
+        # only (p2l/l2p/dispatch). Weights stay in the primary local slot; this
+        # dst slot is a placement alias and must not receive its own weight copy.
         if new_logical in primary_dst_by_logical:
-            buffer_copy_plan.append((primary_dst_by_logical[new_logical], dst))
-            continue  # free-rider
+            continue  # free-rider (metadata-only)
 
         local_sources = local_old_slots_by_logical.get(new_logical, [])
         if len(local_sources) > 0:
+            if new_local_counts[new_logical] > old_local_counts.get(new_logical, 0):
+                primary_dst_by_logical[new_logical] = dst
+                continue  # same-rank extra replica: metadata-only remap
             src = local_sources[0]
             local_copy_actions.append(_LocalCopyAction(src_slot=src, dst_slot=dst))
             buffer_copy_plan.append((dst, dst))
@@ -2155,7 +2295,7 @@ class EPLBManager:
         _rc = self._rebalance_count
 
         _t0 = _time.perf_counter()
-        p2l, l2p, logcnt = rebalance_experts(
+        p2l_raw, phyrank, logcnt = rebalance_experts(
             logical_load,
             num_physical=self.live_metadata.num_physical_experts,
             num_groups=num_groups,
@@ -2167,6 +2307,9 @@ class EPLBManager:
             # fast-path: unchanged hot set => reuse old placement => zero migration.
             old_p2l=self.live_metadata.physical_to_logical_map,
         )
+        p2l, l2p, logcnt, p2l_unique = postprocess_eplb_maps(
+            p2l_raw, phyrank, logcnt, num_gpus=ep_size
+        )
         new_meta = ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
             logical_to_physical_map=l2p,
@@ -2174,6 +2317,7 @@ class EPLBManager:
             ep_size=self.live_metadata.ep_size,
             ep_rank=self.live_metadata.ep_rank,
             max_num_replicas=self.live_metadata.max_num_replicas,
+            p2l_unique=p2l_unique,
         )
 
         chunk_size = max(1, int(self._rebalance_layers_per_chunk))
