@@ -183,7 +183,11 @@ class BlockManager:
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        # dtype pinned: `np.array` infers int64 from a list and int32 from an
+        # `array("i")`, so the digest used to depend on the caller's Python
+        # type. int64 is what lists gave, so pinning it leaves every existing
+        # hash where it was.
+        h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
         return h.intdigest()
 
     def complete_previous_state_batch(self) -> None:
@@ -1098,7 +1102,7 @@ class BlockManager:
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.forget_pending(seq)
-        seq.block_table.clear()
+        del seq.block_table[:]  # `array("i")` has no `.clear()`
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # No next forward will read a pending fork source after deallocation.
             self.state.release(seq.per_req_cache_group)
