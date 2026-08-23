@@ -8,14 +8,20 @@ constructed Python objects and uses them in ``AtomStandaloneRouter``.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import importlib
 import importlib.util
 import json
 import logging
-from pathlib import Path
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+)
 
 logger = logging.getLogger("atom")
 
@@ -76,7 +82,7 @@ def print_version(verbose: bool = False) -> None:
             else atomesh_runner.version_string
         )
         print(version_fn())
-    except Exception:
+    except Exception:  # noqa: BLE001 - a version banner must not fail the CLI
         print("Atomesh Python interface")
 
 
@@ -101,7 +107,6 @@ def initialize_standalone_service(
 ) -> Any:
     from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
 
-    global engine, tokenizer
     return AtomStandaloneService(
         engine=engine,
         tokenizer=tokenizer,
@@ -185,6 +190,13 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
         standalone_args.engine_args,
         standalone_args.default_chat_template_kwargs,
     )
+
+    # This frontend is the api_server's counterpart -- same tokenizer, same
+    # per-request accumulators -- but it builds its engine itself and never
+    # runs that FastAPI lifespan, so it has to apply the GC policy here.
+    tune_gc()
+    maybe_attach_gc_debug_callback("atomesh")
+    freeze_gc_heap("atomesh")
 
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")

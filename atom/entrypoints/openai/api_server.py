@@ -38,8 +38,13 @@ from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
-from atom.utils import tune_gc
+from atom.model_engine.sequence import new_token_ids
 from atom.utils.arg_parser import FlexibleArgumentParser
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+)
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
 from .metrics import AtomMetricsExporter
@@ -475,7 +480,13 @@ async def generate_async(
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    all_token_ids: list[int] = []
+    # An array, not a list: this grows for the whole life of the request,
+    # and one boxed PyInt per token is what the collector then walks on
+    # every pass. It stays an array all the way out -- the dict below is
+    # an internal hand-off to `build_*_response`, which reads `text` and
+    # the counters and never `token_ids`, so nothing serializes it. A
+    # consumer that starts reading that key has to convert.
+    all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -594,7 +605,7 @@ async def generate_async_multimodal(
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    all_token_ids: list[int] = []
+    all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
 
@@ -700,7 +711,7 @@ async def generate_async_fanout(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    per_tokens: list[list[int]] = [[] for _ in range(n)]
+    per_tokens = [new_token_ids() for _ in range(n)]
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
@@ -1133,8 +1144,12 @@ async def lifespan(app: FastAPI):
     global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
+    maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
     _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+    # The engine was built in `main()`, so this is the last point before the
+    # first request at which everything reachable is still startup state.
+    freeze_gc_heap("api_server")
     try:
         yield
     finally:
