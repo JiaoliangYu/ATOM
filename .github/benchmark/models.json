@@ -127,7 +127,7 @@
         {
           "label": "TP TBO",
           "suffix": "",
-          "extra_args": "--enable-tbo",
+          "extra_args": "--enable-dp-attention --enable-tbo",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 64,
           "conc_max": 4096
