@@ -56,6 +56,11 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
+
 
 def _mla_seg_meta_kwargs() -> dict:
     """Extra kwargs for ``get_mla_metadata_info_v1`` on the seg (page_size>1)
@@ -565,7 +570,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
@@ -614,7 +619,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         # round-robin CP only lands on the full-build path: decode_update_mla_
         # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.
@@ -1130,7 +1135,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=1,
-                max_split_per_batch=16,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
             )
             attn_metadata.sparse_prefill_work_meta_data = var[
                 "sparse_prefill_work_meta_data"
@@ -1506,7 +1511,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
         attn_metadata.sparse_prefill_work_meta_data = var[
             "sparse_prefill_work_meta_data"
@@ -2016,7 +2021,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
