@@ -14,7 +14,7 @@ CPU-only; no GPU or distributed setup.
 import pytest
 import torch
 
-from atom.model_ops.eplb import postprocess_eplb_maps, rebalance_experts
+from atom.model_ops.eplb import rebalance_experts
 
 # DSv4-Pro-shaped: 384 logical experts in 8 groups, EP16 over 2 nodes,
 # num_redundant = ep_size (the TRT "num_slots = experts + EP size" tier).
@@ -37,7 +37,7 @@ def _weights(num_layers, num_logical, *, skew=None, seed=0):
 
 def _run(cfg, *, num_layers=2, weight=None, hierarchical=True):
     w = _weights(num_layers, cfg["num_logical"]) if weight is None else weight
-    p2l, phyrank, logcnt, p2l_unique_raw = rebalance_experts(
+    return rebalance_experts(
         w,
         num_physical=cfg["num_physical"],
         num_groups=cfg["num_groups"],
@@ -45,17 +45,10 @@ def _run(cfg, *, num_layers=2, weight=None, hierarchical=True):
         num_gpus=cfg["num_gpus"],
         enable_hierarchical=hierarchical,
     )
-    return postprocess_eplb_maps(
-        p2l,
-        phyrank,
-        logcnt,
-        num_gpus=cfg["num_gpus"],
-        p2l_unique=p2l_unique_raw,
-    )
 
 
 def _assert_placement_valid(p2l, logcnt, cfg):
-    """Invariants on raw placement (pre same-rank alias)."""
+    """Invariants that any placement must satisfy."""
     num_layers = p2l.shape[0]
     num_logical = cfg["num_logical"]
     assert p2l.shape == (num_layers, cfg["num_physical"])
@@ -75,7 +68,7 @@ def _assert_placement_valid(p2l, logcnt, cfg):
 
 class TestHierarchicalPlacement:
     def test_dsv4_ep16_two_nodes(self):
-        p2l, l2p, logcnt, _p2l_unique = _run(DSV4)
+        p2l, l2p, logcnt = _run(DSV4)
         _assert_placement_valid(p2l, logcnt, DSV4)
         assert l2p.shape[:2] == (2, DSV4["num_logical"])
 
@@ -86,7 +79,7 @@ class TestHierarchicalPlacement:
         intra-node XGMI traffic into RDMA traffic for every token hitting it.
         """
         cfg = DSV4
-        p2l, _, _, _ = _run(cfg)
+        p2l, _, _ = _run(cfg)
         group_size = cfg["num_logical"] // cfg["num_groups"]
         phy_per_node = cfg["num_physical"] // cfg["num_nodes"]
 
@@ -102,7 +95,7 @@ class TestHierarchicalPlacement:
 
     def test_each_node_owns_its_share_of_slots(self):
         cfg = DSV4
-        p2l, _, _, _ = _run(cfg)
+        p2l, _, _ = _run(cfg)
         phy_per_node = cfg["num_physical"] // cfg["num_nodes"]
         for layer in range(p2l.shape[0]):
             for n in range(cfg["num_nodes"]):
@@ -117,7 +110,7 @@ class TestHierarchicalPlacement:
         """
         cfg = DSV4
         w = _weights(2, cfg["num_logical"], skew=48)  # one whole group is hot
-        p2l, _, logcnt, _ = _run(cfg, weight=w)
+        p2l, _, logcnt = _run(cfg, weight=w)
         _assert_placement_valid(p2l, logcnt, cfg)
 
     def test_hot_experts_get_more_replicas(self):
@@ -133,8 +126,8 @@ class TestHierarchicalVsFlat:
     def test_flat_and_hierarchical_both_valid(self):
         """Same inputs, both branches; only the placement should differ."""
         w = _weights(2, DSV4["num_logical"])
-        flat_p2l, _, flat_cnt, _ = _run(DSV4, weight=w, hierarchical=False)
-        hier_p2l, _, hier_cnt, _ = _run(DSV4, weight=w, hierarchical=True)
+        flat_p2l, _, flat_cnt = _run(DSV4, weight=w, hierarchical=False)
+        hier_p2l, _, hier_cnt = _run(DSV4, weight=w, hierarchical=True)
         _assert_placement_valid(flat_p2l, flat_cnt, DSV4)
         _assert_placement_valid(hier_p2l, hier_cnt, DSV4)
 
@@ -148,7 +141,7 @@ class TestHierarchicalVsFlat:
         """
         cfg = DSV4
         w = _weights(2, cfg["num_logical"])
-        p2l, _, _, _ = _run(cfg, weight=w, hierarchical=False)
+        p2l, _, _ = _run(cfg, weight=w, hierarchical=False)
         group_size = cfg["num_logical"] // cfg["num_groups"]
         phy_per_node = cfg["num_physical"] // cfg["num_nodes"]
         split = sum(
@@ -171,7 +164,7 @@ class TestHierarchicalVsFlat:
         a = _run(cfg, weight=w, hierarchical=True)
         b = _run(cfg, weight=w, hierarchical=False)
         assert torch.equal(a[0], b[0]), "nnodes=1 must take the flat branch"
-        assert torch.equal(a[3], b[3]), "p2l_unique must match too"
+        assert torch.equal(a[1], b[1]), "logical_to_physical must match too"
 
 
 class TestHierarchicalConstraints:
@@ -192,5 +185,5 @@ class TestHierarchicalConstraints:
     @pytest.mark.parametrize("num_nodes, num_gpus", [(2, 16), (4, 16), (8, 16)])
     def test_scales_to_more_nodes(self, num_nodes, num_gpus):
         cfg = dict(DSV4, num_nodes=num_nodes, num_gpus=num_gpus)
-        p2l, _, logcnt, _ = _run(cfg, num_layers=1)
+        p2l, _, logcnt = _run(cfg, num_layers=1)
         _assert_placement_valid(p2l, logcnt, cfg)
