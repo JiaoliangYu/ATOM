@@ -145,8 +145,23 @@ def _build_logical_to_physical_map(
     physical_to_logical: torch.Tensor,
     physical_rank: torch.Tensor,
     logcnt: torch.Tensor,
+    *,
+    old_p2l: torch.Tensor | None = None,
+    num_gpus: int | None = None,
 ) -> torch.Tensor:
-    """Build padded logical_to_physical map from p2l + rank + logcnt."""
+    """Build the padded logical_to_physical map from p2l + rank + logcnt.
+
+    With `old_p2l`, the placement is first settled in place against it (see
+    `_keep_slots_stable`) and l2p is derived from the settled maps, so the two
+    cannot drift apart.
+    """
+    if old_p2l is not None:
+        assert num_gpus is not None, "num_gpus is required to keep slots stable"
+        settled, settled_rank = _keep_slots_stable(
+            physical_to_logical, physical_rank, old_p2l, num_gpus
+        )
+        physical_to_logical.copy_(settled)
+        physical_rank.copy_(settled_rank)
     num_layers, num_physical = physical_to_logical.shape
     assert (
         physical_rank.shape == physical_to_logical.shape
@@ -196,15 +211,14 @@ def _keep_slots_stable(
     """Permute each rank's slots so an expert that stays on the rank keeps its
     old slot.
 
-    Slot order WITHIN a rank is free -- balancedness is a per-rank aggregate --
-    so this is a pure relabelling of an already-decided placement. It turns
-    "expert moved to another slot on the same rank" into "expert did not move",
-    which the migration planner then skips instead of copying. Cross-rank moves
-    are untouched; only local copies disappear.
+    Slot order within a rank is free -- balancedness is a per-rank aggregate --
+    so this only relabels an already-decided placement, turning "moved to another
+    slot on the same rank" into "did not move", which the migration planner skips
+    instead of copying. Cross-rank moves are untouched.
 
-    Mirrors vllm's `preserve_intragpu_slots`: walk the old slots in order and
-    give each one back its expert when the new placement still puts it on this
-    rank, then let the arrivals take what is left.
+    Ties break on the lowest index throughout: every rank runs this on its own
+    and their migration plans must pair up, so the permutation has to be a
+    function of the maps alone.
     """
     if old_p2l is None or old_p2l.shape != p2l.shape:
         return p2l, phyrank
@@ -212,39 +226,49 @@ def _keep_slots_stable(
     assert num_physical % num_gpus == 0
     n = num_physical // num_gpus
     device = p2l.device
+    num_logical = int(max(int(p2l.max()), int(old_p2l.max()))) + 1
+    shape = (num_layers, num_gpus, n)
 
-    old_l = old_p2l.view(num_layers, num_gpus, n)
-    new_l = p2l.view(num_layers, num_gpus, n)
-    rank_l = phyrank.view(num_layers, num_gpus, n)
+    old_l = old_p2l.view(shape).to(torch.int64)
+    new_l = p2l.view(shape).to(torch.int64)
+    rank_l = phyrank.view(shape)
+    ar = torch.arange(n, device=device).expand(shape)
+    absent = torch.full(shape, n, dtype=torch.int64, device=device)
 
-    # src[slot] = which of the new placement's local entries lands on that slot.
-    src = torch.full((num_layers, num_gpus, n), -1, dtype=torch.int64, device=device)
-    taken = torch.zeros((num_layers, num_gpus, n), dtype=torch.bool, device=device)
-    for slot in range(n):
-        # Hand this slot back the expert it already holds, if the new placement
-        # still wants that expert on this rank and it is not spoken for. argmax
-        # returns the first hit, so every rank derives the same permutation from
-        # the same maps -- they must, or their migration plans would not pair up.
-        want = old_l[:, :, slot : slot + 1]
-        match = (new_l == want) & ~taken
-        hit = match.any(-1)
-        first = match.to(torch.int8).argmax(-1)
-        src[:, :, slot] = torch.where(hit, first, torch.full_like(first, -1))
-        claim = torch.zeros_like(taken)
-        claim.scatter_(2, first.unsqueeze(-1), hit.unsqueeze(-1))
-        taken |= claim
+    # Old slot each expert held on this rank; n means "was not here".
+    pos = torch.full(
+        (num_layers, num_gpus, num_logical), n, dtype=torch.int64, device=device
+    )
+    pos.scatter_reduce_(2, old_l, ar, reduce="amin", include_self=True)
+    want = pos.gather(2, new_l)
 
-    # Whatever is left over -- experts arriving from another rank -- fills the
-    # slots nobody reclaimed, in order. Both sides have the same count, so
-    # pairing them position by position is a permutation by construction.
-    free_slots = torch.argsort((src >= 0).to(torch.int8), dim=2, stable=True)
-    free_entries = torch.argsort(taken.to(torch.int8), dim=2, stable=True)
-    filler = torch.empty_like(src)
-    filler.scatter_(2, free_slots, free_entries)
-    src = torch.where(src >= 0, src, filler)
+    # An expert can hold two slots on a rank, so several entries may want the
+    # same one; the lowest-indexed entry claims it.
+    winner = torch.full(
+        (num_layers, num_gpus, n + 1), n, dtype=torch.int64, device=device
+    )
+    winner.scatter_reduce_(2, want, ar, reduce="amin", include_self=True)
+    keep = (want < n) & (winner.gather(2, want) == ar)
+    claim = torch.where(keep, want, absent)
 
+    # src[slot] = the entry that reclaimed it, -1 where nobody did.
+    reclaimed = torch.full(
+        (num_layers, num_gpus, n + 1), -1, dtype=torch.int64, device=device
+    )
+    reclaimed.scatter_(2, claim, ar)
+    reclaimed = reclaimed[:, :, :n]
+
+    # Experts arriving from another rank fill what is left. Unclaimed slots and
+    # unkept entries come out in index order and are equal in number, so pairing
+    # them position by position is a permutation by construction.
+    free_slots = torch.argsort((reclaimed >= 0).to(torch.int8), dim=2, stable=True)
+    free_entries = torch.argsort(keep.to(torch.int8), dim=2, stable=True)
+    arrivals = torch.empty_like(want)
+    arrivals.scatter_(2, free_slots, free_entries)
+
+    src = torch.where(reclaimed >= 0, reclaimed, arrivals)
     return (
-        new_l.gather(2, src).view(num_layers, num_physical),
+        new_l.gather(2, src).view(num_layers, num_physical).to(p2l.dtype),
         rank_l.gather(2, src).view(num_layers, num_physical),
     )
 
@@ -518,9 +542,13 @@ def rebalance_experts(
             p2l[layer] = p2l_l
             phyrank[layer] = rank_l
             logcnt[layer] = cnt_l
-        if sticky_slots:
-            p2l, phyrank = _keep_slots_stable(p2l, phyrank, old_p2l, num_gpus)
-        l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+        l2p = _build_logical_to_physical_map(
+            p2l,
+            phyrank,
+            logcnt,
+            old_p2l=old_p2l if sticky_slots else None,
+            num_gpus=num_gpus,
+        )
         return p2l, l2p, logcnt
 
     # Hierarchical path: group->node assignment, then node-local rebalance.
@@ -587,9 +615,13 @@ def rebalance_experts(
         phyrank[layer] = phyrank_l
         logcnt[layer] = cnt_l
 
-    if sticky_slots:
-        p2l, phyrank = _keep_slots_stable(p2l, phyrank, old_p2l, num_gpus)
-    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+    l2p = _build_logical_to_physical_map(
+        p2l,
+        phyrank,
+        logcnt,
+        old_p2l=old_p2l if sticky_slots else None,
+        num_gpus=num_gpus,
+    )
     return p2l, l2p, logcnt
 
 
