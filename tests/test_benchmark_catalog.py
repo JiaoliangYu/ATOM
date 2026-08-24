@@ -239,10 +239,24 @@ def test_build_cell_configs_matrix_under_github_limit():
 
 
 def test_build_cell_configs_one_config_per_server_key():
-    """Each config is a unique (variant, scenario) server-launch key."""
+    """Each config is a unique (variant, scenario) server-launch key.
+
+    Client-side sizing is part of the scenario: two scenarios may share a
+    server config and differ only in num_prompts/num_warmups (a heavy
+    concurrency band capped so it fits the benchmark step timeout). Those are
+    distinct configs by design, so the key includes them.
+    """
     configs = catalog.build_cell_configs(CATALOG)
     keys = [
-        (c["model_path"], c["server_args"], c["env_vars"], c["isl"], c["osl"])
+        (
+            c["model_path"],
+            c["server_args"],
+            c["env_vars"],
+            c["isl"],
+            c["osl"],
+            c["num_prompts"],
+            c["num_warmups"],
+        )
         for c in configs
     ]
     assert len(keys) == len(set(keys))

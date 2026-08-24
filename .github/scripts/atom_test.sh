@@ -439,7 +439,7 @@ if [ "$TYPE" == "benchmark" ]; then
     --max-concurrency="$CONC"
     --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 10 ))}"
     --trust-remote-code
-    --num-warmups="$(( CONC * 2 ))"
+    --num-warmups="${NUM_WARMUPS_OVERRIDE:-$(( CONC * 2 ))}"
     --request-rate=inf --ignore-eos
     --save-result --percentile-metrics="ttft,tpot,itl,e2el"
     --result-dir=. --result-filename="${RESULT_FILENAME}.json"
