@@ -202,8 +202,9 @@ def _keep_slots_stable(
     which the migration planner then skips instead of copying. Cross-rank moves
     are untouched; only local copies disappear.
 
-    Experts holding several slots on one rank are matched once, so the number of
-    fixed points can fall a hair short of the theoretical maximum.
+    Mirrors vllm's `preserve_intragpu_slots`: walk the old slots in order and
+    give each one back its expert when the new placement still puts it on this
+    rank, then let the arrivals take what is left.
     """
     if old_p2l is None or old_p2l.shape != p2l.shape:
         return p2l, phyrank
@@ -211,53 +212,40 @@ def _keep_slots_stable(
     assert num_physical % num_gpus == 0
     n = num_physical // num_gpus
     device = p2l.device
-    num_logical = int(max(int(p2l.max()), int(old_p2l.max()))) + 1
 
-    old_l = old_p2l.view(num_layers, num_gpus, n).to(torch.int64)
-    new_l = p2l.view(num_layers, num_gpus, n).to(torch.int64)
-    rank_l = phyrank.view(num_layers, num_gpus, n).to(torch.int64)
-    ar = torch.arange(n, device=device).view(1, 1, n).expand(num_layers, num_gpus, n)
+    old_l = old_p2l.view(num_layers, num_gpus, n)
+    new_l = p2l.view(num_layers, num_gpus, n)
+    rank_l = phyrank.view(num_layers, num_gpus, n)
 
-    # Old local slot of each logical expert (-1 when it was not on this rank).
-    pos = torch.full(
-        (num_layers, num_gpus, num_logical), -1, dtype=torch.int64, device=device
-    )
-    pos.scatter_(2, old_l, ar)
-    target = pos.gather(2, new_l)
-    on_rank = target >= 0
+    # src[slot] = which of the new placement's local entries lands on that slot.
+    src = torch.full((num_layers, num_gpus, n), -1, dtype=torch.int64, device=device)
+    taken = torch.zeros((num_layers, num_gpus, n), dtype=torch.bool, device=device)
+    for slot in range(n):
+        # Hand this slot back the expert it already holds, if the new placement
+        # still wants that expert on this rank and it is not spoken for. argmax
+        # returns the first hit, so every rank derives the same permutation from
+        # the same maps -- they must, or their migration plans would not pair up.
+        want = old_l[:, :, slot : slot + 1]
+        match = (new_l == want) & ~taken
+        hit = match.any(-1)
+        first = match.to(torch.int8).argmax(-1)
+        src[:, :, slot] = torch.where(hit, first, torch.full_like(first, -1))
+        claim = torch.zeros_like(taken)
+        claim.scatter_(2, first.unsqueeze(-1), hit.unsqueeze(-1))
+        taken |= claim
 
-    # Several new slots may want the same old slot; elect one winner. Entries
-    # that have no target go to a sentinel column so they cannot corrupt slot 0.
-    idx = torch.where(target >= 0, target, torch.full_like(target, n))
-    winner = torch.full(
-        (num_layers, num_gpus, n + 1), -1, dtype=torch.int64, device=device
-    )
-    winner.scatter_(2, idx, ar)
-    keep = on_rank & (winner.gather(2, idx) == ar)
+    # Whatever is left over -- experts arriving from another rank -- fills the
+    # slots nobody reclaimed, in order. Both sides have the same count, so
+    # pairing them position by position is a permutation by construction.
+    free_slots = torch.argsort((src >= 0).to(torch.int8), dim=2, stable=True)
+    free_entries = torch.argsort(taken.to(torch.int8), dim=2, stable=True)
+    filler = torch.empty_like(src)
+    filler.scatter_(2, free_slots, free_entries)
+    src = torch.where(src >= 0, src, filler)
 
-    used = torch.zeros((num_layers, num_gpus, n + 1), dtype=torch.bool, device=device)
-    used.scatter_(2, torch.where(keep, target, torch.full_like(target, n)), True)
-    used = used[:, :, :n]
-
-    # Remaining slots take the free old slots in order.
-    free_rank = torch.cumsum((~used).to(torch.int64), dim=2) - 1
-    inv = torch.zeros((num_layers, num_gpus, n + 1), dtype=torch.int64, device=device)
-    inv.scatter_(
-        2,
-        torch.where(~used, free_rank, torch.full_like(free_rank, n)),
-        torch.where(~used, ar.to(torch.int64), torch.zeros_like(free_rank)),
-    )
-    inv = inv[:, :, :n]
-    unkept_rank = torch.cumsum((~keep).to(torch.int64), dim=2) - 1
-    dest = torch.where(keep, target, inv.gather(2, unkept_rank.clamp_min(0)))
-
-    out_p2l = torch.empty_like(new_l)
-    out_rank = torch.empty_like(rank_l)
-    out_p2l.scatter_(2, dest, new_l)
-    out_rank.scatter_(2, dest, rank_l)
     return (
-        out_p2l.view(num_layers, num_physical).to(p2l.dtype),
-        out_rank.view(num_layers, num_physical).to(phyrank.dtype),
+        new_l.gather(2, src).view(num_layers, num_physical),
+        rank_l.gather(2, src).view(num_layers, num_physical),
     )
 
 
@@ -501,6 +489,12 @@ def rebalance_experts(
     assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
     assert num_physical >= num_logical
 
+    # Only naive leaves the within-rank slot free. `biased` pins the hot experts
+    # to the front of each GPU's block in expert-id order precisely so repeated
+    # rebalances reproduce the same placement, and reuses the live map verbatim
+    # when the hot set holds; permuting its slots would fight that design.
+    sticky_slots = policy is None or policy is _placement_naive
+
     p2l = torch.empty(
         (num_layers, num_physical), dtype=torch.int32, device=weight.device
     )
@@ -524,7 +518,8 @@ def rebalance_experts(
             p2l[layer] = p2l_l
             phyrank[layer] = rank_l
             logcnt[layer] = cnt_l
-        p2l, phyrank = _keep_slots_stable(p2l, phyrank, old_p2l, num_gpus)
+        if sticky_slots:
+            p2l, phyrank = _keep_slots_stable(p2l, phyrank, old_p2l, num_gpus)
         l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
         return p2l, l2p, logcnt
 
@@ -592,7 +587,8 @@ def rebalance_experts(
         phyrank[layer] = phyrank_l
         logcnt[layer] = cnt_l
 
-    p2l, phyrank = _keep_slots_stable(p2l, phyrank, old_p2l, num_gpus)
+    if sticky_slots:
+        p2l, phyrank = _keep_slots_stable(p2l, phyrank, old_p2l, num_gpus)
     l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
     return p2l, l2p, logcnt
 

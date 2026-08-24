@@ -16,7 +16,11 @@ from collections import Counter
 
 import torch
 
-from atom.model_ops.eplb import _keep_slots_stable, rebalance_experts
+from atom.model_ops.eplb import (
+    _keep_slots_stable,
+    _placement_biased,
+    rebalance_experts,
+)
 
 
 def _ref(p2l, phyrank, old_p2l, num_gpus):
@@ -133,15 +137,23 @@ class TestKeepSlotsStable:
         after = int((old == out).sum())
         bound = _upper_bound(old, new, 8)
         assert after > before, f"no slots saved ({before} -> {after})"
-        # An expert holding several slots on one rank is matched once, so the
-        # last few fixed points can be out of reach.
-        assert after >= bound * 0.99, f"{after} far below reachable {bound}"
+        assert after == bound, f"{after} short of the reachable {bound}"
 
-    def test_matches_the_reference_within_tolerance(self):
+    def test_matches_the_reference(self):
         old, new, phyrank = _two_placements()
         out, _ = _keep_slots_stable(new, phyrank, old, 8)
         ref, _ = _ref(new, phyrank, old, 8)
-        assert int((old == out).sum()) >= int((old == ref).sum()) * 0.99
+        assert int((old == out).sum()) == int((old == ref).sum())
+
+    def test_is_deterministic(self):
+        """Every rank runs this independently and their migration plans have to
+        pair up, so the same maps must always give the same permutation."""
+        old, new, phyrank = _two_placements()
+        first, first_rank = _keep_slots_stable(new, phyrank, old, 8)
+        for _ in range(20):
+            again, again_rank = _keep_slots_stable(new, phyrank, old, 8)
+            assert torch.equal(again, first)
+            assert torch.equal(again_rank, first_rank)
 
     def test_identical_placement_is_a_noop(self):
         _, new, phyrank = _two_placements()
@@ -193,3 +205,53 @@ class TestRebalanceExpertsUsesIt:
             return int((old == p2l).sum())
 
         assert run(old) > run(None)
+
+    def test_only_naive_gets_sticky_slots(self, monkeypatch):
+        """`biased` pins hot experts to the front of each GPU block on purpose,
+        in expert-id order, so repeated rebalances reproduce the same placement
+        and its fast path can reuse the live map verbatim. Permuting its slots
+        would fight that, so the pass must run for naive only.
+
+        Asserted on the call itself: comparing placements cannot tell the two
+        apart, because `_placement_biased` reads `old_p2l` for its own fast path.
+        """
+        from atom.model_ops import eplb
+
+        calls = []
+        real = eplb._keep_slots_stable
+
+        def spy(*args, **kwargs):
+            calls.append(True)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(eplb, "_keep_slots_stable", spy)
+
+        num_logical, num_physical, num_gpus, num_layers = 64, 72, 8, 4
+        g = torch.Generator().manual_seed(2)
+        weight = torch.rand((num_layers, num_logical), generator=g) + 0.1
+        old, _, _ = rebalance_experts(
+            weight,
+            num_physical=num_physical,
+            num_groups=1,
+            num_nodes=1,
+            num_gpus=num_gpus,
+            enable_hierarchical=False,
+        )
+
+        def run(policy):
+            rebalance_experts(
+                weight * 1.1,
+                num_physical=num_physical,
+                num_groups=1,
+                num_nodes=1,
+                num_gpus=num_gpus,
+                enable_hierarchical=False,
+                policy=policy,
+                old_p2l=old,
+            )
+
+        calls.clear()  # building `old` above already went through naive
+        run(_placement_biased)
+        assert not calls, "slot stability must not touch biased placement"
+        run(None)
+        assert calls, "naive placement must get slot stability"
