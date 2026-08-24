@@ -18,6 +18,10 @@ on:
         description: "Benchmark DeepSeek-V4-Pro EPLB r64 biased: standard vs MegaMoE"
         type: boolean
         default: true
+      deepseek-v4-pro-tp-tbo:
+        description: "Benchmark DeepSeek-V4-Pro TP+TBO (no EP, no DP-attention)"
+        type: boolean
+        default: true
       glm-5-2-fp8:
         description: "Benchmark GLM-5.2-FP8"
         type: boolean
