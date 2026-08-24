@@ -35,6 +35,12 @@ class EngineUtilityHandler:
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",
+        "begin_buffered_weight_update": "_handle_begin_buffered_weight_update",
+        "prepare_ipc_weight_buffer": "_handle_prepare_ipc_weight_buffer",
+        "apply_weight_bucket_from_ipc": "_handle_apply_weight_bucket_from_ipc",
+        "apply_weight_bucket_from_shm": "_handle_apply_weight_bucket_from_shm",
+        "commit_buffered_weight_update": "_handle_commit_buffered_weight_update",
+        "abort_buffered_weight_update": "_handle_abort_buffered_weight_update",
         "release_memory": "_handle_release_memory",
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
@@ -80,6 +86,7 @@ class EngineUtilityHandler:
                     "resume_memory",
                     "update_weights_shm",
                     "update_weights_ipc",
+                    "commit_buffered_weight_update",
                 ):
                     tags = args.get("tags", []) if isinstance(args, dict) else []
                     if cmd == "resume_memory" and "weights" in tags:
@@ -96,6 +103,12 @@ class EngineUtilityHandler:
                             logger.info(
                                 f"{self.label}: engine exited sleep mode (weights updated)"
                             )
+                    elif cmd == "commit_buffered_weight_update":
+                        engine._is_rl_weights_offloaded = False
+                        logger.info(
+                            f"{self.label}: engine exited sleep mode "
+                            "(weight update committed)"
+                        )
             except queue.Empty:
                 engine._has_pending_utility = False
                 break
@@ -206,6 +219,74 @@ class EngineUtilityHandler:
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "update_weights_ipc", "result": result})
         )
+
+    def _weight_update_response(self, cmd: str, result) -> None:
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": cmd, "result": result})
+        )
+
+    def _handle_begin_buffered_weight_update(self, args: dict):
+        update_id = args["update_id"]
+        transport = args["transport"]
+        result = self.runner_mgr.call_func(
+            "begin_buffered_weight_update",
+            update_id,
+            transport,
+            wait_out=True,
+        )
+        self._weight_update_response("begin_buffered_weight_update", result)
+
+    def _handle_prepare_ipc_weight_buffer(self, args: dict):
+        result = self.runner_mgr.call_func(
+            "prepare_ipc_weight_buffer",
+            args["update_id"],
+            args["generation"],
+            args["capacity"],
+            args.get("ipc_handle"),
+            args.get("ipc_handles"),
+            wait_out=True,
+        )
+        self._weight_update_response("prepare_ipc_weight_buffer", result)
+
+    def _handle_apply_weight_bucket_from_ipc(self, args: dict):
+        result = self.runner_mgr.call_func(
+            "apply_weight_bucket_from_ipc",
+            args["update_id"],
+            args["generation"],
+            args.get("bucket_meta", {}),
+            args.get("payload_bytes", 0),
+            wait_out=True,
+        )
+        self._weight_update_response("apply_weight_bucket_from_ipc", result)
+
+    def _handle_apply_weight_bucket_from_shm(self, args: dict):
+        result = self.runner_mgr.call_func(
+            "apply_weight_bucket_from_shm",
+            args["update_id"],
+            args["shm_name"],
+            args.get("bucket_meta", {}),
+            args.get("payload_bytes", 0),
+            wait_out=True,
+        )
+        self._weight_update_response("apply_weight_bucket_from_shm", result)
+
+    def _handle_commit_buffered_weight_update(self, args: dict):
+        result = self.runner_mgr.call_func(
+            "commit_buffered_weight_update",
+            args["update_id"],
+            args.get("verify_full_load", False),
+            wait_out=True,
+        )
+        self._weight_update_response("commit_buffered_weight_update", result)
+
+    def _handle_abort_buffered_weight_update(self, args: dict):
+        result = self.runner_mgr.call_func(
+            "abort_buffered_weight_update",
+            args["update_id"],
+            args.get("error", "sender aborted weight update"),
+            wait_out=True,
+        )
+        self._weight_update_response("abort_buffered_weight_update", result)
 
     def _handle_release_memory(self, args: dict):
         """Handle memory release command (sleep mode)."""

@@ -4,7 +4,11 @@
 import logging
 
 from atom.model_engine.llm_engine import LLMEngine
-from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
+from atom.rollout.weight_sync import (
+    IPCWeightBufferPool,
+    load_weights_via_ipc,
+    load_weights_via_shm,
+)
 
 logger = logging.getLogger("atom")
 
@@ -30,6 +34,7 @@ class AsyncLLMEngine(LLMEngine):
             "atom.rollout.model_runner_ext.RLHFModelRunner",
         )
         super().__init__(model, **kwargs)
+        self._ipc_weight_buffer_pool = IPCWeightBufferPool()
 
     def collective_rpc(
         self,
@@ -109,7 +114,11 @@ class AsyncLLMEngine(LLMEngine):
             mode = "ipc" if torch.cuda.is_available() else "shm"
         if mode == "ipc":
             load_weights_via_ipc(
-                self.core_mgr, weights, bucket_size_mb, num_gpus=num_gpus
+                self.core_mgr,
+                weights,
+                bucket_size_mb,
+                num_gpus=num_gpus,
+                buffer_pool=self._ipc_weight_buffer_pool,
             )
         else:
             load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)

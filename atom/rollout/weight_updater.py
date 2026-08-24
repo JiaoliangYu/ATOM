@@ -27,7 +27,9 @@ class WeightBucketResult:
 class WeightUpdateTransaction:
     """Cross-bucket state for one atomic-at-the-serving-boundary reload."""
 
-    version: int
+    version: int | None
+    update_id: str | None = None
+    transport: str = "rdma"
     buckets: int = 0
     payload_bytes: int = 0
     received_names: set[str] = field(default_factory=set)
@@ -523,26 +525,74 @@ class WeightUpdaterMixin:
 
         return result
 
-    def begin_weight_update(self, version: int) -> dict:
-        """Begin a versioned, cross-bucket weight update transaction."""
-        version = int(version)
+    @staticmethod
+    def _weight_update_label(transaction: WeightUpdateTransaction) -> str:
+        if transaction.version is not None:
+            return f"version={transaction.version}"
+        return f"update_id={transaction.update_id}, transport={transaction.transport}"
+
+    def _begin_weight_update_transaction(
+        self,
+        *,
+        version: int | None,
+        update_id: str | None,
+        transport: str,
+    ) -> WeightUpdateTransaction:
         active = getattr(self, "_weight_update_transaction", None)
         if active is not None:
             raise RuntimeError(
-                f"weight update version {active.version} is already in progress"
+                "weight update "
+                f"{self._weight_update_label(active)} is already in progress"
             )
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        transaction = WeightUpdateTransaction(
+            version=version,
+            update_id=update_id,
+            transport=transport,
+        )
+        self._weight_update_transaction = transaction
+        return transaction
+
+    def begin_weight_update(self, version: int) -> dict:
+        """Begin a numeric, versioned RDMA weight update transaction."""
+        version = int(version)
         last_version = getattr(self, "_last_started_weight_version", None)
         if last_version is not None and version <= last_version:
             raise RuntimeError(
                 f"weight update version must increase: "
                 f"last_started={last_version}, got={version}"
             )
-        if hasattr(self, "_packed_weight_accum"):
-            self._packed_weight_accum.clear()
-        self._weight_update_transaction = WeightUpdateTransaction(version=version)
+        self._begin_weight_update_transaction(
+            version=version, update_id=None, transport="rdma"
+        )
         self._last_started_weight_version = version
         logger.info(f"{self.label}: began weight update version={version}")
         return {"version": version, "state": "receiving"}
+
+    def begin_buffered_weight_update(self, update_id: str, transport: str) -> dict:
+        """Begin an IPC/SHM update without consuming the RDMA version space."""
+        update_id = str(update_id)
+        transport = str(transport)
+        if not update_id:
+            raise ValueError("buffered weight update_id must not be empty")
+        if transport not in ("ipc", "shm"):
+            raise ValueError(f"unsupported buffered weight transport: {transport}")
+        if update_id == getattr(self, "_last_started_buffered_update_id", None):
+            raise RuntimeError(f"buffered weight update_id was already used: {update_id}")
+        self._begin_weight_update_transaction(
+            version=None, update_id=update_id, transport=transport
+        )
+        self._last_started_buffered_update_id = update_id
+        logger.info(
+            f"{self.label}: began buffered weight update "
+            f"update_id={update_id}, transport={transport}"
+        )
+        return {
+            "update_id": update_id,
+            "transport": transport,
+            "state": "receiving",
+        }
 
     def apply_weight_bucket(
         self,
@@ -556,7 +606,7 @@ class WeightUpdaterMixin:
         try:
             bucket = self._apply_named_tensors(named_tensors)
         except Exception as exc:
-            self.abort_weight_update(transaction.version, exc)
+            self._abort_active_weight_update(exc)
             raise
         transaction.buckets += 1
         transaction.payload_bytes += int(payload_bytes)
@@ -569,6 +619,8 @@ class WeightUpdaterMixin:
         transaction.packed_expected.update(bucket.packed_expected)
         return {
             "version": transaction.version,
+            "update_id": transaction.update_id,
+            "transport": transaction.transport,
             "bucket": transaction.buckets,
             "updated": bucket.updated,
             "received": len(bucket.received_names),
@@ -577,19 +629,12 @@ class WeightUpdaterMixin:
             "ignored_scales": sorted(bucket.ignored_scale_names),
         }
 
-    def commit_weight_update(self, version: int, verify_full_load: bool = True) -> dict:
-        """Finalize a reload once, making the new version eligible for serving."""
-        version = int(version)
-        transaction = getattr(self, "_weight_update_transaction", None)
-        if transaction is None:
-            raise RuntimeError("no weight update transaction is in progress")
-        if transaction.version != version:
-            error = RuntimeError(
-                f"weight update version mismatch: active={transaction.version}, got={version}"
-            )
-            self.abort_weight_update(transaction.version, error)
-            raise error
-
+    def _commit_active_weight_update(
+        self,
+        transaction: WeightUpdateTransaction,
+        *,
+        verify_full_load: bool,
+    ) -> dict:
         try:
             incomplete_shards = {
                 name: sorted(
@@ -603,7 +648,7 @@ class WeightUpdaterMixin:
             }
             if incomplete_shards:
                 raise RuntimeError(
-                    "incomplete packed shards after RDMA reload: "
+                    "incomplete packed shards after weight reload: "
                     f"{incomplete_shards}"
                 )
             incomplete_packed = sorted(
@@ -611,15 +656,20 @@ class WeightUpdaterMixin:
             )
             if incomplete_packed:
                 raise RuntimeError(
-                    "incomplete packed parameters after RDMA reload: "
+                    "incomplete packed parameters after weight reload: "
                     f"{incomplete_packed[:20]}"
                 )
 
             expected_names = {name for name, _ in self.model.named_parameters()}
             missing = sorted(expected_names - transaction.loaded_internal)
             if verify_full_load and (missing or transaction.skipped_names):
+                reload_kind = (
+                    "RDMA"
+                    if transaction.transport == "rdma"
+                    else transaction.transport.upper()
+                )
                 raise RuntimeError(
-                    "incomplete ATOM RDMA weight reload: "
+                    f"incomplete ATOM {reload_kind} weight reload: "
                     f"loaded {len(transaction.loaded_internal)}/{len(expected_names)} "
                     f"internal parameters from {len(transaction.received_names)} HF tensors; "
                     f"missing={missing[:20]}, "
@@ -629,11 +679,13 @@ class WeightUpdaterMixin:
             self.clear_kv_cache()
             self._invalidate_cudagraphs_after_weight_update()
         except Exception as exc:
-            self.abort_weight_update(version, exc)
+            self._abort_active_weight_update(exc)
             raise
 
         manifest = {
-            "version": version,
+            "version": transaction.version,
+            "update_id": transaction.update_id,
+            "transport": transaction.transport,
             "buckets": transaction.buckets,
             "bytes": transaction.payload_bytes,
             "received": len(transaction.received_names),
@@ -647,41 +699,119 @@ class WeightUpdaterMixin:
             },
             "missing": missing,
         }
-        self._last_committed_weight_version = version
         self._weight_update_healthy = True
+        self._weight_update_failure = None
         self._weight_update_transaction = None
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
         logger.info(
-            f"{self.label}: committed weight update version={version}, "
+            f"{self.label}: committed weight update "
+            f"{self._weight_update_label(transaction)}, "
             f"buckets={manifest['buckets']}, loaded={manifest['loaded_internal']}"
         )
         return manifest
 
-    def abort_weight_update(self, version: int, error) -> dict:
-        """Discard transaction state and fence serving after a partial write."""
+    def commit_weight_update(self, version: int, verify_full_load: bool = True) -> dict:
+        """Finalize a numeric RDMA reload."""
+        version = int(version)
+        transaction = getattr(self, "_weight_update_transaction", None)
+        if transaction is None:
+            raise RuntimeError("no weight update transaction is in progress")
+        if transaction.version != version or transaction.transport != "rdma":
+            error = RuntimeError(
+                "weight update version mismatch: "
+                f"active={self._weight_update_label(transaction)}, got={version}"
+            )
+            self._abort_active_weight_update(error)
+            raise error
+        manifest = self._commit_active_weight_update(
+            transaction, verify_full_load=verify_full_load
+        )
+        self._last_committed_weight_version = version
+        return manifest
+
+    def commit_buffered_weight_update(
+        self, update_id: str, verify_full_load: bool = False
+    ) -> dict:
+        """Finalize an IPC/SHM reload and release any receiver mapping."""
+        transaction = self._require_buffered_weight_update(update_id)
+        transport = transaction.transport
+        manifest = self._commit_active_weight_update(
+            transaction, verify_full_load=verify_full_load
+        )
+        if transport == "ipc":
+            self._release_ipc_weight_buffer()
+        return manifest
+
+    def _abort_active_weight_update(self, error) -> dict:
         active = getattr(self, "_weight_update_transaction", None)
-        active_version = active.version if active is not None else int(version)
+        version = active.version if active is not None else None
+        update_id = active.update_id if active is not None else None
+        transport = active.transport if active is not None else None
         self._weight_update_transaction = None
         self._weight_update_healthy = False
         self._weight_update_failure = str(error)
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
-        logger.error(
-            f"{self.label}: aborted weight update version={active_version}: {error}"
+        if transport == "ipc":
+            self._release_ipc_weight_buffer()
+        label = (
+            self._weight_update_label(active)
+            if active is not None
+            else "no active transaction"
         )
+        logger.error(f"{self.label}: aborted weight update {label}: {error}")
         return {
-            "version": active_version,
+            "version": version,
+            "update_id": update_id,
+            "transport": transport,
             "state": "aborted",
             "error": str(error),
         }
+
+    def abort_weight_update(self, version: int, error) -> dict:
+        """Discard transaction state and fence serving after a partial write."""
+        active = getattr(self, "_weight_update_transaction", None)
+        if active is not None and active.version not in (None, int(version)):
+            error = RuntimeError(
+                f"cannot abort version={version}; "
+                f"active={self._weight_update_label(active)}"
+            )
+        return self._abort_active_weight_update(error)
+
+    def abort_buffered_weight_update(self, update_id: str, error) -> dict:
+        active = getattr(self, "_weight_update_transaction", None)
+        if active is not None and active.update_id != str(update_id):
+            error = RuntimeError(
+                f"cannot abort update_id={update_id}; "
+                f"active={self._weight_update_label(active)}"
+            )
+        return self._abort_active_weight_update(error)
+
+    def _require_buffered_weight_update(
+        self, update_id: str, transport: str | None = None
+    ) -> WeightUpdateTransaction:
+        transaction = getattr(self, "_weight_update_transaction", None)
+        if transaction is None:
+            raise RuntimeError("no weight update transaction is in progress")
+        if transaction.version is not None or transaction.update_id != str(update_id):
+            raise RuntimeError(
+                f"buffered weight update mismatch: "
+                f"active={self._weight_update_label(transaction)}, got={update_id}"
+            )
+        if transport is not None and transaction.transport != transport:
+            raise RuntimeError(
+                f"buffered weight transport mismatch: "
+                f"active={transaction.transport}, got={transport}"
+            )
+        return transaction
 
     def assert_weight_update_ready(self) -> None:
         transaction = getattr(self, "_weight_update_transaction", None)
         if transaction is not None:
             raise RuntimeError(
                 "ATOM serving is fenced while weight update "
-                f"version={transaction.version} is in progress"
+                f"{self._weight_update_label(transaction)} is in progress"
             )
         if getattr(self, "_weight_update_healthy", True):
             return
@@ -696,6 +826,12 @@ class WeightUpdaterMixin:
         return {
             "healthy": getattr(self, "_weight_update_healthy", True),
             "active_version": transaction.version if transaction is not None else None,
+            "active_update_id": (
+                transaction.update_id if transaction is not None else None
+            ),
+            "active_transport": (
+                transaction.transport if transaction is not None else None
+            ),
             "last_committed_version": getattr(
                 self, "_last_committed_weight_version", None
             ),
@@ -869,6 +1005,163 @@ class WeightUpdaterMixin:
                 f"ignored_scales={ignored_scales}, is_last={is_last}"
             )
             return updated
+        finally:
+            shm.close()
+
+    @staticmethod
+    def _weight_bucket_views(buffer: torch.Tensor, bucket_meta: dict):
+        named_tensors = []
+        capacity = buffer.numel()
+        for name, meta in bucket_meta.items():
+            offset = int(meta["offset"])
+            nbytes = int(meta["nbytes"])
+            if offset < 0 or nbytes < 0 or offset + nbytes > capacity:
+                raise RuntimeError(
+                    f"weight bucket entry {name} is outside buffer capacity: "
+                    f"offset={offset}, nbytes={nbytes}, capacity={capacity}"
+                )
+            dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
+            tensor = (
+                buffer[offset : offset + nbytes]
+                .view(dtype=dtype)
+                .view(meta["shape"])
+            )
+            named_tensors.append((name, tensor))
+        return named_tensors
+
+    def _synchronize_weight_update_device(self) -> None:
+        if getattr(self, "device", None) is not None and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _release_ipc_weight_buffer(self) -> None:
+        if getattr(self, "_ipc_buffer", None) is None:
+            self._ipc_buffer_update_id = None
+            return
+        self._synchronize_weight_update_device()
+        self._ipc_buffer = None
+        self._ipc_buffer_update_id = None
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def prepare_ipc_weight_buffer(
+        self,
+        update_id: str,
+        generation: int,
+        capacity: int,
+        ipc_handle,
+        ipc_handles: Optional[dict] = None,
+    ) -> dict:
+        """Map one explicit sender generation, replacing stale mappings safely."""
+        self._require_buffered_weight_update(update_id, transport="ipc")
+        generation = int(generation)
+        capacity = int(capacity)
+        current_generation = getattr(self, "_ipc_buffer_generation", -1)
+        current_capacity = getattr(self, "_ipc_buffer_capacity", 0)
+        current_buffer = getattr(self, "_ipc_buffer", None)
+        if generation < current_generation:
+            raise RuntimeError(
+                f"stale IPC buffer generation: "
+                f"current={current_generation}, got={generation}"
+            )
+        if generation == current_generation and capacity != current_capacity:
+            raise RuntimeError(
+                f"IPC capacity changed without a new generation: "
+                f"current={current_capacity}, got={capacity}"
+            )
+        if generation == current_generation and current_buffer is not None:
+            self._ipc_buffer_update_id = str(update_id)
+            return {
+                "update_id": str(update_id),
+                "generation": generation,
+                "capacity": capacity,
+                "reused": True,
+            }
+
+        self._release_ipc_weight_buffer()
+        from atom.rollout.weight_sync import rebuild_ipc_handle
+
+        parallel_config = getattr(getattr(self, "config", None), "parallel_config", None)
+        dp_rank_local = getattr(parallel_config, "data_parallel_rank_local", 0) or 0
+        global_device_idx = dp_rank_local * self.world_size + self.rank
+        local_device_idx = getattr(self.device, "index", None)
+        if ipc_handles is not None and global_device_idx in ipc_handles:
+            buffer = rebuild_ipc_handle(
+                ipc_handles[global_device_idx], device_id=local_device_idx
+            )
+        else:
+            buffer = rebuild_ipc_handle(ipc_handle, device_id=local_device_idx)
+        if buffer.numel() < capacity:
+            raise RuntimeError(
+                f"mapped IPC buffer is too small: "
+                f"mapped={buffer.numel()}, advertised={capacity}"
+            )
+        self._ipc_buffer = buffer
+        self._ipc_buffer_generation = generation
+        self._ipc_buffer_capacity = capacity
+        self._ipc_buffer_update_id = str(update_id)
+        return {
+            "update_id": str(update_id),
+            "generation": generation,
+            "capacity": capacity,
+            "reused": False,
+        }
+
+    def apply_weight_bucket_from_ipc(
+        self,
+        update_id: str,
+        generation: int,
+        bucket_meta: dict,
+        payload_bytes: int = 0,
+    ) -> dict:
+        """Apply IPC views and synchronize before acknowledging sender reuse."""
+        self._require_buffered_weight_update(update_id, transport="ipc")
+        generation = int(generation)
+        if getattr(self, "_ipc_buffer", None) is None:
+            raise RuntimeError("IPC weight buffer has not been prepared")
+        if self._ipc_buffer_update_id != str(update_id):
+            raise RuntimeError(
+                f"IPC buffer belongs to update_id={self._ipc_buffer_update_id}, "
+                f"got={update_id}"
+            )
+        if generation != self._ipc_buffer_generation:
+            raise RuntimeError(
+                f"IPC generation mismatch: "
+                f"prepared={self._ipc_buffer_generation}, got={generation}"
+            )
+        named_tensors = self._weight_bucket_views(self._ipc_buffer, bucket_meta)
+        result = self.apply_weight_bucket(named_tensors, payload_bytes=payload_bytes)
+        self._synchronize_weight_update_device()
+        return result
+
+    def apply_weight_bucket_from_shm(
+        self,
+        update_id: str,
+        shm_name: str,
+        bucket_meta: dict,
+        payload_bytes: int = 0,
+    ) -> dict:
+        """Apply one SHM bucket inside the same explicit transaction."""
+        self._require_buffered_weight_update(update_id, transport="shm")
+        from multiprocessing import shared_memory as _shm_mod
+        from unittest.mock import patch
+
+        with patch(
+            "multiprocessing.resource_tracker.register",
+            lambda *args, **kwargs: None,
+        ):
+            shm = _shm_mod.SharedMemory(name=shm_name)
+        try:
+            buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            named_tensors = self._weight_bucket_views(buffer, bucket_meta)
+            result = self.apply_weight_bucket(
+                named_tensors, payload_bytes=payload_bytes
+            )
+            self._synchronize_weight_update_device()
+            del named_tensors
+            del buffer
+            return result
         finally:
             shm.close()
 
