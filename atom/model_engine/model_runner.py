@@ -947,6 +947,16 @@ class ModelRunner:
 
         nnodes = node_count(config)
         mori_env = apply_mori_env(nnodes=nnodes)
+
+        # weight_iterator splits the prefetch by node, because page cache is
+        # per node. It reads these, and without them falls back to (0, 1) --
+        # every rank prefetching the whole checkpoint -- as soon as the world
+        # is wider than the visible devices, which is every multi-node run.
+        # An external launcher that already set them knows better than we do.
+        if nnodes > 1:
+            topo = WideEPTopology.from_config(config)
+            os.environ.setdefault("LOCAL_RANK", str(local_device_rank))
+            os.environ.setdefault("LOCAL_WORLD_SIZE", str(topo.gpu_per_node))
         if nnodes > 1:
             logger.info(
                 format_startup_summary(
