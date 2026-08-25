@@ -9,6 +9,7 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
@@ -833,6 +834,14 @@ class ParallelConfig:
 
     data_parallel_master_ip: str = "127.0.0.1"
 
+    dp_sync_timeout_s: float | None = None
+    """Bound on the DP group's rendezvous and collectives. None keeps the
+    backend default (~30 min for gloo), which is right on one node where the
+    peers are sibling processes. Across nodes the common failure -- the other
+    node never started, or has the wrong master IP -- presents as every barrier
+    waiting forever with nothing logged, so a shorter bound is what makes it
+    diagnosable."""
+
     @property
     def is_multinode_dp(self) -> bool:
         """Whether this node owns only part of the global DP group.
@@ -857,9 +866,14 @@ class ParallelConfig:
         can live in different processes. To avoid port conflicts, we
         pop a new port from the prepared port list each time we need to
         initialize a new process group related to data parallelism.
+
+        Every rank has to walk the same sequence, or the second group is
+        formed on a different port per rank and never completes. Advancing by
+        data_parallel_rank did not: rank 0 stayed on the base port while the
+        others each moved by a different amount.
         """
         answer = self.data_parallel_master_port
-        self.data_parallel_master_port += self.data_parallel_rank
+        self.data_parallel_master_port += 1
 
         return answer
 
@@ -877,8 +891,16 @@ class ParallelConfig:
             self.data_parallel_rank,
             self.data_parallel_size,
             backend="gloo",
+            timeout=self.dp_sync_timeout,
         )
         return dp_group
+
+    @property
+    def dp_sync_timeout(self) -> timedelta | None:
+        """``dp_sync_timeout_s`` as a timedelta; None means backend default."""
+        if self.dp_sync_timeout_s is None:
+            return None
+        return timedelta(seconds=self.dp_sync_timeout_s)
 
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
