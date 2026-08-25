@@ -950,6 +950,16 @@ class ParallelConfig:
                 f"({self.data_parallel_size}): this node's slice would run off "
                 f"the end of the global DP group"
             )
+        if self.data_parallel_size % self.data_parallel_size_local:
+            raise ValueError(
+                f"data_parallel_size ({self.data_parallel_size}) must be "
+                f"divisible by data_parallel_size_local "
+                f"({self.data_parallel_size_local}): nodes have to hold equal "
+                f"slices. EPLB's hierarchical placement asserts "
+                f"num_gpus % num_nodes == 0 (model_ops/eplb.py), so a ragged "
+                f"split starts fine and then fails inside a rebalance, "
+                f"thousands of steps later"
+            )
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -1993,6 +2003,131 @@ class Config:
                 self.index_cache_dtype = "fp8"
         elif self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+
+        self._validate_multinode()
+
+    def _validate_multinode(self) -> None:
+        """Reject what multi-node DP has not been shown to work with.
+
+        Multi-node narrows the configuration surface rather than adding an
+        orthogonal dimension: most parallelism knobs reshape the rank space,
+        and none of the combinations below have run across a node boundary.
+        Deny by default and widen each as it is verified. The failure being
+        avoided is not a crash -- it is a run that starts, serves, and is
+        quietly wrong or hangs with no message.
+        """
+        pc = self.parallel_config
+        if not pc.is_multinode_dp:
+            return
+
+        nnodes = pc.data_parallel_size // pc.data_parallel_size_local
+
+        def reject(what: str, why: str, fix: str) -> None:
+            raise ValueError(
+                f"Multi-node DP ({nnodes} nodes, "
+                f"data_parallel_size={pc.data_parallel_size} "
+                f"data_parallel_size_local={pc.data_parallel_size_local}) "
+                f"{what}\n  Why: {why}\n  Fix: {fix}"
+            )
+
+        if not self.enable_dp_attention:
+            reject(
+                "requires --enable-dp-attention.",
+                "WideEP grows the EP group through the DP dimension. TP across "
+                "nodes would replicate the MLA KV cache and put an all-reduce "
+                "on every layer's critical path over the slower link.",
+                "add --enable-dp-attention, or run independent single-node "
+                "instances behind a router.",
+            )
+        if not self.enable_expert_parallel:
+            reject(
+                "requires --enable-expert-parallel.",
+                "spanning nodes only pays for itself by sharding experts "
+                "wider; without EP each node holds a full copy and the "
+                "inter-node link buys nothing.",
+                "add --enable-expert-parallel, or run independent single-node "
+                "instances.",
+            )
+        if self.pipeline_parallel_size != 1:
+            reject(
+                f"cannot be combined with pipeline_parallel_size="
+                f"{self.pipeline_parallel_size}.",
+                "the engine index space folds PP stages into DP ranks, and "
+                "that mapping has not been reconciled across nodes.",
+                "set --pipeline-parallel-size 1.",
+            )
+        if self.prefill_context_parallel_size != 1:
+            reject(
+                f"cannot be combined with prefill_context_parallel_size="
+                f"{self.prefill_context_parallel_size}.",
+                "ATOM_PCP_MOE_MERGE folds PCP into the EP flatten "
+                "(model_ops/moe.py), which stacks on the multi-node rank "
+                "space in a way nothing has exercised.",
+                "set --prefill-context-parallel-size 1.",
+            )
+        if pc.decode_context_parallel_size != 1:
+            reject(
+                f"cannot be combined with decode_context_parallel_size="
+                f"{pc.decode_context_parallel_size}.",
+                "same unexercised interaction with the EP flatten as PCP.",
+                "set --decode-context-parallel-size 1.",
+            )
+        if self.moe_backend != "standard":
+            reject(
+                f"cannot be combined with --moe-backend {self.moe_backend}.",
+                "FlyDSLAll2AllManager raises NotImplementedError for internode "
+                "(aiter dist/device_communicators/all2all.py); the mega path "
+                "has no cross-node transport.",
+                "use --moe-backend standard.",
+            )
+        if self.enable_rapidserve:
+            reject(
+                "cannot be combined with --enable-rapidserve.",
+                "rapidserve selects DisaggCoreManager (model_engine/"
+                "llm_engine.py), which spawns engines and assigns addresses "
+                "through its own path -- a second, unreconciled rank layout.",
+                "drop --enable-rapidserve, or disaggregate across instances "
+                "instead of within a GPU.",
+            )
+        if self.plugin_config is not None:
+            reject(
+                "cannot be combined with the SGLang/vLLM plugin path.",
+                "the plugin brings its own multi-node world (SGLang's "
+                "--nnodes), and plugin/config.py assigns "
+                "data_parallel_size_local the global size, so gpu_per_node "
+                "comes out wrong on that path.",
+                "use the native path, or drive multi-node through the "
+                "plugin's own topology flags.",
+            )
+
+        if self.enable_tbo:
+            logger.warning(
+                "Multi-node DP with --enable-tbo: TBO builds its own MoRI op "
+                "and is not verified across nodes. Expect to validate it "
+                "yourself before trusting the numbers."
+            )
+
+        base_port_default = next(
+            f.default for f in fields(ParallelConfig) if f.name == "data_parallel_base_port"
+        )
+        if pc.data_parallel_base_port == base_port_default:
+            reject(
+                "requires an explicit --data-parallel-base-port.",
+                "the default is get_open_port(), evaluated separately in each "
+                "process, so the nodes pick different ports and every rank "
+                "waits on an address no one is bound to -- a silent hang, not "
+                "a connection error.",
+                "pass the same --data-parallel-base-port on every node.",
+            )
+        if pc.data_parallel_master_ip in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(
+                "Multi-node DP with data_parallel_master_ip=%s: this only "
+                "resolves if every 'node' is this machine, i.e. the "
+                "single-box logical-node setup. Across real nodes the "
+                "non-coordinator ranks connect to their own loopback and hang "
+                "with no message. Pass --data-parallel-master-ip <routable-ip>.",
+                pc.data_parallel_master_ip,
+            )
 
     def compute_hash(self) -> str:
         """
