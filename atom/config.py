@@ -1381,6 +1381,15 @@ class EPLBConfig:
     #   "biased" -> fully replicate top-K hottest experts to all GPUs
     #               (K = num_redundant // num_gpus, per-node in multi-node)
     placement_policy: str = "naive"
+    # Cross-node migration guard. A rearrange whose inter-node weight movement
+    # would stall longer than this is skipped. 0 = no cap, count and log only,
+    # which is the default until M0-B measures the link: a made-up threshold
+    # that silently stops EPLB from ever rebalancing is worse than no cap.
+    # Single-node runs move zero cross-node bytes, so the cap never fires there.
+    max_migration_stall_ms: float = 0.0
+    # Assumed inter-node bandwidth the guard converts bytes into time with.
+    # Calibrate at M0-B; only meaningful when max_migration_stall_ms > 0.
+    migration_bandwidth_gbps: float = 50.0
 
     def __post_init__(self):
         self.load_window_size = int(self.load_window_size)
@@ -1413,6 +1422,14 @@ class EPLBConfig:
             "naive",
             "biased",
         }, "eplb.placement_policy must be one of {'naive','biased'}"
+        self.max_migration_stall_ms = float(self.max_migration_stall_ms)
+        assert (
+            self.max_migration_stall_ms >= 0
+        ), "eplb.max_migration_stall_ms must be >= 0 (0 disables the cap)"
+        self.migration_bandwidth_gbps = float(self.migration_bandwidth_gbps)
+        assert (
+            self.migration_bandwidth_gbps > 0
+        ), "eplb.migration_bandwidth_gbps must be > 0"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "EPLBConfig":

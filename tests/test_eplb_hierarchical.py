@@ -13,8 +13,13 @@ CPU-only; no GPU or distributed setup.
 
 import pytest
 import torch
+from aiter_stub import stubbed_aiter
 
-from atom.model_ops.eplb import rebalance_experts
+# Placement is pure index arithmetic. Stub AITER rather than skip without it,
+# so a CPU box runs these for real instead of reporting green.
+with stubbed_aiter():
+    import atom.config  # noqa: F401  (initialize before model_ops' __init__ chain)
+    from atom.model_ops.eplb import rebalance_experts
 
 # DSv4-Pro-shaped: 384 logical experts in 8 groups, EP16 over 2 nodes,
 # num_redundant = ep_size (the TRT "num_slots = experts + EP size" tier).
