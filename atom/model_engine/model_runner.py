@@ -938,10 +938,27 @@ class ModelRunner:
         )
         # Before init_dist_env, not after: MoRI reads its heap settings when the
         # heap is created, inside the first collective.
-        from atom.model_engine.topology import node_count
+        from atom.model_engine.topology import (
+            WideEPTopology,
+            format_startup_summary,
+            node_count,
+        )
         from atom.model_ops.fused_moe.mori_env import apply_mori_env
 
-        apply_mori_env(nnodes=node_count(config))
+        nnodes = node_count(config)
+        mori_env = apply_mori_env(nnodes=nnodes)
+        if nnodes > 1:
+            logger.info(
+                format_startup_summary(
+                    WideEPTopology.from_config(config),
+                    dp_rank=config.parallel_config.data_parallel_rank,
+                    dp_rank_local=dp_rank_local,
+                    device_rank=local_device_rank,
+                    visible_devices=os.environ.get("HIP_VISIBLE_DEVICES")
+                    or os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    mori_env=mori_env,
+                )
+            )
 
         # Both branches handle simulated TP: the PP path only to reject it,
         # since it would otherwise deadlock on a group sized for absent ranks.

@@ -9,6 +9,7 @@ import pytest
 
 from atom.model_engine.topology import (
     WideEPTopology,
+    format_startup_summary,
     node_count,
     parse_dist_init_addr,
 )
@@ -227,6 +228,62 @@ class TestSimulatedDeployment:
             pc, tensor_parallel_size=1, dp_attention=True, dp_logical_size=0
         )
         assert topo.nnodes == 2
+
+
+class TestStartupSummary:
+    def _topo(self):
+        return WideEPTopology.create(
+            nnodes=2,
+            node_rank=1,
+            dp_attention=True,
+            raw_tp_size=8,
+            raw_dp_size=2,
+            dist_init_addr="10.0.0.1:29500",
+        )
+
+    def test_carries_every_field_needed_to_compare_two_nodes(self):
+        line = format_startup_summary(
+            self._topo(),
+            dp_rank=9,
+            dp_rank_local=1,
+            device_rank=1,
+            visible_devices="0,1,2,3,4,5,6,7",
+            mori_env={"MORI_SHMEM_HEAP_SIZE": "8G"},
+        )
+        assert line.startswith("[wideep] ")
+        for field in (
+            "nnodes=2",
+            "node_rank=1",
+            "ep=16",
+            "gpu_per_node=8",
+            "global=16",
+            "local=8",
+            "rank=9",
+            "local_rank=1",
+            "device=cuda:1",
+            "visible=0,1,2,3,4,5,6,7",
+            "MORI_SHMEM_HEAP_SIZE=8G",
+        ):
+            assert field in line, field
+
+    def test_optional_parts_are_omitted_not_blank(self):
+        line = format_startup_summary(
+            self._topo(), dp_rank=9, dp_rank_local=1, device_rank=1
+        )
+        assert "visible=" not in line
+        assert "mori:" not in line
+        assert "device=cuda:1" in line
+
+    def test_stays_on_one_line(self):
+        line = format_startup_summary(
+            self._topo(),
+            dp_rank=9,
+            dp_rank_local=1,
+            device_rank=1,
+            visible_devices="0,1",
+            mori_env={"A": "1", "B": "2"},
+        )
+        assert "\n" not in line
 
 
 class TestNodeCount:

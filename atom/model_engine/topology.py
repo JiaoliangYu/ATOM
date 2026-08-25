@@ -40,6 +40,37 @@ def parse_dist_init_addr(addr: str) -> tuple[str, int]:
     return host, port
 
 
+def format_startup_summary(
+    topo: WideEPTopology,
+    *,
+    dp_rank: int,
+    dp_rank_local: int,
+    device_rank: int,
+    visible_devices: str | None = None,
+    mori_env: dict[str, str] | None = None,
+) -> str:
+    """One greppable line per worker: is this rank where it thinks it is?
+
+    Multi-node misconfiguration is diagnosed by comparing ranks across nodes,
+    which means reading the same fields out of several logs. Emitting them
+    together, once, on a line with a fixed prefix is the difference between
+    one grep and a correlation exercise. Everything here is already known at
+    worker init; nothing is computed for the message.
+    """
+    parts = [
+        topo.describe(),
+        f"rank={dp_rank} local_rank={dp_rank_local}",
+        f"device=cuda:{device_rank}",
+    ]
+    if visible_devices:
+        parts.append(f"visible={visible_devices}")
+    if mori_env:
+        parts.append(
+            "mori: " + " ".join(f"{k}={v}" for k, v in sorted(mori_env.items()))
+        )
+    return " | ".join(parts)
+
+
 def node_count(config) -> int:
     """How many nodes this Config runs on.
 
