@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.model_engine.topology import WideEPTopology, parse_dist_init_addr
+from atom.model_engine.topology import (
+    WideEPTopology,
+    node_count,
+    parse_dist_init_addr,
+)
 
 
 def _legacy_local_engine_count(
@@ -223,6 +227,42 @@ class TestSimulatedDeployment:
             pc, tensor_parallel_size=1, dp_attention=True, dp_logical_size=0
         )
         assert topo.nnodes == 2
+
+
+class TestNodeCount:
+    """The one place that answers "how many nodes" including the simulated case."""
+
+    def _config(self, pc, *, tp, dp_attention=True, dp_logical_size=0):
+        return SimpleNamespace(
+            parallel_config=pc,
+            tensor_parallel_size=tp,
+            enable_dp_attention=dp_attention,
+            dp_logical_size=dp_logical_size,
+        )
+
+    def test_reports_the_split(self):
+        pc = _FakeParallelConfig(
+            data_parallel_size=16, data_parallel_size_local=8, data_parallel_rank=8
+        )
+        assert node_count(self._config(pc, tp=1)) == 2
+
+    def test_simulation_reports_one_box(self):
+        # Same fields as node 0 of a real 2-node run; only dp_logical_size
+        # distinguishes them, which is why this rule lives in one place.
+        pc = _FakeParallelConfig(
+            data_parallel_size=8, data_parallel_size_local=4, data_parallel_rank=0
+        )
+        assert node_count(self._config(pc, tp=1, dp_logical_size=8)) == 1
+
+    def test_missing_field_is_not_simulating(self):
+        # Older Config objects and test doubles have no dp_logical_size.
+        pc = _FakeParallelConfig(
+            data_parallel_size=8, data_parallel_size_local=4, data_parallel_rank=0
+        )
+        cfg = SimpleNamespace(
+            parallel_config=pc, tensor_parallel_size=1, enable_dp_attention=True
+        )
+        assert node_count(cfg) == 2
 
 
 class TestValidation:

@@ -40,6 +40,19 @@ def parse_dist_init_addr(addr: str) -> tuple[str, int]:
     return host, port
 
 
+def node_count(config) -> int:
+    """How many nodes this Config runs on.
+
+    The one place that answers the question for the simulated case, so callers
+    that only need a node count do not each re-derive the rule: ``--fake-eplb``
+    runs a single box pretending to be a wider deployment, and the DP fields
+    alone cannot distinguish that from being one node of a real split.
+    """
+    if getattr(config, "dp_logical_size", 0):
+        return 1
+    return WideEPTopology.from_config(config).nnodes
+
+
 @dataclass(frozen=True)
 class WideEPTopology:
     """Engine-unit view of the parallel layout.
@@ -160,6 +173,16 @@ class WideEPTopology:
             global_dp_size=global_dp_size,
             local_engine_count=local_engine_count,
             dist_init_addr=f"{host}:{port}" if nnodes > 1 and host else None,
+        )
+
+    @classmethod
+    def from_config(cls, config) -> WideEPTopology:
+        """Same as ``from_parallel_config``, reading the fields off a Config."""
+        return cls.from_parallel_config(
+            config.parallel_config,
+            tensor_parallel_size=config.tensor_parallel_size,
+            dp_attention=config.enable_dp_attention,
+            dp_logical_size=getattr(config, "dp_logical_size", 0),
         )
 
     @classmethod

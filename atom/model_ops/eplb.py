@@ -1918,26 +1918,19 @@ class EPLBManager:
         # across nodes and makes every rebalance pay avoidable inter-node
         # traffic, so it fails loud instead of defaulting to 1.
         from atom.config import get_current_atom_config
-        from atom.model_engine.topology import WideEPTopology
+        from atom.model_engine.topology import WideEPTopology, node_count
 
         atom_config = get_current_atom_config()
-        if atom_config.dp_logical_size:
-            # --fake-eplb: the DP fields describe the simulated width, not a node
-            # split, and the simulation runs on one box.
-            self._nnodes = 1
-        else:
-            topo = WideEPTopology.from_parallel_config(
-                atom_config.parallel_config,
-                tensor_parallel_size=atom_config.tensor_parallel_size,
-                dp_attention=atom_config.enable_dp_attention,
-            )
+        self._nnodes = node_count(atom_config)
+        if not atom_config.dp_logical_size:
+            # Skipped while simulating, where the two legitimately disagree.
+            topo = WideEPTopology.from_config(atom_config)
             if topo.ep_size != ep_size:
                 raise RuntimeError(
                     f"EPLB ep_size ({ep_size}) disagrees with the topology "
                     f"({topo.ep_size}); hierarchical placement would partition "
                     f"the wrong rank set. {topo.describe()}"
                 )
-            self._nnodes = topo.nnodes
 
         try:
             cfg = atom_config.eplb_config

@@ -936,6 +936,13 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
+        # Before init_dist_env, not after: MoRI reads its heap settings when the
+        # heap is created, inside the first collective.
+        from atom.model_engine.topology import node_count
+        from atom.model_ops.fused_moe.mori_env import apply_mori_env
+
+        apply_mori_env(nnodes=node_count(config))
+
         # Both branches handle simulated TP: the PP path only to reject it,
         # since it would otherwise deadlock on a group sized for absent ranks.
         if config.pipeline_parallel_size > 1:
