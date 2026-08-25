@@ -70,6 +70,10 @@ class IncrementalStreamDetokenizer:
         return ""
 
 
+class _MergedIds(list):
+    """Marks a token_ids list this module owns and may extend in place."""
+
+
 def merge_chunk(into: dict, new: dict) -> None:
     """Fold ``new`` into the chunk already waiting. ``into`` is modified.
 
@@ -77,8 +81,18 @@ def merge_chunk(into: dict, new: dict) -> None:
     ``token_ids`` is rebuilt rather than extended: the first chunk's list is the
     engine's own ``output_tokens``, which must not be appended to.
     """
-    into["token_ids"] = [*into.get("token_ids", ()), *new.get("token_ids", ())]
-    into["text"] = into.get("text", "") + new.get("text", "")
+    ids = new.get("token_ids")
+    if ids:
+        cur = into.get("token_ids")
+        if cur.__class__ is _MergedIds:
+            cur.extend(ids)
+        else:
+            merged = _MergedIds(cur or ())
+            merged.extend(ids)
+            into["token_ids"] = merged
+    text = into.pop("text", "")
+    text += new.get("text", "")
+    into["text"] = text
     into["finished"] = bool(into.get("finished") or new.get("finished"))
     for key in _LATEST_WINS:
         if new.get(key):
