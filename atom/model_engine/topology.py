@@ -94,13 +94,26 @@ class WideEPTopology:
         *,
         tensor_parallel_size: int,
         dp_attention: bool,
+        dp_logical_size: int = 0,
     ) -> WideEPTopology:
         """Derive from ``ParallelConfig``, before or after CoreManager's fold.
 
         Both regimes work because the fold is a change of units -- it scales the
         DP quantities by ``tp_size`` and divides TP by the same -- so the ratio
         and the product this reads are invariant under it.
+
+        ``dp_logical_size`` (``Config.dp_logical_size``, non-zero only under
+        ``--fake-eplb``) must be passed through: while simulating, the DP fields
+        describe a deployment wider than the box, so their ratio is not a node
+        count. Refuse rather than report a node count that does not exist.
         """
+        if dp_logical_size:
+            raise ValueError(
+                f"cannot derive a node topology while simulating a "
+                f"{dp_logical_size}-wide deployment (--fake-eplb): the DP fields "
+                f"describe the simulated width, not this box. Callers that "
+                f"support simulation must handle it explicitly."
+            )
         global_dp_size = parallel_config.data_parallel_size
         local_engine_count = parallel_config.data_parallel_size_local
         rank_offset = parallel_config.data_parallel_rank

@@ -13,7 +13,12 @@ from atom.model_engine.topology import WideEPTopology, parse_dist_init_addr
 def _legacy_local_engine_count(
     *, dp_attention: bool, raw_tp: int, raw_dp: int, pp_size: int = 1
 ) -> int:
-    """Mirror engine_core_mgr.py:113-130 for Gate 0 regression."""
+    """Mirror CoreManager's engine-count fold for Gate 0 regression.
+
+    engine_core_mgr.py: iter_dp_rank_assignments + the enable_dp_attention
+    branch. Excludes the --fake-eplb shrink, which the topology refuses to
+    describe (see TestSimulatedDeployment).
+    """
     if dp_attention:
         assert pp_size == 1
         return raw_tp * raw_dp
@@ -193,6 +198,31 @@ class TestFromParallelConfig:
             WideEPTopology.from_parallel_config(
                 pc, tensor_parallel_size=1, dp_attention=True
             )
+
+
+class TestSimulatedDeployment:
+    """--fake-eplb makes the DP fields describe a width, not a node split."""
+
+    def test_simulation_is_rejected_not_guessed(self):
+        # -tp 8 on a 4-GPU box: post-fold the fields read exactly like node 0 of
+        # a real 2-node deployment, so the ratio must not be taken as a node
+        # count. Callers that support simulation handle it explicitly.
+        pc = _FakeParallelConfig(
+            data_parallel_size=8, data_parallel_size_local=4, data_parallel_rank=0
+        )
+        with pytest.raises(ValueError, match="--fake-eplb"):
+            WideEPTopology.from_parallel_config(
+                pc, tensor_parallel_size=1, dp_attention=True, dp_logical_size=8
+            )
+
+    def test_not_simulating_is_the_default(self):
+        pc = _FakeParallelConfig(
+            data_parallel_size=8, data_parallel_size_local=4, data_parallel_rank=0
+        )
+        topo = WideEPTopology.from_parallel_config(
+            pc, tensor_parallel_size=1, dp_attention=True, dp_logical_size=0
+        )
+        assert topo.nnodes == 2
 
 
 class TestValidation:
