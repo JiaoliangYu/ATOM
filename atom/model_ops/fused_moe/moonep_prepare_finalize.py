@@ -141,9 +141,11 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # documents it as the number of leading rows fused_moe is driven over
         # via num_local_tokens, and mori fills it with a scalar for a layout
         # that is not grouped by expert at all.  For MoonEP that is
-        # cu_seqlens[-1].  local_group_sizes() still runs, for its check that
-        # no group landed here without a prefetch slot.
-        self._op.local_group_sizes(cu_seqlens)
+        # cu_seqlens[-1].  local_group_sizes() used to be called here purely for
+        # its side effect -- it raised when a group landed on this rank with no
+        # prefetch slot.  That is legal now (the group reads its weights in
+        # place at the owner's home row), so the call is gone; use
+        # ``overflow_rows()`` from a tuning path if you want the count.
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=self._op.valid_rows(),
             expert_num_tokens_cpu=None,
@@ -242,63 +244,61 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 "weights are not in the symmetric heap and peers cannot "
                 "prefetch them. It is called from init_prepare_finalize."
             )
-        if w1.data_ptr() != pools[0][0].pool.data_ptr():
+        # Against ``home``, not the pool base: adopt_weights rebinds the param
+        # onto this rank's own slot, which sits at ``pool + rank * slot_bytes``
+        # in the row-contiguous range and is row 0 only on rank 0.
+        if w1.data_ptr() != pools[0][0].home.data_ptr():
             raise RuntimeError(
-                "the layer's w13_weight no longer aliases the MoonEP pool; "
-                "something reassigned it after adopt_weights, and peers would "
-                "prefetch stale weights"
+                "the layer's w13_weight no longer aliases this rank's slot in "
+                "the MoonEP pool; something reassigned it after adopt_weights, "
+                "and peers would prefetch stale weights"
             )
         plan = self._op.live_plan()
-        if self._op.needs_split():
-            # Decode migrates nothing, so there is nothing to prefetch and the
-            # P2P weight reads drop out of the step entirely.
+        if self._op.has_migration():
+            # Decode migrates nothing, so there is nothing to pull into the
+            # prefetch tail and the P2P weight reads drop out of the step.
+            # Migration is now an optimisation, not a precondition: an expert
+            # that gets no slot is still addressable at its owner's home row.
             sel = plan.experts_to_copy[self._op.cfg.rank].contiguous()
             for pool, _flat, _sh in pools:
                 if pool is not None:
                     pool.prefetch(sel)
 
-        slot_ids = self._op.row_slot_ids()
+        epn_padded = next(
+            (p.epn_padded for p, _f, _s in pools if p is not None), None
+        )
+        slot_ids = self._op.row_slot_ids(epn_padded)
         out = self._op.get_expert_output_buffer()
         act = activation if activation is not None else ActivationType.Silu
         qt = quant_type if quant_type is not None else QuantType.No
 
-        def experts(lo, hi, seg, num_local_tokens=None):
-            """One fused_moe over rows[lo:hi] against a ``seg``-slot slice."""
-            if hi <= lo:
-                return
-            n = hi - lo
-            fused_out = fused_moe(
-                rows[lo:hi],
-                self._slice(pools[0], seg),
-                self._slice(pools[1], seg),
-                torch.ones((n, 1), dtype=torch.float32, device=rows.device),
-                slot_ids[lo:hi],
-                None,
-                act,
-                quant_type=qt,
-                w1_scale=self._slice(pools[2], seg),
-                w2_scale=self._slice(pools[3], seg),
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
-                num_local_tokens=num_local_tokens,
-                hidden_pad=hidden_pad,
-                intermediate_pad=intermediate_pad,
-                bias1=self._slice(pools[4], seg) if pools[4][0] is not None else bias1,
-                bias2=self._slice(pools[5], seg) if pools[5][0] is not None else bias2,
-                dtype=dtype if dtype is not None else rows.dtype,
-                **(extra_kwargs or {}),
-            )
-            out[lo:hi].copy_(fused_out)
-
-        epn = self._op.cfg.num_experts_per_rank
-        if not self._op.needs_split():
-            # Decode: nothing migrated, so one call covers every row and the
-            # row count stays on device -- no host sync anywhere in the step.
-            experts(0, out.shape[0], (0, epn), self._op.valid_rows())
-            return out
-        home_end, total, nb = self._op.expert_call_split()
-        experts(0, home_end, (0, epn))
-        experts(home_end, total, (epn, epn + nb))
+        # One call over the whole row-contiguous [E + B] pool. Every slot id is
+        # a global pool row, so home experts, borrowed ones in the prefetch tail
+        # and any overflow expert read in place at its owner's row all come out
+        # of the same weight tensor -- there is nothing left to split on. The
+        # row count stays on device, so the experts step costs no host sync.
+        fused_out = fused_moe(
+            rows[: out.shape[0]],
+            self._whole(pools[0]),
+            self._whole(pools[1]),
+            torch.ones((out.shape[0], 1), dtype=torch.float32, device=rows.device),
+            slot_ids[: out.shape[0]],
+            None,
+            act,
+            quant_type=qt,
+            w1_scale=self._whole(pools[2]),
+            w2_scale=self._whole(pools[3]),
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            num_local_tokens=self._op.valid_rows(),
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=self._whole(pools[4]) if pools[4][0] is not None else bias1,
+            bias2=self._whole(pools[5]) if pools[5][0] is not None else bias2,
+            dtype=dtype if dtype is not None else rows.dtype,
+            **(extra_kwargs or {}),
+        )
+        out.copy_(fused_out)
         return out
 
     ADOPTED = (
@@ -397,17 +397,24 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return pool, flat
 
     @staticmethod
-    def _slice(entry, seg):
-        """Slots ``seg`` of a pool, in the shape fused_moe expects.
+    def _whole(entry):
+        """A pool's full ``[E + B]`` range, in the shape fused_moe expects.
 
-        Every expert in the returned tensor must be routed to by at least one
-        row -- see ``expert_call_split``.
+        The range is row-contiguous across ranks, so this one tensor covers
+        every expert in the world plus this rank's prefetch tail; rows the plan
+        never routes to are simply never indexed.  Declaring them is safe --
+        measured on gfx950 2026-08-24, bf16/fp8/mxfp4 alike, with up to 42 of 48
+        experts unrouted and the output still bit-exact.
+
+        ``is_shuffled`` has to be restored by hand: ``fused_moe`` reads it off
+        the tensor object (``aiter/fused_moe.py:758``) and a view adopted from a
+        raw VMM pointer carries no attributes.  Getting this wrong raises rather
+        than corrupting, unlike the slicing version of the same trap.
         """
         pool, flat, shuffled = entry
         if pool is None:
             return None
-        lo, hi = seg
-        t = pool.pool[lo:hi]
+        t = pool.pool
         t = t.reshape(-1, *t.shape[2:]) if flat else t
         if shuffled:
             t.is_shuffled = True
