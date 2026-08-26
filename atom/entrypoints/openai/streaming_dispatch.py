@@ -70,29 +70,25 @@ class IncrementalStreamDetokenizer:
         return ""
 
 
-class _MergedIds(list):
-    """Marks a token_ids list this module owns and may extend in place."""
-
-
 def merge_chunk(into: dict, new: dict) -> None:
     """Fold ``new`` into the chunk already waiting. ``into`` is modified.
 
-    ``text`` and ``token_ids`` are deltas, so concatenating them is exact.
-    ``token_ids`` is rebuilt rather than extended: the first chunk's list is the
-    engine's own ``output_tokens``, which must not be appended to.
+    ``text`` and ``token_ids`` are deltas, so concatenating them is exact. Both
+    are extended in place -- ``into`` carries the copy
+    :meth:`StreamOutputCollector.put_nowait` made on the way in. Rebuilding them
+    walked the whole accumulation again on every merge, and the accumulation is
+    exactly what deepens while a stream is being merged into.
     """
-    ids = new.get("token_ids")
-    if ids:
-        cur = into.get("token_ids")
-        if cur.__class__ is _MergedIds:
-            cur.extend(ids)
-        else:
-            merged = _MergedIds(cur or ())
-            merged.extend(ids)
-            into["token_ids"] = merged
+    into["token_ids"].extend(new.get("token_ids") or ())
+    # Popped so the string has one reference and CPython grows it in place.
+    # `into["text"] = into["text"] + ...` leaves the dict holding one, which
+    # forces a fresh allocation and a full copy per merge -- restoring this is
+    # silent, so it survives both the tests and the linter.
     text = into.pop("text", "")
-    text += new.get("text", "")
-    into["text"] = text
+    try:
+        text += new.get("text", "")
+    finally:
+        into["text"] = text
     into["finished"] = bool(into.get("finished") or new.get("finished"))
     for key in _LATEST_WINS:
         if new.get(key):
@@ -131,6 +127,11 @@ class StreamOutputCollector:
             tag, chunk = None, payload
         waiting = self._pending.get(tag)
         if waiting is None:
+            # A merge extends this list, so it has to be one we own. The engine
+            # already hands out a per-step copy (the sole `RequestOutput` site,
+            # in the scheduler), but that is a long way from here to rely on,
+            # and copying once per stall is cheaper than once per merge.
+            chunk["token_ids"] = list(chunk.get("token_ids") or ())
             self._pending[tag] = chunk
         else:
             merge_chunk(waiting, chunk)
