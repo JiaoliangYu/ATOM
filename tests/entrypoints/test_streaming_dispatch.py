@@ -340,10 +340,7 @@ def test_two_steps_keep_their_order_within_one_stream():
 
 
 def test_merge_keeps_end_of_stream_and_never_extends_the_producers_list():
-    """A swallowed terminal flag hangs its client; a mutated list corrupts the producer.
-
-    Driven through the collector because that is where the copy is taken now.
-    """
+    """A swallowed terminal flag hangs its client; a mutated list corrupts the producer."""
     produced = [1]
     collector = StreamOutputCollector("request-1")
     collector.put_nowait({"token_ids": produced, "text": "a", "finished": True})
@@ -358,11 +355,7 @@ def test_merge_keeps_end_of_stream_and_never_extends_the_producers_list():
 
 
 def test_put_nowait_gives_merge_chunk_a_list_it_may_extend():
-    """`merge_chunk` extends in place, so the key it needs is established here.
-
-    It used to create the key itself on every merge; losing that is only safe
-    while this holds.
-    """
+    """`merge_chunk` extends in place; it used to create this key itself."""
     collector = StreamOutputCollector("request-1")
     collector.put_nowait({"text": "a"})
 
@@ -370,8 +363,7 @@ def test_put_nowait_gives_merge_chunk_a_list_it_may_extend():
 
 
 def test_merge_extends_in_place_instead_of_rebuilding():
-    """Rebuilding walks the whole accumulation per merge, and it is the accumulation
-    that grows while a stream is stalled."""
+    """Rebuilding walks the whole accumulation, which is what a stall grows."""
     collector = StreamOutputCollector("request-1")
     collector.put_nowait({"token_ids": [1], "text": "a"})
     accumulating = collector._pending[None]["token_ids"]

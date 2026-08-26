@@ -73,17 +73,12 @@ class IncrementalStreamDetokenizer:
 def merge_chunk(into: dict, new: dict) -> None:
     """Fold ``new`` into the chunk already waiting. ``into`` is modified.
 
-    ``text`` and ``token_ids`` are deltas, so concatenating them is exact. Both
-    are extended in place -- ``into`` carries the copy
-    :meth:`StreamOutputCollector.put_nowait` made on the way in. Rebuilding them
-    walked the whole accumulation again on every merge, and the accumulation is
-    exactly what deepens while a stream is being merged into.
+    Both deltas extend in place: ``into`` holds the copy ``put_nowait`` took,
+    and rebuilding them walked the whole accumulation on every merge.
     """
     into["token_ids"].extend(new.get("token_ids") or ())
-    # Popped so the string has one reference and CPython grows it in place.
-    # `into["text"] = into["text"] + ...` leaves the dict holding one, which
-    # forces a fresh allocation and a full copy per merge -- restoring this is
-    # silent, so it survives both the tests and the linter.
+    # Popped so the string has one reference and CPython grows it in place;
+    # assigning `into["text"] + ...` back reallocates and copies per merge.
     text = into.pop("text", "")
     try:
         text += new.get("text", "")
@@ -127,10 +122,8 @@ class StreamOutputCollector:
             tag, chunk = None, payload
         waiting = self._pending.get(tag)
         if waiting is None:
-            # A merge extends this list, so it has to be one we own. The engine
-            # already hands out a per-step copy (the sole `RequestOutput` site,
-            # in the scheduler), but that is a long way from here to rely on,
-            # and copying once per stall is cheaper than once per merge.
+            # A merge extends this list, so it has to be ours. The scheduler
+            # already copies per step, but that is too far away to rely on.
             chunk["token_ids"] = list(chunk.get("token_ids") or ())
             self._pending[tag] = chunk
         else:
