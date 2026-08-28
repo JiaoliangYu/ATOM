@@ -1357,7 +1357,7 @@ class Scheduler:
             # don't clobber with local num_cached_blocks (always 0 on consumer).
             if not seq.prefix_cache_hit_tokens:
                 seq.prefix_cache_hit_tokens = (
-                    num_cached_blocks * self.block_manager.block_size
+                    num_cached_blocks * self.block_manager.hash_block_size
                 )
 
             self._notify_connector_after_prefill_alloc(seq)
@@ -1371,7 +1371,7 @@ class Scheduler:
                 continue
 
             seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
+                num_cached_blocks * self.block_manager.hash_block_size
             )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
@@ -2617,7 +2617,9 @@ class Scheduler:
         if not (prefix_caching or kv_events):
             return True
 
-        num_cached_blocks = seq.num_cached_tokens // bm.block_size
+        # num_cached_tokens is a global-token count. Under DCP each block-table
+        # entry spans one virtual hash block, not one rank-local physical block.
+        num_cached_blocks = seq.num_cached_tokens // bm.hash_block_size
         # PD consumer only: full prompt KV arrived via RDMA, safe to hash all.
         # Offload/LMCache path skipped — suffix KV not yet computed.
         if prefix_caching and not self._connector_flag("is_offload"):

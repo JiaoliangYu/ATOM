@@ -670,7 +670,7 @@ class BlockManager:
                     store_run_hashes,
                     store_run_tokens,
                     store_run_parent,
-                    self.block_size,
+                    self.hash_block_size,
                 )
             )
         pos = base + num_new_tokens
@@ -1099,7 +1099,7 @@ class BlockManager:
                             # into a list already. See `_make_block_stored`.
                             list(token_ids),
                             parent_hash if parent_hash != -1 else None,
-                            self.block_size,
+                            self.hash_block_size,
                         )
                     )
 
@@ -1112,16 +1112,33 @@ class BlockManager:
         """Hash received prompt blocks into the prefix cache so subsequent
         turns can match them locally and transfer only the delta.
 
-        Only whole blocks are registered; trailing partial block left unhashed
-        (matches ``hash_blocks``). Returns the number of blocks hashed.
+        Under DCP, one block-table entry represents ``dcp_world_size`` physical
+        blocks and therefore ``hash_block_size`` global tokens. Hashing at the
+        physical ``block_size`` would attach several incompatible token ranges
+        to the same virtual block.
+
+        Blocks before ``num_cached_tokens`` are already indexed locally; only
+        the received suffix needs registration. The trailing partial hash block
+        remains unpublished, matching ``hash_blocks``.
+
+        Returns the number of complete received suffix blocks processed for
+        this sequence. This includes blocks annotated from an existing canonical
+        hash, so it is neither the total number of hashed prompt blocks nor
+        necessarily the number of newly inserted hash-index entries.
         """
         if not self.enable_prefix_caching:
             return 0
-        num_full = seq.num_prompt_tokens // self.block_size
+
+        hbs = self._hash_block_size()
+        num_full = seq.num_prompt_tokens // hbs
         num_full = min(num_full, len(seq.block_table))
-        h = -1
-        for i in range(num_full):
-            token_ids = seq.block(i)
+        start = min(seq.num_cached_tokens // hbs, num_full)
+        h = self._chain_parent_hash(seq, start)
+        if h is None:
+            return 0
+
+        for i in range(start, num_full):
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = seq.block_table[i]
             block = self.kv.block(block_id)
@@ -1136,7 +1153,13 @@ class BlockManager:
                         f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
                     )
                 block.update(h, token_ids)
-        return num_full
+
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, num_full * hbs)
+        # The decode consumer has no local prefill postprocess to publish these
+        # prompt blocks. Mark that one-shot work complete so its first decode
+        # output does not publish the same physical blocks again.
+        seq.prefix_hashes_published = True
+        return num_full - start
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -1231,7 +1254,7 @@ class BlockManager:
                 block_hashes,
                 token_ids,
                 parent_block_hash,
-                self.block_size,
+                self.hash_block_size,
                 medium=MEDIUM_REMOTE,
             )
         )
