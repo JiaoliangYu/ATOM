@@ -35,7 +35,6 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
-    indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
@@ -81,6 +80,7 @@ from atom.model_ops import module_dispatch_ops as _module_dispatch_ops
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
+    indexer_qk_rope_quant_and_cache,
     is_rocm_aiter_fp4bmm_enabled,
     qrep_tp_override,
     triton_convert_req_index_to_global_index,
@@ -2321,14 +2321,10 @@ class Indexer(nn.Module):
         # rope q (1/pcp) and k (full) separately. The op then scores 1/pcp
         # queries against the gathered full KV and writes the full k-cache.
         pcp = _pcp_active()
-        # DCP must also take the unfused path: the fused q-rope/quant+cache op is
-        # driven by slot_mapping, which is -1 on every rank that does not own the
-        # current token, so those ranks skip it entirely and leave q_fp8 /
-        # weights_out uninitialized. Only the owner rank ends up with a valid
-        # query -- invisible while ctx <= index_topk (top-k selects everything
-        # anyway), garbage beyond it.
-        dcp = get_dcp_world_size() > 1
-        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp or dcp
+        # With compute_all_q_rope, DCP uses the fused path even when this rank's
+        # slot is -1: Q/weights are produced on every rank, positions are clamped
+        # for padded rows, and only the owner rank writes K cache.
+        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
         if unfused_qk_rope:
             q_pe, _ = torch.split(
