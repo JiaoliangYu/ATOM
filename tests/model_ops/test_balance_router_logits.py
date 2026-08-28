@@ -1,6 +1,10 @@
 import pytest
 import torch
 
+pytest.importorskip(
+    "aiter", reason="init_balance_router_logits lives in atom.model_ops.moe"
+)
+
 from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
 from atom.model_ops.moe import _FAKE_EPLB_LOGIT, init_balance_router_logits
 
@@ -12,25 +16,25 @@ from atom.model_ops.moe import _FAKE_EPLB_LOGIT, init_balance_router_logits
     "layout_kwargs",
     [
         pytest.param(
-            dict(
-                num_routed=256,
-                num_fused_shared_experts=1,
-                num_configured_redundant=0,
-                ep_size=8,
-                use_all2all=True,
-                eplb_enabled=False,
-            ),
+            {
+                "num_routed": 256,
+                "num_fused_shared_experts": 1,
+                "num_configured_redundant": 0,
+                "ep_size": 8,
+                "use_all2all": True,
+                "eplb_enabled": False,
+            },
             id="local_replica_shared",
         ),
         pytest.param(
-            dict(
-                num_routed=256,
-                num_fused_shared_experts=1,
-                num_configured_redundant=32,
-                ep_size=8,
-                use_all2all=True,
-                eplb_enabled=True,
-            ),
+            {
+                "num_routed": 256,
+                "num_fused_shared_experts": 1,
+                "num_configured_redundant": 32,
+                "ep_size": 8,
+                "use_all2all": True,
+                "eplb_enabled": True,
+            },
             id="eplb_routed_shared",
         ),
     ],
