@@ -155,8 +155,6 @@ jobs:
       ratio: ${{ matrix.config.ratio }}
       ratio_str: ${{ matrix.config.ratio_str }}
       concurrency: ${{ matrix.config.concurrency }}
-      num_prompts: ${{ matrix.config.num_prompts }}
-      num_warmups: ${{ matrix.config.num_warmups }}
       image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}

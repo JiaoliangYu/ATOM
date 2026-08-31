@@ -42,10 +42,6 @@ not a duplicated top-level entry. Each variant runs a set of *scenarios*
 and are then filtered by the variant's `conc_min`/`conc_max` band (the
 declarative replacement for the old workflow `exclude` block).
 
-A scenario may also carry `num_prompts` / `num_warmups` to override the
-runner's default client-side sizing (conc*10 prompts, conc*2 warmups) for
-that scenario only.
-
 Three public entry points keep every consumer in sync:
 
 - `load_variants(path)`  -> flat per-variant dicts (server args, suffix, ...).
@@ -204,12 +200,7 @@ def build_cells(
 
     Each cell self-describes one run:
         display, prefix, suffix, model_path, server_args, bench_args, env_vars,
-        runner, isl, osl, conc, ratio, num_prompts, num_warmups, result_filename
-
-    `num_prompts` / `num_warmups` are optional per-scenario client-side sizing.
-    Empty string means "unset" -- the runner keeps its conc*10 / conc*2 defaults.
-    They exist because a high-concurrency cell would otherwise request
-    conc*10 prompts and outlive the benchmark step's timeout.
+        runner, isl, osl, conc, ratio, result_filename
 
     `param_lists` (workflow_dispatch) overrides the catalog scenarios with an
     explicit grid; otherwise per-variant/default scenarios are used. `model_filter`
@@ -246,8 +237,6 @@ def build_cells(
                         "osl": sc["osl"],
                         "conc": conc,
                         "ratio": ratio,
-                        "num_prompts": sc.get("num_prompts", ""),
-                        "num_warmups": sc.get("num_warmups", ""),
                         "result_filename": (
                             f"{rec['prefix']}{rec['suffix']}-"
                             f"{sc['isl']}-{sc['osl']}-{conc}-{ratio_str}"
@@ -305,12 +294,6 @@ def build_cell_configs(
             c["isl"],
             c["osl"],
             c["ratio"],
-            # Two scenarios can share (isl, osl, ratio) and differ only in their
-            # client-side sizing -- e.g. one concurrency band on the default
-            # conc*10 prompts and a heavier one capped explicitly. Leaving these
-            # out of the key silently merges them and drops one override.
-            c["num_prompts"],
-            c["num_warmups"],
         )
         cfg = configs.get(key)
         if cfg is None:
@@ -328,8 +311,6 @@ def build_cell_configs(
                 "ratio": c["ratio"],
                 "ratio_str": _fmt_ratio(c["ratio"]),
                 "scenario": scenario_tag(c["isl"], c["osl"]),
-                "num_prompts": c["num_prompts"],
-                "num_warmups": c["num_warmups"],
                 "_conc": [],
             }
             configs[key] = cfg

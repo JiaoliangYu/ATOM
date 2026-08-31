@@ -108,14 +108,13 @@
           "label": "MegaMoE",
           "suffix": "-mega",
           "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 800, \"load_window_size\": 800, \"rebalance_min_balancedness\": 2.0}'",
+          "bench_args": "--num-prompts 20480 --num-warmups 256",
           "scenarios": [
             {
               "isl": 8192,
               "osl": 1024,
               "concurrency": [4096],
-              "random_range_ratio": 0.8,
-              "num_prompts": 20480,
-              "num_warmups": 256
+              "random_range_ratio": 0.8
             }
           ],
           "conc_min": 4096,

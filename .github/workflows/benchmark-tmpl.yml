@@ -53,16 +53,6 @@ on:
         description: "JSON array of concurrency values (second-level matrix)"
         type: string
         required: true
-      num_prompts:
-        description: "Client --num-prompts; empty keeps the runner default (conc*10)"
-        type: string
-        required: false
-        default: ""
-      num_warmups:
-        description: "Client --num-warmups; empty keeps the runner default (conc*2)"
-        type: string
-        required: false
-        default: ""
       image:
         type: string
         required: false
@@ -187,8 +177,6 @@ jobs:
             -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
             -e SERVER_ARGS="$ARGS" \
             -e BENCH_EXTRA_ARGS="${{ inputs.bench_args }}" \
-            -e NUM_PROMPTS_OVERRIDE="${{ inputs.num_prompts }}" \
-            -e NUM_WARMUPS_OVERRIDE="${{ inputs.num_warmups }}" \
             -e MP="$model_path" \
             atom-benchmark bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
 
