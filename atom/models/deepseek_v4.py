@@ -42,7 +42,15 @@ from aiter.dist.parallel_state import (
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
-from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_batched_gemm_a8w4_v2
+
+try:
+    from aiter.ops.batched_gemm_op_a8w8 import (
+        batched_gemm_a8w8_mxscale_bpreshuffle,
+    )
+except ImportError:
+    # Added by ROCm/aiter#5041. Keep other architectures importable while
+    # ATOM and AITER changes roll out independently.
+    batched_gemm_a8w8_mxscale_bpreshuffle = None
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -98,7 +106,7 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
-from atom.model_ops.utils import atom_parameter
+from atom.model_ops.utils import atom_parameter, shuffle_weights
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -2565,14 +2573,13 @@ class DeepseekV4Attention(nn.Module):
         # Cached at construction (non-compiled) so `_attn_post` — now traced into
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
-        # gfx1250-only; ATOM_WO_A_USE_FLYDSL=1 selects flydsl a8w4 wo_a GEMM.
+        # gfx1250-only; ATOM_WO_A_USE_FLYDSL=1 selects the FlyDSL A8W8 wo_a BMM.
         self._use_flydsl_wo_a = self._is_gfx1250 and envs.ATOM_WO_A_USE_FLYDSL
-        self.wo_a_fp4 = None  # [B, N//16, (K//2)*16] uint8 MXFP4 codes (shuffled)
-        self.wo_a_wscale = None  # [B, N//32, (K//32)*32] uint8 e8m0 n32k4
         self._is_gfx950 = get_gfx() == "gfx950"
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
         self._wo_a_mxscale = False
+        self._wo_a_mxscale_bpreshuffle = False
         self._wo_a_fp8_dtype: torch.dtype | None = None
         self._wo_a_w_fp8: torch.Tensor | None = None
         self._wo_a_w_scale: torch.Tensor | None = None
@@ -2683,6 +2690,8 @@ class DeepseekV4Attention(nn.Module):
 
         * gfx950 + 128-aligned shape: keep wo_a FP8 and cache the uint8 e8m0
           [G, N/128, K/128] block scale for `batched_gemm_a8w8_mxscale`.
+        * opted-in gfx1250 + same shape: preshuffle the FP8 weight for
+          `batched_gemm_a8w8_mxscale_bpreshuffle`.
         * otherwise: dequant to BF16 for the grouped LoRA einsum
           (`sgd,grd->sgr`) / `batched_gemm_bf16` — aiter has no FP8 grouped
           einsum.
@@ -2693,13 +2702,12 @@ class DeepseekV4Attention(nn.Module):
 
         w = self.wo_a.weight
         if w.dtype == torch.bfloat16:
-            self._maybe_build_wo_a_a8w4(w.data)
             return  # already dequanted
         scale = getattr(self.wo_a, "weight_scale", None)
         if w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) or scale is None:
             return  # nothing to do
 
-        # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950) --------------------
+        # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950 / gfx1250) ---------
         # The 128x128 weight block scale and per-128 activation groups need
         # N % 128 == 0 and K % 128 == 0; anything else falls through to BF16,
         # as does a block scale with no exact e8m0 form.
@@ -2707,8 +2715,9 @@ class DeepseekV4Attention(nn.Module):
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
         w_scale = None
+        use_mxscale = self._is_gfx950 or self._use_flydsl_wo_a
         if (
-            self._is_gfx950
+            use_mxscale
             and out_dim == G * N
             and N % 128 == 0
             and K % 128 == 0
@@ -2719,23 +2728,36 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
+            self._wo_a_mxscale_bpreshuffle = self._use_flydsl_wo_a
+            if self._wo_a_mxscale_bpreshuffle:
+                if batched_gemm_a8w8_mxscale_bpreshuffle is None:
+                    raise RuntimeError(
+                        "gfx1250 FP8 wo_a BMM requires an AITER build containing "
+                        "ROCm/aiter#5041"
+                    )
+                # The A8W8 FlyDSL BMM expects a 16x16 preshuffled weight. Its
+                # block scale remains in [G, N/128, K/128] e8m0 layout.
+                shuffle_weights(w, layout=(16, 16))
             # Cached as module attrs so the forward skips the reshape and the
             # scale conversion on every call.
             self._wo_a_w_fp8 = w.data.view(G, N, K)
             self._wo_a_w_scale = w_scale
             self._wo_a_mxscale = True
             if self.layer_id == 0:
+                backend = (
+                    "bpreshuffle FlyDSL" if self._wo_a_mxscale_bpreshuffle else "opus"
+                )
                 logger.info(
-                    "wo_a using fp8 e8m0 mxscale batched GEMM "
-                    "(G=%d, N=%d, K=%d, keeping FP8 weight); "
+                    "wo_a using fp8 e8m0 mxscale batched GEMM (%s, "
+                    "G=%d, N=%d, K=%d, keeping FP8 weight); "
                     "every layer with this shape takes the same path.",
+                    backend,
                     G,
                     N,
                     K,
                 )
             # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
-            # below: the mxscale kernel reads `wo_a.weight` directly and needs
-            # the plain row-major [G*N, K] layout.
+            # below: gfx1250 was preshuffled above; gfx950 needs plain row-major.
             self.wo_a.quant_type = QuantType.No
             self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
             return
@@ -2762,18 +2784,6 @@ class DeepseekV4Attention(nn.Module):
         # subsequent LinearBase post-load a no-op for wo_a.
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
-        self._maybe_build_wo_a_a8w4(bf16)
-
-    def _maybe_build_wo_a_a8w4(self, wo_a_bf16: torch.Tensor) -> None:
-        """Preshuffle wo_a BF16 to flydsl a8w4 layout; no-op if disabled."""
-        if not self._use_flydsl_wo_a:
-            return
-        from aiter.ops.flydsl.batched_gemm_mxfp4 import preshuffle_a8w4_weight_mbn
-
-        w = wo_a_bf16.view(self.n_local_groups, self.o_lora_rank, -1).contiguous()
-        w_codes, w_scales = preshuffle_a8w4_weight_mbn(w.to(torch.bfloat16))
-        self.wo_a_fp4 = w_codes
-        self.wo_a_wscale = w_scales
 
     def maybe_compressors_async(
         self, x, plan, state_slot_in, state_slot_out, block_tables
@@ -2973,35 +2983,11 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """Output inverse RoPE + grouped output LoRA.
 
-        `o` arrives un-inverse-RoPE'd from `_sparse_attention` on all paths. Owning the
-        inverse RoPE here is what lets the flydsl and mxscale branches fuse it into
-        the group-quant, and keeps the attention halves free of wo_a path knowledge.
+        `o` arrives un-inverse-RoPE'd from `_sparse_attention` on all paths.
+        Owning the inverse RoPE here lets the mxscale branches fuse it into
+        group quant and keeps the attention halves free of wo_a path knowledge.
         """
         num_tokens = o.size(0)
-        out_dtype = o.dtype
-        if self._use_flydsl_wo_a and self.wo_a_fp4 is not None:
-            H = self.n_local_heads
-            o = o.view(num_tokens, H, self.head_dim)
-            cos, sin = self.rotary_emb.cos_sin_2d()
-            a_fp8, a_scales = inverse_rope_group_quant(
-                o,
-                positions,
-                cos,
-                sin,
-                self.n_local_groups,
-                quant_group_size=32,
-                scale_layout="n32k4",
-            )
-            y = flydsl_batched_gemm_a8w4_v2(
-                a_fp8,
-                self.wo_a_fp4,
-                a_scales,
-                self.wo_a_wscale,
-                N=self.o_lora_rank,
-                dtype=out_dtype,
-                layout="mbn",
-            )
-            return y.transpose(0, 1).flatten(1)
         if self._wo_a_mxscale:
             # `inverse_rope_group_quant` fuses the output inverse RoPE into the
             # per-token e8m0 group-quant, saving a bf16 round trip. The output
@@ -3017,12 +3003,12 @@ class DeepseekV4Attention(nn.Module):
             x_scale = torch.empty(
                 (num_tokens, G, D // 128), dtype=torch.uint8, device=o.device
             )
-            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            cos, sin = self.rotary_emb.cos_sin_2d()
             inverse_rope_group_quant(
                 o,
                 positions.to(torch.int64),
-                cos.reshape(cos.shape[0], -1),
-                sin.reshape(sin.shape[0], -1),
+                cos,
+                sin,
                 num_groups=G,
                 quant_group_size=128,
                 # Row-major [S, G, Ks], which is how `x_scale` is allocated
@@ -3035,13 +3021,23 @@ class DeepseekV4Attention(nn.Module):
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
             # flatten below is a free view.
-            y = batched_gemm_a8w8_mxscale(
-                x_fp8,
-                self._wo_a_w_fp8,
-                x_scale,
-                self._wo_a_w_scale,
-                dtype=o.dtype,
-            )
+            if self._wo_a_mxscale_bpreshuffle:
+                assert batched_gemm_a8w8_mxscale_bpreshuffle is not None
+                y = batched_gemm_a8w8_mxscale_bpreshuffle(
+                    x_fp8,
+                    self._wo_a_w_fp8,
+                    x_scale,
+                    self._wo_a_w_scale,
+                    dtype=o.dtype,
+                )
+            else:
+                y = batched_gemm_a8w8_mxscale(
+                    x_fp8,
+                    self._wo_a_w_fp8,
+                    x_scale,
+                    self._wo_a_w_scale,
+                    dtype=o.dtype,
+                )
             # Flattened here, like both BF16 branches below: wo_b takes
             # [M, G * o_lora_rank]. Handing it the 3-D tensor instead makes aiter
             # read (M, K) off the first two dims, so K comes out as the group
