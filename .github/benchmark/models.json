@@ -88,19 +88,19 @@
         "kv_cache_dtype": "fp8",
         "extra_args": "--index_cache_dtype fp4 --no-enable_prefix_caching --enable-dp-attention --enable-expert-parallel --eplb-enable --moe-backend mega"
       },
+      "scenarios": [
+        {
+          "isl": 8192,
+          "osl": 1024,
+          "concurrency": [512, 4096],
+          "random_range_ratio": 0.8
+        }
+      ],
       "variants": [
         {
           "label": "MegaMoE",
           "suffix": "-mega",
           "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
-          "scenarios": [
-            {
-              "isl": 8192,
-              "osl": 1024,
-              "concurrency": [512],
-              "random_range_ratio": 0.8
-            }
-          ],
           "conc_min": 512,
           "conc_max": 512
         },
@@ -109,14 +109,6 @@
           "suffix": "-mega",
           "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 800, \"load_window_size\": 800, \"rebalance_min_balancedness\": 2.0}'",
           "bench_args": "--num-prompts 20480 --num-warmups 256",
-          "scenarios": [
-            {
-              "isl": 8192,
-              "osl": 1024,
-              "concurrency": [4096],
-              "random_range_ratio": 0.8
-            }
-          ],
           "conc_min": 4096,
           "conc_max": 4096
         }
