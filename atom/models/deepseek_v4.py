@@ -2573,7 +2573,7 @@ class DeepseekV4Attention(nn.Module):
         # Cached at construction (non-compiled) so `_attn_post` — now traced into
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
-        # gfx1250-only; ATOM_WO_A_USE_FLYDSL=1 selects the FlyDSL A8W8 wo_a BMM.
+        # gfx1250 defaults to FlyDSL A8W8; ATOM_WO_A_USE_FLYDSL=0 disables it.
         self._use_flydsl_wo_a = self._is_gfx1250 and envs.ATOM_WO_A_USE_FLYDSL
         self._is_gfx950 = get_gfx() == "gfx950"
         # Flipped by process_weights_after_loading when wo_a is eligible for the
