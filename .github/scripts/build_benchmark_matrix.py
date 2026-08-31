@@ -8,9 +8,9 @@ concurrency list; see ``catalog.build_cell_configs``) to ``$GITHUB_OUTPUT`` as
 
 Behaviour by event:
 - ``schedule``      -> all models, catalog ``default_scenarios`` (nightly grid).
-- ``workflow_dispatch`` -> only models whose checkbox is ticked. Workload from
-  the ``param_lists`` input when set; empty/unset uses each model's catalog
-  scenarios (same as nightly). Also validates dispatch checkboxes vs prefixes.
+- ``workflow_dispatch`` -> only models whose checkbox is ticked, workload from
+  the ``param_lists`` input. Also validates that the dispatch model checkboxes
+  stay in sync with the catalog prefixes (fails fast on drift).
 
 This replaces the former inline Python in the ``parse-param-lists`` and
 ``load-models`` jobs so the logic is testable (see tests/ci/).
@@ -31,6 +31,7 @@ from catalog import (  # noqa: E402
 )
 
 CATALOG = ".github/benchmark/models.json"
+DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
 
 # workflow_dispatch inputs that are NOT model toggles.
 RESERVED_INPUTS = {
@@ -79,14 +80,7 @@ def main() -> int:
             )
             return 1
         model_filter = {k for k in model_keys if inputs.get(k)}
-        raw_param_lists = inputs.get("param_lists")
-        # Empty/unset -> catalog scenarios (needed for models with custom
-        # scenario grids, e.g. 8k1k-only bands outside default_scenarios).
-        param_lists = (
-            None
-            if raw_param_lists is None or str(raw_param_lists).strip() == ""
-            else raw_param_lists
-        )
+        param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
 
     configs = build_cell_configs(
         CATALOG, param_lists=param_lists, model_filter=model_filter
