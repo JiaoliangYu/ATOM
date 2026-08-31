@@ -462,12 +462,11 @@ if [ "$TYPE" == "benchmark" ]; then
   set +m
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
-  # 8k/1k high-concurrency runs can sit in client-only prepare/encode for many
-  # minutes with no engine output yet. STUCK_POLLS × POLL_SEC is the no-progress
-  # hang window (default 60 × 10s = 10 min) while the benchmark client is still
-  # alive. Fault signatures are still detected immediately by wait_infer_drain.sh.
+  # Per-model overrides: ATOM_BENCHMARK_STUCK_POLLS, ATOM_BENCHMARK_MAX_MINUTES.
+  # Default stuck window is 18 × POLL_SEC (3 min); long-running cases (e.g.
+  # 8k/1k high concurrency) set ATOM_BENCHMARK_STUCK_POLLS in models.json.
   benchmark_max_minutes=${ATOM_BENCHMARK_MAX_MINUTES:-120}
-  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-60}
+  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-18}
   bash scripts/wait_infer_drain.sh \
     ${ATOM_SERVER_PORT} "$benchmark_max_minutes" 10 \
     "$ATOM_CLIENT_LOG" "$benchmark_stuck_polls"
