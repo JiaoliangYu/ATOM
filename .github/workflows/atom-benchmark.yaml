@@ -83,13 +83,13 @@ on:
         default: false
       param_lists:
         description: |
-          "Benchmark parameter lists. 
-          Input as a single or multiple sets (comma-separated, semicolon between sets), 
-          format: input_length,output_length,concurrency,random_range_ratio.
-          Example (single set): 1024,1024,128,0.8
-          Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
+          Benchmark parameter lists. Leave empty to use each model's catalog
+          scenarios (recommended for nightly-style or custom-grid models).
+          Format: input_length,output_length,concurrency,random_range_ratio.
+          Single set: 1024,1024,128,0.8
+          Multiple sets: 1024,1024,128,0.8;2048,1024,256,0.7
         type: string
-        default: "1024,1024,128,0.8"
+        default: ""
       atom_commit:
         description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
         type: string

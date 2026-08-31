@@ -175,6 +175,17 @@ def test_model_filter():
     assert {c["prefix"] for c in cells} == {"glm-5-2-fp8"}
 
 
+def test_eplb_catalog_scenarios_without_param_lists():
+    """Custom model scenarios must work on dispatch when param_lists is empty."""
+    cells = catalog.build_cells(
+        CATALOG, param_lists=None, model_filter={"deepseek-v4-pro-eplb"}
+    )
+    assert sorted((c["isl"], c["osl"], c["conc"]) for c in cells) == [
+        (8192, 1024, 512),
+        (8192, 1024, 4096),
+    ]
+
+
 def test_validate_dispatch_inputs_in_sync_and_drift():
     prefixes = {m["prefix"] for m in catalog._load_catalog(CATALOG)["models"]}
     assert catalog.validate_dispatch_inputs(CATALOG, prefixes) == []
