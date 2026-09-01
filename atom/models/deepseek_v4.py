@@ -41,14 +41,10 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
-
-try:
-    from aiter.ops.batched_gemm_op_a8w8 import (
-        batched_gemm_a8w8_mxscale_bpreshuffle,
-    )
-except ImportError:
-    batched_gemm_a8w8_mxscale_bpreshuffle = None
+from aiter.ops.batched_gemm_op_a8w8 import (
+    batched_gemm_a8w8_mxscale,
+    batched_gemm_a8w8_mxscale_bpreshuffle,
+)
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -2572,6 +2568,7 @@ class DeepseekV4Attention(nn.Module):
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
         self._is_gfx950 = get_gfx() == "gfx950"
+        self._is_preshuffle = self._is_gfx1250
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
         self._wo_a_mxscale = False
@@ -2710,7 +2707,7 @@ class DeepseekV4Attention(nn.Module):
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
         w_scale = None
-        use_mxscale = self._is_gfx950 or self._is_gfx1250
+        use_mxscale = self._is_gfx950 or self._is_preshuffle
         if (
             use_mxscale
             and out_dim == G * N
@@ -2723,12 +2720,7 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
-            if self._is_gfx1250:
-                if batched_gemm_a8w8_mxscale_bpreshuffle is None:
-                    raise RuntimeError(
-                        "gfx1250 FP8 wo_a BMM requires an AITER build containing "
-                        "ROCm/aiter#5041"
-                    )
+            if self._is_preshuffle:
                 # The A8W8 BMM expects a 16x16 preshuffled weight. Its
                 # block scale remains in [G, N/128, K/128] e8m0 layout.
                 shuffle_weights(w, layout=(16, 16))
@@ -2742,7 +2734,7 @@ class DeepseekV4Attention(nn.Module):
                     "wo_a using fp8 e8m0 mxscale batched GEMM (preshuffle=%s, "
                     "G=%d, N=%d, K=%d, keeping FP8 weight); "
                     "every layer with this shape takes the same path.",
-                    self._is_gfx1250,
+                    self._is_preshuffle,
                     G,
                     N,
                     K,
@@ -3014,10 +3006,9 @@ class DeepseekV4Attention(nn.Module):
             # flatten below is a free view.
             bmm = (
                 batched_gemm_a8w8_mxscale_bpreshuffle
-                if self._is_gfx1250
+                if self._is_preshuffle
                 else batched_gemm_a8w8_mxscale
             )
-            assert bmm is not None
             y = bmm(
                 x_fp8,
                 self._wo_a_w_fp8,
