@@ -13,7 +13,6 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_BASE_PORT",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
-    "ATOM_WO_A_USE_FLYDSL",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
@@ -70,9 +69,6 @@ class TestEnvsDefaults:
 
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
-
-    def test_wo_a_use_flydsl_default_enabled(self):
-        assert _get_envs().ATOM_WO_A_USE_FLYDSL is True
 
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
@@ -157,10 +153,6 @@ class TestEnvsOverrides:
     def test_online_quant_streaming_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
         assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is True
-
-    def test_wo_a_use_flydsl_disabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_WO_A_USE_FLYDSL", "0")
-        assert _get_envs().ATOM_WO_A_USE_FLYDSL is False
 
     def test_disable_vllm_plugin_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")

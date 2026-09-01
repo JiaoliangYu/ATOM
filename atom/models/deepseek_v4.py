@@ -2571,8 +2571,6 @@ class DeepseekV4Attention(nn.Module):
         # Cached at construction (non-compiled) so `_attn_post` — now traced into
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
-        # gfx1250 defaults to FlyDSL A8W8; ATOM_WO_A_USE_FLYDSL=0 disables it.
-        self._use_flydsl_wo_a = self._is_gfx1250 and envs.ATOM_WO_A_USE_FLYDSL
         self._is_gfx950 = get_gfx() == "gfx950"
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
@@ -2688,7 +2686,7 @@ class DeepseekV4Attention(nn.Module):
 
         * gfx950 + 128-aligned shape: keep wo_a FP8 and cache the uint8 e8m0
           [G, N/128, K/128] block scale for `batched_gemm_a8w8_mxscale`.
-        * opted-in gfx1250 + same shape: preshuffle the FP8 weight for
+        * gfx1250 + same shape: preshuffle the FP8 weight for
           `batched_gemm_a8w8_mxscale_bpreshuffle`.
         * otherwise: dequant to BF16 for the grouped LoRA einsum
           (`sgd,grd->sgr`) / `batched_gemm_bf16` — aiter has no FP8 grouped
@@ -2713,7 +2711,7 @@ class DeepseekV4Attention(nn.Module):
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
         w_scale = None
-        use_mxscale = self._is_gfx950 or self._use_flydsl_wo_a
+        use_mxscale = self._is_gfx950 or self._is_gfx1250
         if (
             use_mxscale
             and out_dim == G * N
@@ -2726,7 +2724,7 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
-            self._wo_a_mxscale_bpreshuffle = self._use_flydsl_wo_a
+            self._wo_a_mxscale_bpreshuffle = self._is_gfx1250
             if self._wo_a_mxscale_bpreshuffle:
                 if batched_gemm_a8w8_mxscale_bpreshuffle is None:
                     raise RuntimeError(

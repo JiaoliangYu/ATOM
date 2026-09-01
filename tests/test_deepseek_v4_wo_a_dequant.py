@@ -99,7 +99,7 @@ class _FakeAttention:
         self.n_local_groups = 2
         self.o_lora_rank = 128
         self._is_gfx950 = False
-        self._use_flydsl_wo_a = False
+        self._is_gfx1250 = False
 
     def __getattr__(self, name):
         raise AttributeError(
