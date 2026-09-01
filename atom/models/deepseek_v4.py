@@ -2723,8 +2723,7 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
-            preshuffle = self._is_gfx1250
-            if preshuffle:
+            if self._is_gfx1250:
                 if batched_gemm_a8w8_mxscale_bpreshuffle is None:
                     raise RuntimeError(
                         "gfx1250 FP8 wo_a BMM requires an AITER build containing "
@@ -2743,7 +2742,7 @@ class DeepseekV4Attention(nn.Module):
                     "wo_a using fp8 e8m0 mxscale batched GEMM (preshuffle=%s, "
                     "G=%d, N=%d, K=%d, keeping FP8 weight); "
                     "every layer with this shape takes the same path.",
-                    preshuffle,
+                    self._is_gfx1250,
                     G,
                     N,
                     K,
@@ -3013,10 +3012,9 @@ class DeepseekV4Attention(nn.Module):
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
             # flatten below is a free view.
-            preshuffle = self._is_gfx1250
             bmm = (
                 batched_gemm_a8w8_mxscale_bpreshuffle
-                if preshuffle
+                if self._is_gfx1250
                 else batched_gemm_a8w8_mxscale
             )
             assert bmm is not None
