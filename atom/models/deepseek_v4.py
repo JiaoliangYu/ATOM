@@ -48,8 +48,6 @@ try:
         batched_gemm_a8w8_mxscale_bpreshuffle,
     )
 except ImportError:
-    # Added by ROCm/aiter#5041. Keep other architectures importable while
-    # ATOM and AITER changes roll out independently.
     batched_gemm_a8w8_mxscale_bpreshuffle = None
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
