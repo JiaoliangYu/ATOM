@@ -2723,13 +2723,14 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
-            if self._is_gfx1250:
+            preshuffle = self._is_gfx1250
+            if preshuffle:
                 if batched_gemm_a8w8_mxscale_bpreshuffle is None:
                     raise RuntimeError(
                         "gfx1250 FP8 wo_a BMM requires an AITER build containing "
                         "ROCm/aiter#5041"
                     )
-                # The A8W8 FlyDSL BMM expects a 16x16 preshuffled weight. Its
+                # The A8W8 BMM expects a 16x16 preshuffled weight. Its
                 # block scale remains in [G, N/128, K/128] e8m0 layout.
                 shuffle_weights(w, layout=(16, 16))
             # Cached as module attrs so the forward skips the reshape and the
@@ -2738,12 +2739,11 @@ class DeepseekV4Attention(nn.Module):
             self._wo_a_w_scale = w_scale
             self._wo_a_mxscale = True
             if self.layer_id == 0:
-                backend = "bpreshuffle FlyDSL" if self._is_gfx1250 else "opus"
                 logger.info(
-                    "wo_a using fp8 e8m0 mxscale batched GEMM (%s, "
+                    "wo_a using fp8 e8m0 mxscale batched GEMM (preshuffle=%s, "
                     "G=%d, N=%d, K=%d, keeping FP8 weight); "
                     "every layer with this shape takes the same path.",
-                    backend,
+                    preshuffle,
                     G,
                     N,
                     K,
@@ -3013,23 +3013,20 @@ class DeepseekV4Attention(nn.Module):
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
             # flatten below is a free view.
-            if self._is_gfx1250:
-                assert batched_gemm_a8w8_mxscale_bpreshuffle is not None
-                y = batched_gemm_a8w8_mxscale_bpreshuffle(
-                    x_fp8,
-                    self._wo_a_w_fp8,
-                    x_scale,
-                    self._wo_a_w_scale,
-                    dtype=o.dtype,
-                )
-            else:
-                y = batched_gemm_a8w8_mxscale(
-                    x_fp8,
-                    self._wo_a_w_fp8,
-                    x_scale,
-                    self._wo_a_w_scale,
-                    dtype=o.dtype,
-                )
+            preshuffle = self._is_gfx1250
+            bmm = (
+                batched_gemm_a8w8_mxscale_bpreshuffle
+                if preshuffle
+                else batched_gemm_a8w8_mxscale
+            )
+            assert bmm is not None
+            y = bmm(
+                x_fp8,
+                self._wo_a_w_fp8,
+                x_scale,
+                self._wo_a_w_scale,
+                dtype=o.dtype,
+            )
             # Flattened here, like both BF16 branches below: wo_b takes
             # [M, G * o_lora_rank]. Handing it the 3-D tensor instead makes aiter
             # read (M, K) off the first two dims, so K comes out as the group
