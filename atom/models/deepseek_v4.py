@@ -2575,7 +2575,6 @@ class DeepseekV4Attention(nn.Module):
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
         self._wo_a_mxscale = False
-        self._wo_a_mxscale_bpreshuffle = False
         self._wo_a_fp8_dtype: torch.dtype | None = None
         self._wo_a_w_fp8: torch.Tensor | None = None
         self._wo_a_w_scale: torch.Tensor | None = None
@@ -2724,8 +2723,7 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
-            self._wo_a_mxscale_bpreshuffle = self._is_gfx1250
-            if self._wo_a_mxscale_bpreshuffle:
+            if self._is_gfx1250:
                 if batched_gemm_a8w8_mxscale_bpreshuffle is None:
                     raise RuntimeError(
                         "gfx1250 FP8 wo_a BMM requires an AITER build containing "
@@ -2740,9 +2738,7 @@ class DeepseekV4Attention(nn.Module):
             self._wo_a_w_scale = w_scale
             self._wo_a_mxscale = True
             if self.layer_id == 0:
-                backend = (
-                    "bpreshuffle FlyDSL" if self._wo_a_mxscale_bpreshuffle else "opus"
-                )
+                backend = "bpreshuffle FlyDSL" if self._is_gfx1250 else "opus"
                 logger.info(
                     "wo_a using fp8 e8m0 mxscale batched GEMM (%s, "
                     "G=%d, N=%d, K=%d, keeping FP8 weight); "
@@ -3017,7 +3013,7 @@ class DeepseekV4Attention(nn.Module):
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
             # flatten below is a free view.
-            if self._wo_a_mxscale_bpreshuffle:
+            if self._is_gfx1250:
                 assert batched_gemm_a8w8_mxscale_bpreshuffle is not None
                 y = batched_gemm_a8w8_mxscale_bpreshuffle(
                     x_fp8,
