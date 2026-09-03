@@ -2568,7 +2568,7 @@ class DeepseekV4Attention(nn.Module):
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
         self._is_gfx950 = get_gfx() == "gfx950"
-        self._is_preshuffle = self._is_gfx1250
+        self._is_preshuffle = self._is_gfx1250 # TODO: gfx950 will support preshuffle in the future
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
         self._wo_a_mxscale = False
@@ -2707,7 +2707,7 @@ class DeepseekV4Attention(nn.Module):
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
         w_scale = None
-        use_mxscale = self._is_gfx950 or self._is_preshuffle
+        use_mxscale = self._is_gfx950 or self._is_gfx1250
         if (
             use_mxscale
             and out_dim == G * N
