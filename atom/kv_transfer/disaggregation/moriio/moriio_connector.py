@@ -22,6 +22,7 @@ import msgpack
 import msgspec
 import numpy as np
 import zmq
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
@@ -29,12 +30,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+    _MORIIO_AVAILABLE,
     MoRIIOAgentMetadata,
     MoRIIOConstants,
-    _MORIIO_AVAILABLE,
     get_port_offset,
 )
-from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -43,6 +43,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqMeta,
     TransferId,
 )
+from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
     get_open_port,
@@ -50,7 +51,6 @@ from atom.utils import (
     zmq_socket_ctx,
 )
 from atom.utils.network import get_ip
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 if _MORIIO_AVAILABLE:
     from mori.io import (
@@ -90,14 +90,11 @@ class MoRIIOConnector(KVConnectorBase):
 
         kv_transfer_config = config.kv_transfer_config
         self.local_ip = get_ip()
-        self._local_ping_port = get_open_port()
 
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.http_port = kv_transfer_config.get("http_port", 8000)
-        self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
-        self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
@@ -187,17 +184,12 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
-        # Start service-discovery ping (only on rank 0)
-        if self.tp_rank == 0 and self.dp_rank == 0:
-            self._ping_thread = threading.Thread(
-                target=self._service_discovery_ping,
-                args=(self.zmq_context,),
-                daemon=True,
-                name="kv-connector-ping",
-            )
-            self._ping_thread.start()
-
-    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
+    ) -> None:
         """Register all KV cache tensors for RDMA and start the handshake listener.
 
         Must be called after model loading and KV cache allocation, before any
@@ -636,67 +628,6 @@ class MoRIIOConnector(KVConnectorBase):
             notify_port,
         )
 
-    def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
-        """Periodically register with the proxy for service discovery (rank 0 only)."""
-        http_endpoint = f"http://{self.request_address}/v1/completions"
-        role_code = "P" if self.is_producer else "D"
-        retry_count = 0
-        msg_index = 1
-        proxy_path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
-
-        with zmq_context.socket(zmq.DEALER) as sock:
-            sock.connect(proxy_path)
-
-            while True:
-                try:
-                    registration_data = {
-                        "type": "register",
-                        "role": role_code,
-                        "index": str(msg_index),
-                        "request_address": http_endpoint,
-                        "handshake_port": self.base_handshake_port,
-                        "dp_size": self.dp_size,
-                        "tp_size": self.tp_size,
-                        "transfer_mode": "read",
-                    }
-                    sock.send(msgpack.dumps(registration_data))
-                    logger.debug(
-                        "Ping #%d sent to %s (role=%s)",
-                        msg_index,
-                        proxy_path,
-                        role_code,
-                    )
-                    retry_count = 0
-
-                except ConnectionRefusedError:
-                    logger.info(
-                        "Proxy connection refused: %s:%s -> %s",
-                        self.local_ip,
-                        self._local_ping_port,
-                        proxy_path,
-                    )
-                    retry_count += 1
-
-                except OSError as e:
-                    logger.info("OS error during ping: %s", e)
-                    retry_count += 1
-
-                except Exception as e:
-                    logger.info("Unexpected ping error: %s", e)
-                    retry_count += 1
-                    if retry_count >= MoRIIOConstants.MAX_PING_RETRIES:
-                        logger.error(
-                            "Ping failed after %d retries, aborting",
-                            MoRIIOConstants.MAX_PING_RETRIES,
-                        )
-                        raise RuntimeError(
-                            f"Service discovery ping failed after {retry_count} retries"
-                        ) from e
-
-                finally:
-                    time.sleep(MoRIIOConstants.PING_INTERVAL_SECONDS)
-                    msg_index += 1
-
     def _handshake_listener(
         self,
         metadata: MoRIIOAgentMetadata,
@@ -728,7 +659,7 @@ class MoRIIOConnector(KVConnectorBase):
                 if msg == MoRIIOConstants.GET_META_MSG:
                     # Phase 1: send engine metadata
                     sock.send_multipart((identity, b"", encoded_data))
-                    logger.info("Handshake: sent engine metadata to peer")
+                    logger.debug("Handshake: sent engine metadata to peer")
                     # Phase 2: send per-layer KV cache metadata
                     buf = msgpack.dumps(layer_name_to_local_kv_cache_metadata)
                     sock.send_multipart((identity, b"", buf))
@@ -838,7 +769,7 @@ class MoRIIOConnector(KVConnectorBase):
         thread safety).  Once all complete, the request is placed on
         ``_ready_requests`` for RDMA reads.
         """
-        logger.info(
+        logger.debug(
             "Initiating background handshake for req %s -> %s",
             req_id,
             remote_engine_id,
@@ -850,7 +781,7 @@ class MoRIIOConnector(KVConnectorBase):
         remote_dp_size = int(meta.remote_dp_size)
 
         def _on_all_done(_f: Future[Any], entry=(req_id, meta)):
-            logger.info("All handshakes completed for req %s", req_id)
+            logger.debug("All handshakes completed for req %s", req_id)
             self._ready_requests.put(entry)
             self.load_ready_flag[remote_engine_id] = True
             self.write_ready_flags[remote_engine_id] = True
@@ -1028,7 +959,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, seq.block_table)
+            self._reqs_need_recv[seq.id] = (seq, list(seq.block_table))
             params["do_remote_prefill"] = False
             logger.debug(
                 "Queued req %s for remote KV loading (%d blocks)",
@@ -1052,7 +983,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": seq.block_table.copy(),
+            "remote_block_ids": list(seq.block_table),
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
@@ -1062,6 +993,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
+            "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 
         # Clean up transfer ID mapping on the consumer side

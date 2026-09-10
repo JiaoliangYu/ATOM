@@ -47,8 +47,10 @@ Three public entry points keep every consumer in sync:
 - `load_variants(path)`  -> flat per-variant dicts (server args, suffix, ...).
   Used by the dashboard display-name map and regression rerun.
 - `build_cells(path, ...)` -> fully-expanded benchmark cells (variant x scenario
-  x concurrency). Each cell self-describes one server+benchmark run and is the
-  single matrix dimension the GPU `benchmark` job iterates.
+  x concurrency). Each cell self-describes one server+benchmark run.
+- `build_cell_configs(path, ...)` -> cells regrouped by (variant x scenario) into
+  the first-level matrix configs the GPU `benchmark` job iterates; each config
+  carries a concurrency list the reusable template fans out over.
 - `validate_dispatch_inputs(path, keys)` -> assert the workflow_dispatch model
   checkboxes stay in sync with the catalog prefixes.
 """
@@ -65,6 +67,9 @@ from typing import Any
 DEFAULT_CONC_MAX = 256
 DEFAULT_CONC_MIN = 0
 DEFAULT_RATIO = 0.8
+# How often a scenario runs. Untagged means nightly, so adding a scenario keeps
+# the old behaviour and only an explicit tag moves it off the nightly grid.
+DEFAULT_CADENCE = "nightly"
 
 
 def _load_catalog(path: str | Path) -> dict[str, Any]:
@@ -98,6 +103,12 @@ def build_args(config: dict[str, Any], variant: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def build_env_vars(model: dict[str, Any], variant: dict[str, Any]) -> str:
+    """Compose model- and variant-level environment variables."""
+    parts = [p for p in (model.get("env_vars", ""), variant.get("env_vars", "")) if p]
+    return "\n".join(parts)
+
+
 def _iter_variants(catalog: dict[str, Any]):
     """Yield (model, variant) pairs, defaulting to a single base variant."""
     for model in catalog["models"]:
@@ -110,13 +121,16 @@ def _variant_record(model: dict[str, Any], variant: dict[str, Any]) -> dict[str,
     label = variant.get("label", "")
     return {
         "display": model["display"] + (f" {label}" if label else ""),
-        "path": model["path"],
+        # A variant may point at a different checkpoint (e.g. a spec-decode
+        # draft baked into a separate repo) while still sharing the parent
+        # model's dispatch checkbox / prefix. Falls back to the model path.
+        "path": variant.get("path", model["path"]),
         "prefix": model["prefix"],
         "args": build_args(model.get("config", {}), variant),
         "bench_args": variant.get("bench_args", ""),
         "suffix": variant.get("suffix", ""),
         "runner": model["runner"],
-        "env_vars": model.get("env_vars", ""),
+        "env_vars": build_env_vars(model, variant),
         "conc_min": variant.get("conc_min", DEFAULT_CONC_MIN),
         "conc_max": variant.get("conc_max", DEFAULT_CONC_MAX),
     }
@@ -132,13 +146,22 @@ def _resolve_scenarios(
     model: dict[str, Any],
     variant: dict[str, Any],
     default_scenarios: list[dict[str, Any]],
+    cadence: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Pick the scenario list for a variant and filter it by its conc band."""
+    """Pick the scenario list for a variant, filtered by cadence and conc band.
+
+    `cadence` None keeps every scenario (what a dispatch and the tests want);
+    a value keeps only scenarios carrying it, with untagged ones reading as
+    `DEFAULT_CADENCE`. A model's or variant's own `scenarios` are filtered the
+    same way, so an override is nightly unless it says otherwise.
+    """
     scenarios = variant.get("scenarios") or model.get("scenarios") or default_scenarios
     cmin = variant.get("conc_min", DEFAULT_CONC_MIN)
     cmax = variant.get("conc_max", DEFAULT_CONC_MAX)
     resolved: list[dict[str, Any]] = []
     for sc in scenarios:
+        if cadence is not None and sc.get("cadence", DEFAULT_CADENCE) != cadence:
+            continue
         concs = [c for c in sc["concurrency"] if cmin <= c <= cmax]
         if concs:
             resolved.append({**sc, "concurrency": concs})
@@ -184,6 +207,7 @@ def build_cells(
     path: str | Path,
     param_lists: str | None = None,
     model_filter: set[str] | None = None,
+    cadence: str | None = None,
 ) -> list[dict[str, Any]]:
     """Expand the catalog into fully-resolved benchmark cells.
 
@@ -207,7 +231,9 @@ def build_cells(
                 param_lists, rec["conc_min"], rec["conc_max"]
             )
         else:
-            scenarios = _resolve_scenarios(model, variant, default_scenarios)
+            scenarios = _resolve_scenarios(
+                model, variant, default_scenarios, cadence=cadence
+            )
         for sc in scenarios:
             ratio = sc.get("random_range_ratio", DEFAULT_RATIO)
             ratio_str = _fmt_ratio(ratio)
@@ -233,6 +259,90 @@ def build_cells(
                     }
                 )
     return cells
+
+
+def scenario_tag(isl: int, osl: int) -> str:
+    """Short scenario key for an (isl, osl) pair, e.g. 1024/1024 -> ``1k1k``.
+
+    Falls back to ``<isl>_<osl>`` for lengths that are not whole 1024 multiples
+    so the tag stays unambiguous.
+    """
+
+    def _fmt(n: int) -> str:
+        return f"{n // 1024}k"
+
+    if isl >= 1024 and osl >= 1024 and isl % 1024 == 0 and osl % 1024 == 0:
+        return f"{_fmt(isl)}{_fmt(osl)}"
+    return f"{isl}_{osl}"
+
+
+def build_cell_configs(
+    path: str | Path,
+    param_lists: str | None = None,
+    model_filter: set[str] | None = None,
+    cadence: str | None = None,
+) -> list[dict[str, Any]]:
+    """Group cells into first-level matrix configs: one per (variant, scenario).
+
+    A single GitHub Actions matrix tops out at 256 entries, which one-job-per-cell
+    overflows once the catalog passes 256 cells. Instead the workflow drives a
+    two-level fan-out (mirrors InferenceX run-sweep): the top ``benchmark`` job
+    matrixes over these configs (model variant × scenario), and the reusable
+    ``benchmark-tmpl.yml`` it calls matrixes over each config's ``concurrency``
+    list. Both matrices stay far below 256 while every (cell = config × conc)
+    still runs as its own parallel job.
+
+    Each config carries the per-server-launch fields plus the scenario shape and
+    a JSON-encoded ``concurrency`` list (the second-level matrix). ``result_filename``
+    is rebuilt per concurrency inside the template from
+    ``{prefix}{suffix}-{isl}-{osl}-{conc}-{ratio_str}`` (unchanged naming contract).
+    """
+    cells = build_cells(
+        path,
+        param_lists=param_lists,
+        model_filter=model_filter,
+        cadence=cadence,
+    )
+
+    configs: dict[tuple, dict[str, Any]] = {}
+    for c in cells:
+        key = (
+            c["prefix"],
+            c["suffix"],
+            c["model_path"],
+            c["server_args"],
+            c["env_vars"],
+            c["isl"],
+            c["osl"],
+            c["ratio"],
+        )
+        cfg = configs.get(key)
+        if cfg is None:
+            cfg = {
+                "display": c["display"],
+                "prefix": c["prefix"],
+                "suffix": c["suffix"],
+                "model_path": c["model_path"],
+                "server_args": c["server_args"],
+                "bench_args": c["bench_args"],
+                "env_vars": c["env_vars"],
+                "runner": c["runner"],
+                "isl": c["isl"],
+                "osl": c["osl"],
+                "ratio": c["ratio"],
+                "ratio_str": _fmt_ratio(c["ratio"]),
+                "scenario": scenario_tag(c["isl"], c["osl"]),
+                "_conc": [],
+            }
+            configs[key] = cfg
+        cfg["_conc"].append(c["conc"])
+
+    out: list[dict[str, Any]] = []
+    for cfg in configs.values():
+        conc = sorted(cfg.pop("_conc"))
+        cfg["concurrency"] = json.dumps(conc)
+        out.append(cfg)
+    return out
 
 
 def validate_dispatch_inputs(path: str | Path, input_keys: set[str]) -> list[str]:

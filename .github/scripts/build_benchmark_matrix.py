@@ -2,11 +2,14 @@
 """Compute the benchmark cell matrix for the ATOM Benchmark workflow.
 
 Reads the GitHub event name and workflow_dispatch inputs from the environment
-and emits the fully-expanded list of benchmark cells (see ``catalog.build_cells``)
-to ``$GITHUB_OUTPUT`` as ``cells_json`` plus a ``has_cells`` flag.
+and emits the first-level matrix configs (variant × scenario, each carrying a
+concurrency list; see ``catalog.build_cell_configs``) to ``$GITHUB_OUTPUT`` as
+``configs_json`` plus a ``has_cells`` flag.
 
 Behaviour by event:
-- ``schedule``      -> all models, catalog ``default_scenarios`` (nightly grid).
+- ``schedule``      -> all models, catalog ``default_scenarios`` filtered by
+  ``CADENCE`` (the workflow derives it from which cron fired: the nightly grid,
+  or the weekly one).
 - ``workflow_dispatch`` -> only models whose checkbox is ticked, workload from
   the ``param_lists`` input. Also validates that the dispatch model checkboxes
   stay in sync with the catalog prefixes (fails fast on drift).
@@ -23,7 +26,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catalog import build_cells, load_variants, validate_dispatch_inputs  # noqa: E402
+from catalog import (
+    build_cell_configs,
+    load_variants,
+    validate_dispatch_inputs,
+)
 
 CATALOG = ".github/benchmark/models.json"
 DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
@@ -37,16 +44,21 @@ RESERVED_INPUTS = {
     "enable_rtl",
     "param_lists",
     "atom_commit",
+    "publish_to_dashboard",
 }
 
 
-def _emit(cells: list[dict]) -> None:
-    payload = json.dumps(cells)
+def _emit(configs: list[dict]) -> None:
+    # One entry per first-level matrix config (variant × scenario); each carries
+    # a JSON `concurrency` list the reusable template fans out over. Grouping
+    # keeps both matrix levels far under GitHub's 256-job-per-matrix limit that a
+    # flat per-cell matrix would overflow.
+    payload = json.dumps(configs)
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a", encoding="utf-8") as f:
-            f.write(f"cells_json={payload}\n")
-            f.write(f"has_cells={'true' if cells else 'false'}\n")
+            f.write(f"configs_json={payload}\n")
+            f.write(f"has_cells={'true' if configs else 'false'}\n")
     else:
         print(payload)
 
@@ -54,6 +66,12 @@ def _emit(cells: list[dict]) -> None:
 def main() -> int:
     event = os.environ.get("EVENT_NAME", "")
     inputs = json.loads(os.environ.get("INPUTS_JSON") or "{}")
+
+    # Which slice of `default_scenarios` this run wants. Set by the workflow off
+    # the cron that fired; unset means no filter. Only the schedule path reads
+    # it -- a dispatch always carries `param_lists`, which replaces the catalog
+    # scenarios outright.
+    cadence = os.environ.get("CADENCE") or None
 
     if event == "schedule":
         model_filter = None
@@ -73,13 +91,31 @@ def main() -> int:
         model_filter = {k for k in model_keys if inputs.get(k)}
         param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
 
-    cells = build_cells(CATALOG, param_lists=param_lists, model_filter=model_filter)
-    _emit(cells)
+    configs = build_cell_configs(
+        CATALOG,
+        param_lists=param_lists,
+        model_filter=model_filter,
+        cadence=cadence,
+    )
+    if event == "schedule" and not configs:
+        # A cron that resolves to nothing means the catalog and the workflow's
+        # cadence labels disagree. Fail loudly: `has_cells=false` would skip the
+        # whole run in silence and read as a healthy no-op.
+        print(
+            f"ERROR: no cells for cadence {cadence!r}; the cron in "
+            f"atom-benchmark.yaml and the scenario `cadence` tags in {CATALOG} "
+            "are out of sync.",
+            file=sys.stderr,
+        )
+        return 1
+    _emit(configs)
 
-    n_models = len({c["prefix"] for c in cells})
+    n_cells = sum(len(json.loads(c["concurrency"])) for c in configs)
+    n_models = len({c["prefix"] for c in configs})
     n_total = len(load_variants(CATALOG))
     print(
-        f"Event={event}: {len(cells)} cells across {n_models} models "
+        f"Event={event} cadence={cadence or 'all'}: {n_cells} cells across "
+        f"{n_models} models -> {len(configs)} matrix configs "
         f"({n_total} variants in catalog)",
         file=sys.stderr,
     )

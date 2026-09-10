@@ -181,7 +181,10 @@ impl Router {
             },
             // on_exhausted hook
             || {
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    endpoint,
+                );
             },
         )
         .await;
@@ -256,7 +259,7 @@ impl Router {
             policy_name,
         );
 
-        let load_guard = ["cache_aware", "manual"]
+        let load_guard = ["cache_aware", "manual", "dp_sticky"]
             .contains(&policy_name)
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 

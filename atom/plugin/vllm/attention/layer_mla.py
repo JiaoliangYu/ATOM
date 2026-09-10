@@ -1,16 +1,21 @@
-from typing import Optional
-
 import functools
 import logging
 
 import aiter
 import torch
+import triton
+import triton.language as tl
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
-    batched_gemm_a16wfp4 as _fp4_bmm_module,
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _fp8_bmm_module,
 )
+from aiter.ops.triton import (
+    batched_gemm_a16wfp4 as _fp4_bmm_module,
+)
+from torch import nn
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAAttention, MLAModules
 from atom.model_ops.linear import use_triton_gemm
@@ -23,10 +28,25 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import envs
-from torch import nn
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 logger = logging.getLogger("atom")
+
+
+def _validate_aiter_tp_matches_vllm_dcp(aiter_tp_group, vllm_dcp_group) -> None:
+    aiter_ranks = tuple(aiter_tp_group.ranks)
+    vllm_ranks = tuple(vllm_dcp_group.ranks)
+    groups_match = (
+        aiter_tp_group.world_size == vllm_dcp_group.world_size
+        and aiter_ranks == vllm_ranks
+        and aiter_tp_group.rank_in_group == vllm_dcp_group.rank_in_group
+    )
+    if not groups_match:
+        raise RuntimeError(
+            "Kimi-K3 DCP FULL graph requires identical aiter TP and vLLM "
+            "DCP rank membership/order; got "
+            f"aiter={aiter_ranks}, vllm={vllm_ranks}."
+        )
+
 
 functools_partial = functools.partial
 _aiter_triton_fp8_bmm = (
@@ -35,6 +55,19 @@ _aiter_triton_fp8_bmm = (
 batched_gemm_a16wfp4 = _fp4_bmm_module.batched_gemm_a16wfp4
 fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 fused_gemm_afp4wfp4_preshuffle_split_cat = None
+
+_MLA_PERSISTENT_METADATA_FIELDS = (
+    "work_meta_data",
+    "work_indptr",
+    "work_info_set",
+    "reduce_indptr",
+    "reduce_final_map",
+    "reduce_partial_map",
+)
+
+
+def disabled_mla_persistent_metadata() -> dict[str, None]:
+    return {field: None for field in _MLA_PERSISTENT_METADATA_FIELDS}
 
 
 if use_triton_gemm():
@@ -54,79 +87,79 @@ if use_triton_gemm():
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
 
 
-def reorg_kvcache(
-    allgatered_kv_c_normed: torch.Tensor,
-    allgatered_k_pe: torch.Tensor,
-    padded_local_chunk_seq_lens_lst: list[int],
-    local_context_lens_allranks: list[list[int]],
-    sum_seq_len: int,
-    max_seq_len: int,
-    chunk_size: int,
-    chunk_idx: int,
-    toks: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+# reorg_kvcache lives in atom.model_ops.dcp_ops so both the plugin and the
+# server-mode MLA path share one implementation (server must not import from
+# the plugin/vLLM tree). Re-exported here to keep the original call sites.
+from atom.model_ops.dcp_ops import reorg_kvcache
+
+
+@triton.jit
+def mla_fold_kv_metadata_kernel(
+    paged_kv_indptr_ptr,  # [num_reqs + 1]   int32
+    paged_kv_indices_ptr,  # [>= paged_kv_indptr[-1]]  int32
+    fold_kv_indptr_ptr,  # [num_reqs * FOLD_FACTOR + 1]  int32, entry [0] pre-zeroed
+    fold_kv_indices_ptr,  # [>= FOLD_FACTOR * paged_kv_indptr[-1] + TAIL_PADDING] int32
+    FOLD_FACTOR: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Build folded kv metadata for the MLA nhead -> nhead/FOLD_FACTOR
+    workaround. Each original batch's KV-index segment is replicated
+    FOLD_FACTOR times back-to-back in `fold_kv_indices`, and `fold_kv_indptr`
+    gets the matching expanded indptr.
     """
-    reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
-    e.g.
-    allgatered_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
-                              T0_4, T0_5, pad, pad, T1_2, pad, ...]
-    -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
-                                  T1_0, T1_1, T1_2, ...]
+    orig_batch = tl.program_id(0)
+    fold_idx = tl.program_id(1)
+
+    seq_start = tl.load(paged_kv_indptr_ptr + orig_batch)
+    seq_end = tl.load(paged_kv_indptr_ptr + orig_batch + 1)
+    seq_len = seq_end - seq_start
+
+    # Each (orig_batch, fold_idx) program writes its one indptr entry.
+    # Entry 0 of fold_kv_indptr stays at its pre-init zero.
+    out_indptr_idx = orig_batch * FOLD_FACTOR + fold_idx + 1
+    out_indptr_val = FOLD_FACTOR * seq_start + (fold_idx + 1) * seq_len
+    tl.store(fold_kv_indptr_ptr + out_indptr_idx, out_indptr_val)
+
+    # Copy the KV-index segment for synthetic batch (orig_batch, fold_idx).
+    dst_start = FOLD_FACTOR * seq_start + fold_idx * seq_len
+
+    for offset_start in range(0, seq_len, BLOCK_SIZE):
+        offsets = offset_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < seq_len
+        src = tl.load(paged_kv_indices_ptr + seq_start + offsets, mask=mask)
+        tl.store(fold_kv_indices_ptr + dst_start + offsets, src, mask=mask)
+
+
+def mla_fold_kv_metadata_triton(
+    paged_kv_indptr,
+    paged_kv_indices,
+    fold_kv_indptr,
+    fold_kv_indices,
+    fold_factor,
+    num_reqs,
+):
+    """Populate `fold_kv_indptr` and `fold_kv_indices` in-place for the
+    MLA nhead-fold workaround. All input/output tensors must already be
+    allocated; this kernel only writes.
     Args:
-        padded_local_chunk_seq_lens_lst: local chunk context lengths
-            under current CP rank.
-        local_context_lens_allranks: local context lengths on each CP rank.
-        sum_seq_len: the sum of cp_chunk_seq_lens_lst.
-        max_seq_len: the max value of cp_chunk_seq_lens_lst.
-        chunk_size: the local padded max context chunk from
-            chunked_context_metadata building.
-        chunk_idx: chunk idx of chunked_prefill.
-        toks: the number of tokens for local gather cache.
+        paged_kv_indptr: [num_reqs+1] int32, the original kv indptr.
+        paged_kv_indices: [paged_kv_indptr[-1]] int32, original kv indices.
+        fold_kv_indptr: [num_reqs*fold_factor + 1] int32, output indptr.
+        fold_kv_indices: [fold_factor * paged_kv_indptr[-1]] int32.
+        fold_factor: integer fold factor (e.g. 4 for nhead 32 -> 8).
+        num_reqs: number of decode requests (size of `paged_kv_indptr` - 1).
     """
-    kv_c_segments = []
-    k_pe_segments = []
-    src_token_idx = 0
-    max_seq_len_check = 0
-    for padded_local_chunk_seq_len, local_context_lens in zip(
-        padded_local_chunk_seq_lens_lst, local_context_lens_allranks
-    ):
-        cur_seq_len = 0
-        for rank, local_context_len in enumerate(local_context_lens):
-            # Note(qcs): We split the context into multiple chunks,
-            # depending on the size of the workspace.
-            # local_context in dcp0:   |-----------------|
-            # local_context in dcp1:   |--------------|
-            # n*padded_local_chunk:    |-----|-----|-----|
-            # local_chunk_len in dcp1: |-----|-----|--|
-            # so we need update the last chunk length in dcp1.
-            local_chunk_len = min(
-                max(0, local_context_len - chunk_idx * chunk_size),
-                padded_local_chunk_seq_len,
-            )
-            if local_chunk_len != 0:
-                kv_c_segment = allgatered_kv_c_normed[
-                    rank * toks
-                    + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                k_pe_segment = allgatered_k_pe[
-                    rank * toks
-                    + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                kv_c_segments.append(kv_c_segment)
-                k_pe_segments.append(k_pe_segment)
-                cur_seq_len += local_chunk_len
-        max_seq_len_check = max(max_seq_len_check, cur_seq_len)
-        src_token_idx += padded_local_chunk_seq_len
-    reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
-    reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
-    assert reorganized_kv_c_normed.shape[0] == sum_seq_len
-    assert reorganized_k_pe.shape[0] == sum_seq_len
-    assert max_seq_len_check == max_seq_len
-    return reorganized_kv_c_normed, reorganized_k_pe
+    if num_reqs == 0:
+        return
+    grid = (num_reqs, fold_factor)
+    mla_fold_kv_metadata_kernel[grid](
+        paged_kv_indptr,
+        paged_kv_indices,
+        fold_kv_indptr,
+        fold_kv_indices,
+        FOLD_FACTOR=fold_factor,
+        BLOCK_SIZE=256,
+    )
 
 
 class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
@@ -138,16 +171,16 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         head_dim,
         scale,
         num_kv_heads,
-        alibi_slopes: list[float] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype="bf16",
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        prefix: Optional[str] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        prefix: str | None = None,
         **kwargs,
     ):
-        from vllm.v1.attention.backend import AttentionType
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.attention.backend import AttentionType
 
         if mla_modules is None:
             raise ValueError("mla_modules is required for vLLM MLA attention")
@@ -163,7 +196,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
         )
         calculate_kv_scales = (
-            cache_config.calculate_kv_scales if cache_config is not None else False
+            getattr(cache_config, "calculate_kv_scales", False)
+            if cache_config is not None
+            else False
         )
 
         MLAAttention.__init__(
@@ -204,21 +239,33 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         from vllm.config import get_current_vllm_config
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available,
         )
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadataBuilder,
         )
 
+        vllm_config = get_current_vllm_config()
         self.supports_quant_query_input = False
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self._configure_dcp_decode_head_padding(dcp_size)
+        if dcp_size > 1:
+            from atom.model_ops.dcp_ops import CPTritonContext
+
+            self._cp_triton_ctx = CPTritonContext()
         self.dcp_world_size = -1
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                get_current_vllm_config()
+                vllm_config
             )
         )
         self.cp_kv_cache_interleave_size = (
-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        self.need_to_return_lse_for_decode = (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
         )
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM
@@ -230,9 +277,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
-        self.prefill_backend = build_vllm_mla_prefill_backend(
-            self, get_current_vllm_config()
-        )
+        self.prefill_backend = build_vllm_mla_prefill_backend(self, vllm_config)
         if self.rotary_emb is not None:
             rotary_emb_cos_sin_cache = torch.cat(
                 [
@@ -264,6 +309,32 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.q_pad_num_heads = getattr(self, "q_pad_num_heads", None)
         _register_vllm_static_forward_context(self)
 
+        # vLLM 0.28 moved MLA's DCP collectives behind an `MLADCPManager` that
+        # its own MLAAttention builds when `impl.dcp_world_size > 1`;
+        # MLACommonMetadataBuilder then reads it back off the registered layer
+        # and asserts the type. ATOM keeps `dcp_world_size = -1` so vLLM's DCP
+        # paths stay out of its decode kernels, so that constructor never ran
+        # and every DCP>1 MLA run aborted on the assert while building metadata.
+        # ATOM only needs the manager for the builder's chunked-prefill KV
+        # gather; its own decode paths do not call the manager.
+        if dcp_size > 1 and getattr(self, "dcp_manager", None) is None:
+            from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+
+            self.dcp_manager = MLADCPManager(
+                vllm_config=vllm_config,
+                device=next(self.kv_b_proj.parameters()).device,
+                num_heads=self.num_heads,
+                query_head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+                output_head_dim=self.kv_lora_rank,
+                # ATOM never feeds MLA a quantized query, so the query keeps
+                # the layer dtype (vLLM's `supports_quant_query_input` branch).
+                query_dtype=self.dtype,
+                output_dtype=self.dtype,
+                padded_num_heads=self.q_pad_num_heads,
+                is_lse_base_on_e=getattr(self, "lse_base_on_e", True),
+                use_pcp=getattr(self, "use_pcp", False),
+            )
+
         atom_static_context = atom_config.compilation_config.static_forward_context
         atom_static_context[model_layer_name] = self
         if "positions" not in atom_static_context:
@@ -278,6 +349,20 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
     def get_attn_backend(self):
         return self.attn_backend
+
+    def write_context_kv_latent(self, kv_cache: torch.Tensor, *args, **kwargs) -> None:
+        """Store context rows, reinterpreting vLLM's fp8 cache as fp8.
+
+        vLLM allocates the fp8 cache as uint8 where native ATOM allocates fp8,
+        and the Triton store reads its element type off the pointer: handed raw
+        bytes it converts each value to an integer instead of writing the fp8 bit
+        pattern, and only draft acceptance shows it.
+        """
+        if self.kv_cache_dtype.startswith("fp8") and kv_cache.dtype == torch.uint8:
+            from vllm.platforms import current_platform
+
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        return MLAAttention.write_context_kv_latent(self, kv_cache, *args, **kwargs)
 
     def process_weights_after_loading(
         self, act_dtype: torch.dtype = torch.bfloat16
@@ -393,7 +478,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         k_scale,
         dcp_world_size,
     ):
-        assert k_scale is None, "DCP not support scaled kvcache now."
+        # The gather branch keys off `self.kv_cache_dtype` (fp8 -> dequantizing
+        # gather, else same-dtype cp_gather), matching vLLM's is_quantized_kv_cache
+        # check. `k_scale` (== self._k_scale) is the per-tensor dequant scale, used
+        # only on the fp8 branch.
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.chunked_context is not None
@@ -411,18 +499,42 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         from vllm.distributed.parallel_state import get_dcp_group
         from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
+        is_quantized_kv = self.kv_cache_dtype.startswith("fp8")
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            ops.cp_gather_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-            )
+            if is_quantized_kv:
+                # fp8 / quantized KV: dequant *during* the gather into the (bf16)
+                # workspace (matches vLLM upstream and the non-DCP
+                # _compute_prefill_context), so the cross-rank all_gather below
+                # runs on already-dequantized bf16 data.
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    # vLLM's parameter name -- NOT ours. Do not sweep it along
+                    # when renaming the ATOM-side spelling.
+                    token_to_seq=prefill_metadata.chunked_context.padded_local_batch_id_per_k_token[
+                        i
+                    ],
+                    num_tokens=toks,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    batch_size=attn_metadata.num_prefills,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
             # |<- use for loca_gather ->|<--------- use for allgather -------->|
@@ -460,6 +572,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 toks=toks,
             )
 
+            kv_c_normed = kv_c_normed.squeeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -518,7 +631,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
                 cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
+                # vLLM's parameter name -- NOT ours (see the DCP call above).
+                token_to_seq=prefill_metadata.chunked_context.batch_id_per_k_token[i],
                 num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=k_scale,
@@ -679,7 +793,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
-                        k_scale=None,
+                        k_scale,
                         dcp_world_size=self.dcp_world_size,
                     )
                 )
@@ -700,6 +814,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 prefix_lse=context_lse,
                 suffix_output=suffix_output,
                 suffix_lse=suffix_lse,
+                prefill_tokens_with_context=(
+                    attn_metadata.prefill.chunked_context.prefill_tokens_with_context
+                ),
             )
         else:
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
@@ -710,14 +827,21 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q,
         kv_c_and_k_pe_cache,
         attn_metadata,
+        q_prepadded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert isinstance(q, torch.Tensor)
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        if q_prepadded:
+            # The fused q write already produced the padded width, so q.shape[1]
+            # is the kernel width and the real head count is this rank's own.
+            original_num_heads = self.num_heads
+        else:
+            original_num_heads = q.shape[1]
+            q = self._pad_decode_query_heads(q)
         B = q.shape[0]
+        num_heads_q = q.shape[1]
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            num_heads_q,
             self.kv_lora_rank,
             dtype=attn_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -725,9 +849,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        use_persistent_mode = not (
-            self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
-        )
+        use_persistent_mode = attn_metadata.decode.use_persistent_metadata
         if not use_persistent_mode:
             work_meta_data = None
             work_indptr = None
@@ -748,14 +870,62 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         paged_kv_indptr = attn_metadata.decode.paged_kv_indptr
         paged_kv_indices = attn_metadata.decode.paged_kv_indices
 
-        mla_decode_fwd(
+        qo_indptr = attn_metadata.decode.qo_indptr
+        paged_kv_last_page_len = attn_metadata.decode.paged_kv_last_page_len
+
+        fold_factor = attn_metadata.decode.fold_factor
+        do_fold = fold_factor is not None and fold_factor > 1
+        if do_fold:
+            decode_md = attn_metadata.decode
+
+            # Fold buffers are populated by the metadata builder outside the
+            # CUDA graph capture region
+            assert decode_md.fold_kv_indptr is not None
+            assert decode_md.fold_kv_indices is not None
+            assert decode_md.fold_qo_indptr is not None
+            assert decode_md.fold_kv_last_page_len is not None
+            paged_kv_indptr = decode_md.fold_kv_indptr
+            paged_kv_indices = decode_md.fold_kv_indices
+            qo_indptr = decode_md.fold_qo_indptr
+            paged_kv_last_page_len = decode_md.fold_kv_last_page_len
+
+            ori_total_s, ori_nhead = q.shape[0], q.shape[1]
+            new_nhead = ori_nhead // fold_factor
+            new_total_s = ori_total_s * fold_factor
+            q = q.view(new_total_s, new_nhead, -1)
+            o = o.view(new_total_s, new_nhead, -1)
+
+        return_lse = self.dcp_world_size > 1
+
+        # DCP + multi-token decode (DSpark verify, MTP): KV is round-robin
+        # sharded, so a causal intra-block mask has to be placed on GLOBAL
+        # positions g(j) = j * world + rank rather than on the rank-local row
+        # order the kernel otherwise sees. Handing over g_kv_indptr plus the
+        # cp world/rank selects aiter's cprr variant, which does exactly that.
+        # A single-token decode needs no mask (one query, all local KV), and
+        # neither does a bidirectional block -- DSpark drafts non-causally, so
+        # every query legitimately sees every KV row.
+        decode_md = attn_metadata.decode
+        cp_world_size = 1
+        cp_rank = 0
+        g_kv_indptr = None
+        if self.dcp_world_size > 1 and decode_md.max_qo_len > 1 and decode_md.causal:
+            cp_world_size = self.dcp_world_size
+            cp_rank = self.dcp_rank
+            g_kv_indptr = decode_md.g_kv_indptr
+            assert g_kv_indptr is not None, (
+                "causal multi-token decode under DCP requires "
+                "attn_metadata.decode.g_kv_indptr from the metadata builder"
+            )
+
+        _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            attn_metadata.decode.qo_indptr,
+            qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
-            attn_metadata.decode.paged_kv_last_page_len,
+            paged_kv_last_page_len,
             attn_metadata.decode.max_qo_len,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
@@ -766,10 +936,18 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             reduce_partial_map=reduce_partial_map,
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
+            return_lse=return_lse,
+            g_kv_indptr=g_kv_indptr,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            causal=decode_md.causal,
         )
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :]
-        return o, None
+        if do_fold:
+            o = o.view(ori_total_s, ori_nhead, -1)
+        o = self._restore_decode_query_heads(o, original_num_heads)
+        if lse is not None:
+            lse = self._restore_decode_query_heads(lse, original_num_heads)
+        return o, lse
 
     def forward_impl(
         self,
@@ -794,19 +972,28 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
 
         if not hasattr(self, "_cached_ops"):
-            from vllm.distributed.parallel_state import get_dcp_group
+            from aiter.dist.parallel_state import get_tp_group as get_aiter_tp_group
             from vllm import _custom_ops as ops
+            from vllm.distributed.parallel_state import get_dcp_group
             from vllm.platforms import current_platform
-            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+            from atom.model_ops.dcp_ops import (
+                cp_lse_ag_out_rs,
+                dcp_all_gather_query_heads,
+            )
 
             self._cached_ops = ops
             self._cached_current_platform = current_platform
             self._cached_get_dcp_group = get_dcp_group
+            self._cached_get_aiter_tp_group = get_aiter_tp_group
             self._cached_cp_lse_ag_out_rs = cp_lse_ag_out_rs
+            self._cached_dcp_all_gather_query_heads = dcp_all_gather_query_heads
         ops = self._cached_ops
         current_platform = self._cached_current_platform
         get_dcp_group = self._cached_get_dcp_group
+        get_aiter_tp_group = self._cached_get_aiter_tp_group
         cp_lse_ag_out_rs = self._cached_cp_lse_ag_out_rs
+        dcp_all_gather_query_heads = self._cached_dcp_all_gather_query_heads
 
         # create the output here, it use query shape
         if attn_metadata is None:
@@ -829,7 +1016,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             return output.fill_(0)
 
         if self.dcp_world_size == -1:
-            self.dcp_world_size = get_dcp_group().world_size
+            vllm_dcp_group = get_dcp_group()
+            self.dcp_world_size = vllm_dcp_group.world_size
+            if self.dcp_world_size > 1:
+                aiter_tp_group = get_aiter_tp_group()
+                _validate_aiter_tp_matches_vllm_dcp(aiter_tp_group, vllm_dcp_group)
+                self.dcp_group = aiter_tp_group
+                self.dcp_rank = aiter_tp_group.rank_in_group
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
@@ -878,7 +1071,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 self._has_fused_rope_cache = hasattr(
                     ops, "concat_and_cache_mla_rope_fused"
                 )
-            if kv_cache.numel() > 0 and self._has_fused_rope_cache:
+            if (
+                kv_cache.numel() > 0
+                and self._has_fused_rope_cache
+                and self.dcp_world_size <= 1
+            ):
+                # Need to adjust the fused kernel for DCP. As for now, we
+                # just skip concat_and_cache_mla_rope_fused when enable DCP.
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
                     q[..., self.qk_nope_head_dim :],
@@ -954,29 +1153,48 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     transpose_bm=True,
                 )
 
+            # Fold the query-head pad into the fused q write instead of paying a
+            # separate pad kernel per layer: allocate at the width the MLA kernel
+            # dispatches on, zeroed so the dead lanes match what F.pad produced,
+            # and hand the writer the real-head slice, which it fills through the
+            # runtime q_out strides it already takes. Only the fused write can do
+            # this, and not under DCP -- decode_q is all-gathered on the head dim
+            # below, so there the pad has to go on after the gather.
+            fused_q_head_pad = (
+                decode_only and self.head_pad > 0 and self.dcp_world_size <= 1
+            )
             if decode_only:
-                decode_q = torch.empty(
-                    (
-                        decode_ql_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                    device=decode_ql_nope.device,
+                decode_q_dtype = (
+                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
                 )
+                decode_q_shape = (
+                    decode_ql_nope.shape[0],
+                    self.padded_num_heads if fused_q_head_pad else self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                )
+                if fused_q_head_pad:
+                    decode_q = torch.zeros(
+                        decode_q_shape,
+                        dtype=decode_q_dtype,
+                        device=decode_ql_nope.device,
+                    )
+                else:
+                    decode_q = torch.empty(
+                        decode_q_shape,
+                        dtype=decode_q_dtype,
+                        device=decode_ql_nope.device,
+                    )
                 aiter.fused_qk_rope_concat_and_cache_mla(
                     decode_ql_nope,
                     decode_q_pe,
                     k_c_normed,
                     k_pe.squeeze(1),
                     kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                        kv_cache.shape[0],
+                        -1,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
-                    decode_q,
+                    decode_q[:, : self.num_heads] if fused_q_head_pad else decode_q,
                     attn_metadata.slot_mapping,
                     self._k_scale,
                     self._q_scale,
@@ -985,6 +1203,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     self.rotary_emb.sin_cache,
                     is_neox=self.rotary_emb.is_neox_style,
                     is_nope_first=True,
+                    # DCP: q_out is head all-gathered, so every rank must compute
+                    # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
+                    # keeps the default (early-return on padded tokens).
+                    compute_all_q_rope=self.dcp_world_size > 1,
                 )
             else:
                 if fp8_attention:
@@ -1019,20 +1241,23 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     decode_q = (decode_ql_nope, decode_q_pe)
                     decode_q = torch.cat(decode_q, dim=-1)
             if self.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # decode_q do allgather in head dim.
-                decode_q = get_dcp_group().all_gather(decode_q, dim=1)
+                # decode_q is fp8 when fp8_attention (produced by the fused
+                # kernel); the head-dim all-gather is copy-only, so an fp8
+                # payload is safe (unlike an fp8 all-reduce).
+                decode_q = dcp_all_gather_query_heads(self.dcp_group, decode_q)
 
             # call decode attn
-            attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
+            attn_out, lse = self._forward_decode(
+                decode_q, kv_cache, attn_metadata, q_prepadded=fused_q_head_pad
+            )
 
             # correct dcp attn_out with lse.
             if self.dcp_world_size > 1:
                 attn_out = cp_lse_ag_out_rs(
                     attn_out,
                     lse,
-                    get_dcp_group(),
-                    is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
+                    self.dcp_group,
+                    ctx=self._cp_triton_ctx,
                 )
 
             # v_up projection
@@ -1194,13 +1419,20 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 transpose_bm=True,
             )
 
+        # Fuse the q fp8-quant into the aiter rope+concat+cache kernel by
+        # allocating q_out as fp8 directly (matches the dense decode path,
+        # forward_impl's decode_only branch). The kernel quantizes q
+        # with self._q_scale on write, so the separate vllm scaled_fp8_quant
+        # below is no longer needed — it saved nothing but an extra
+        # vllm::scaled_fp8_quant kernel launch + a bf16->fp8 pass over q every
+        # decode step. Non-fp8 attention keeps the bf16 output unchanged.
         q_out = torch.empty(
             (
                 ql_nope.shape[0],
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ),
-            dtype=ql_nope.dtype,
+            dtype=dtypes.fp8 if fp8_attention else ql_nope.dtype,
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
@@ -1221,20 +1453,14 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 self.rotary_emb.sin_cache,
                 is_neox=self.rotary_emb.is_neox_style,
                 is_nope_first=True,
+                # DCP: compute Q RoPE for all tokens (q_out is head all-gathered);
+                # non-DCP keeps the default early-return on slot=-1 padded tokens.
+                compute_all_q_rope=self.dcp_world_size > 1,
             )
 
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        if fp8_attention:
-            from vllm import _custom_ops as ops
-
-            # Reshape to 2D for scaled_fp8_quant, then restore
-            q_flat, _ = ops.scaled_fp8_quant(
-                q_out.reshape(q_out.shape[0], -1),
-                self._q_scale,
-            )
-            q_out = q_flat.reshape(q_out.shape)
         attn_out = self._forward_sparse_bf16_kv(q_out, kv_cache, attn_metadata)
 
         # V up-projection
@@ -1258,7 +1484,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):

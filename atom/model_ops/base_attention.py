@@ -2,26 +2,25 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
-from typing import Optional
 from abc import ABC, abstractmethod
 
 import torch
-from torch import nn
 import triton
 import triton.language as tl
+from torch import nn
 
-
-from atom.utils import mark_spliting_op
-from .attention_mla import MLAModules
 from atom.config import get_current_atom_config
-from atom.utils.selector import get_attn_backend
+from atom.utils import mark_spliting_op
+from atom.utils.selector import Family, get_attn_backend
+
+from .attention_mla import MLAModules, _mla_output_width
 
 
 # frontend interface class for constructing attention
 # op in model file
 class Attention:
     def __new__(cls, *args, **kwargs):
-        from atom.plugin.prepare import is_sglang, is_vllm
+        from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
         if is_vllm():
             from atom.plugin.vllm.attention.layer import AttentionForVllm
@@ -31,10 +30,38 @@ class Attention:
             from atom.plugin.sglang.attention import AttentionForSGLang
 
             return AttentionForSGLang(*args, **kwargs)
+        if is_rtpllm():
+            from atom.plugin.rtpllm.attention_backend import AttentionForRTPLLM
+
+            return AttentionForRTPLLM(*args, **kwargs)
 
         from atom.model_ops.paged_attention import Attention as AttentionForAtom
 
         return AttentionForAtom(*args, **kwargs)
+
+
+# Envelopes of the two paged decode kernels wrapped below. Both are multiplied
+# by drafting: MiniMax-M3 sits exactly on the gluon group one today (16 x 4 draft
+# positions), a gqa=8 model reaches the gluon length one first, and ASM tops out
+# lower than either -- past its limit get_heuristic_kernel silently re-runs with
+# mtp=1, a kernel built for another query length.
+PA_GLUON_MAX_QUERY_LEN = 4
+PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
+PA_ASM_MAX_QUERY_GROUP_SIZE = 16
+
+
+def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) -> bool:
+    """Whether decode is past what the gluon kernel takes.
+
+    pow2, not the raw product: that is what the kernel indexes its layout table
+    with, and it rounds a small group up to fill 16.
+    """
+    max_qlen = max(1, int(max_qlen))
+    qlen_p2 = 1 << (max_qlen - 1).bit_length()
+    group_p2 = qlen_p2 * max(
+        16 // qlen_p2, 1 << (num_heads // num_kv_heads - 1).bit_length()
+    )
+    return max_qlen > PA_GLUON_MAX_QUERY_LEN or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
 
 
 def run_pa_fwd_asm(
@@ -46,8 +73,8 @@ def run_pa_fwd_asm(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     *,
-    out: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
     max_qlen: int = 1,
     high_precision: int = 0,
 ):
@@ -83,15 +110,15 @@ def run_pa_decode_gluon(
     max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
-    q_scale: Optional[torch.Tensor],
-    k_scale: Optional[torch.Tensor],
-    v_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
     *,
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
     ps: bool = True,
 ):
@@ -133,7 +160,7 @@ def cp_mha_gather_cache_kernel(
     value_ptr,  # [num_tokens, num_heads, head_size]
     block_table_ptr,  # [num_batches, max_block_num]
     cu_seqlens_kv_ptr,  # [num_batches + 1]
-    token_to_batch_ptr,  # [max_cum_tokens]
+    batch_id_per_k_token_ptr,  # [max_cum_tokens]
     seq_start_ptr,  # [num_batches]
     k_scale_ptr,  # [1] / [num_blocks, num_kv_heads, page_size]
     v_scale_ptr,
@@ -160,7 +187,7 @@ def cp_mha_gather_cache_kernel(
     value_ptr_offset = (
         value_ptr + token_id * head_size * num_heads + head_id * head_size
     )
-    batch_idx = tl.load(token_to_batch_ptr + token_id)
+    batch_idx = tl.load(batch_id_per_k_token_ptr + token_id)
     batch_start = tl.load(seq_start_ptr + batch_idx)
     token_start = tl.load(cu_seqlens_kv_ptr + batch_idx)
     batch_offset = token_id - token_start + batch_start
@@ -248,10 +275,10 @@ def cp_mha_gather_cache(
     key: torch.Tensor,
     value: torch.Tensor,
     block_tables: torch.Tensor,
-    k_scales: Optional[torch.Tensor],
-    v_scales: Optional[torch.Tensor],
+    k_scales: torch.Tensor | None,
+    v_scales: torch.Tensor | None,
     cu_seqlens_kv: torch.Tensor,
-    token_to_batch: torch.Tensor,
+    batch_id_per_k_token: torch.Tensor,
     seq_starts: torch.Tensor,
     dequant: bool,
     kv_cache_layout: str,
@@ -288,7 +315,7 @@ def cp_mha_gather_cache(
 
     k_cache_stride0 = key_cache.stride(0)
     v_cache_stride0 = value_cache.stride(0)
-    grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
+    grid = lambda meta: (total_tokens, num_heads)
     cp_mha_gather_cache_kernel[grid](
         key_cache,
         value_cache,
@@ -296,7 +323,7 @@ def cp_mha_gather_cache(
         value,
         block_tables,
         cu_seqlens_kv,
-        token_to_batch,
+        batch_id_per_k_token,
         seq_starts,
         k_scales,
         v_scales,
@@ -316,7 +343,7 @@ def cp_mha_gather_cache(
 
 def fake_(
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -328,7 +355,9 @@ def fake_(
     # If we fusion rmsnorm and quant, the input dtype is fp8, but actually we use bf16 for output.
     atom_config = get_current_atom_config()
     if use_mla:
-        output_shape[-1] = atom_config.hf_config.hidden_size
+        bound = atom_config.compilation_config.static_forward_context[layer_name]
+        impl = getattr(bound, "impl", bound)
+        output_shape[-1] = _mla_output_width(impl, atom_config.hf_config.hidden_size)
     output_dtype = atom_config.torch_dtype
     output = torch.zeros(output_shape, dtype=output_dtype, device=q.device)
 
@@ -341,7 +370,7 @@ def fake_(
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
 def unified_attention_with_output_base(
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -377,11 +406,13 @@ def linear_attention_with_output_base_fake(
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    return core_attn_out
+    return torch.empty_like(core_attn_out)
 
 
 @mark_spliting_op(
-    is_custom=True, gen_fake=linear_attention_with_output_base_fake, mutates_args=[]
+    is_custom=True,
+    gen_fake=linear_attention_with_output_base_fake,
+    mutates_args=[],
 )
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
@@ -392,7 +423,8 @@ def linear_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    ret = self.impl.forward(mixed_qkv, b, a, core_attn_out, layer_name)
+    ret = torch.empty_like(core_attn_out)
+    ret = self.impl.forward(mixed_qkv, b, a, ret, layer_name)
     return ret
 
 
@@ -412,11 +444,11 @@ class BaseAttention(nn.Module, ABC):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -427,8 +459,8 @@ class BaseAttention(nn.Module, ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError(
@@ -451,7 +483,7 @@ class LinearAttention(nn.Module):
         conv1d=None,
         activation=None,
         layer_num=0,
-        prefix: Optional[str] = None,
+        prefix: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -471,11 +503,7 @@ class LinearAttention(nn.Module):
         self.prefix = prefix
 
         atom_config = get_current_atom_config()
-        block_size = atom_config.kv_cache_block_size
-        self.attn_backend = get_attn_backend(
-            block_size,
-            use_gdn=True,
-        )
+        self.attn_backend = get_attn_backend(Family.GDN)
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
             self.hidden_size,
@@ -497,7 +525,7 @@ class LinearAttention(nn.Module):
         default_name = f"Linear_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError("Duplicate layer: {}".format(self.layer_name))
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(

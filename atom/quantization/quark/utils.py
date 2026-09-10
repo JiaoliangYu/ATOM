@@ -3,10 +3,19 @@
 
 from collections.abc import Iterable
 from typing import Any
+
 import regex as re
+import torch
 import triton
 import triton.language as tl
-import torch
+from aiter import QuantType
+
+_FP8_SOURCE_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    }
+)
 
 
 def deep_compare(dict1: Any, dict2: Any) -> bool:
@@ -81,11 +90,12 @@ def _weight_dequant_kernel(  # type: ignore[no-untyped-def]
     tl.store(y_ptr + offs, y, mask=mask)
 
 
-def weight_dequant_fp8(
+def dequant_per_block_fp8(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 128
 ) -> torch.Tensor:
     """
-    Dequantize FP8 weight tensor using inverse scale with Triton kernel.
+    Dequantize a per-block (128x128) FP8 weight using inverse scale with a
+    Triton kernel.
     """
     assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
     assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
@@ -97,3 +107,332 @@ def weight_dequant_fp8(
 
     _weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+# Optional E8M0 dtype: only available on newer torch builds.
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+
+
+def _mx_block_scale_dtype():
+    """The block-scale dtype mandated by the MX (microscaling) format: E8M0.
+
+    Every MX scheme (``QuantType.per_1x32``) stores a shared power-of-two block
+    scale in E8M0, regardless of whether the elements are FP4 or FP8 — this is
+    fixed by the MX spec, not a per-call choice. Resolving it here gives both the
+    MXFP4 and MXFP8 online-quant paths a single source of truth, so callers pass
+    a value derived from the format rather than a repeated literal.
+    """
+    from aiter import dtypes
+
+    return dtypes.fp8_e8m0
+
+
+def dequant_mxfp8(
+    x: torch.Tensor, s: torch.Tensor, block_size: int = 32
+) -> torch.Tensor:
+    """Dequantize an MXFP8 weight to the default float dtype.
+
+    MXFP8 is a standard microscaling dtype (its 1x32 block scale is part of the
+    format), so the name carries no explicit granularity suffix.
+    """
+    assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
+    M, K = x.shape
+    assert K % block_size == 0, f"K={K} not divisible by block_size={block_size}"
+    n_blocks = K // block_size
+    assert s.shape == (M, n_blocks), f"scale shape {tuple(s.shape)} != {(M, n_blocks)}"
+
+    if _E8M0_DTYPE is not None and s.dtype == _E8M0_DTYPE:
+        # E8M0 dtype decodes straight to the 2**(e-127) multiplier.
+        scale = s.to(torch.float32)
+    else:
+        # Raw E8M0 integer codes stored as uint8 / float.
+        scale = torch.exp2(s.to(torch.float32) - 127.0)
+
+    out_dtype = torch.get_default_dtype()
+    y = x.to(torch.float32).reshape(M, n_blocks, block_size)
+    y = y * scale.unsqueeze(-1)
+    return y.reshape(M, K).to(out_dtype)
+
+
+def dequant_per_channel_fp8(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Dequantize a per-output-channel (per_Token / PTPC) FP8 weight to the
+    default float dtype.
+
+    :param x: quantized weight ``[N, K]`` (last dim is the contracted dim).
+    :param s: per-output-channel scale, ``[N]`` or ``[N, 1]``.
+    """
+    assert x.dim() == 2, f"expected 2D weight, got shape={tuple(x.shape)}"
+    out_dtype = torch.get_default_dtype()
+    scale = s.reshape(-1).to(torch.float32).view(-1, 1)
+    return (x.to(torch.float32) * scale).to(out_dtype)
+
+
+def dequant_per_tensor_fp8(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    output_partition_sizes: list[int] | None = None,
+) -> torch.Tensor:
+    """Dequantize a per-tensor  FP8 weight to the atom config float dtype.
+
+    Merged layers (qkv / gate_up) carry one scalar scale per output partition,
+    so each output row-range is scaled by its own scale. A single scale
+    (``numel <= 1``) scales the whole tensor.
+
+    :param x: quantized weight ``[N, K]``.
+    :param s: per-partition scalar scale(s).
+    :param output_partition_sizes: row counts of each merged output partition,
+        required when there is more than one scale.
+    """
+    out_dtype = torch.get_default_dtype()
+
+    w = x.to(torch.float32)
+    scale = s.reshape(-1)
+    if scale.numel() <= 1:
+        return (w * scale.reshape(())).to(out_dtype)
+    assert output_partition_sizes is not None, (
+        "per_Tensor merged layer needs output_partition_sizes to map each "
+        "scale to its output rows."
+    )
+    off = 0
+    for i, sz in enumerate(output_partition_sizes):
+        w[off : off + sz] = w[off : off + sz] * scale[i]
+        off += sz
+    return w.to(out_dtype)
+
+
+def can_dequant_weight_online(
+    source_quant_type: QuantType,
+    source_quant_dtype: torch.dtype | None = None,
+) -> bool:
+    """Return whether the online path can dequantize this source."""
+    if source_quant_type == QuantType.No:
+        return True
+    if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
+        return False
+    return source_quant_type in (
+        QuantType.per_Tensor,
+        QuantType.per_Token,
+        QuantType.per_1x128,
+        QuantType.per_1x32,
+    )
+
+
+def dequant_weight_online(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    source_quant_type: QuantType,
+    source_quant_dtype: torch.dtype | None = None,
+    output_partition_sizes: list[int] | None = None,
+) -> torch.Tensor:
+    """Dequantize an online-quant SOURCE weight back to the default float dtype.
+
+    Single entry point shared by the Linear and MoE online-quant paths and the
+    inverse counterpart of :func:`quant_weight_online`: it turns an
+    already-quantized weight back into float so it can be re-quantized to a
+    different target format.
+
+    A source is identified by BOTH its ``quant_type`` (the block layout) and its
+    element ``quant_dtype``. The layout alone is not enough: ``per_1x32`` is the
+    MX layout, which the format allows to carry 4-bit elements as well, and only
+    the 8-bit (MXFP8) form is accepted here. Supported sources:
+
+    - ``No``: unquantized, returned unchanged.
+    - ``per_Tensor``: per-tensor FP8, one scalar scale per output partition.
+    - ``per_Token`` (ptpc_fp8): per-output-channel FP8, scale ``(N, 1)``.
+    - ``per_1x128``: DeepSeek-style 128x128 block FP8.
+    - ``per_1x32``: MXFP8 (1x32 E8M0 shared scale).
+
+    :param weight: The quantized (or float, for ``No``) weight tensor.
+    :param weight_scale: The source weight scale (``None`` for ``No``).
+    :param source_quant_type: The source quantization scheme (block layout).
+    :param source_quant_dtype: The source element dtype. Used together with
+        ``source_quant_type`` to reject non-8-bit (e.g. MXFP4) sources. When
+        ``None`` the dtype check is skipped (caller vouches for an 8-bit source).
+    :param output_partition_sizes: row counts of each merged output partition,
+        only used (and required) by ``per_Tensor`` merged layers.
+    :return: The dequantized weight in the default float dtype.
+    """
+    if source_quant_type == QuantType.No:
+        return weight
+
+    # Reject any non-8-bit source up front. The element dtype -- not just the
+    # block layout -- decides whether we can dequantize: MXFP4 (fp4x2) shares
+    # the per_1x32 layout with MXFP8 but is a target-only format.
+    if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
+        raise ValueError(
+            f"Unsupported online dequant source dtype={source_quant_dtype} "
+            f"(quant_type={source_quant_type}); supported sources are 8-bit FP8."
+        )
+
+    if source_quant_type == QuantType.per_Tensor:
+        return dequant_per_tensor_fp8(weight, weight_scale, output_partition_sizes)
+    if source_quant_type == QuantType.per_Token:
+        return dequant_per_channel_fp8(weight, weight_scale)
+    if source_quant_type == QuantType.per_1x128:
+        return dequant_per_block_fp8(weight, weight_scale)
+    if source_quant_type == QuantType.per_1x32:
+        # per_1x32 is only the block layout; the (8-bit) dtype check above has
+        # already ruled out MXFP4, so a valid source here is always MXFP8.
+        return dequant_mxfp8(weight, weight_scale)
+    raise ValueError(
+        f"Unsupported source quant_type for online dequant: {source_quant_type}. "
+        f"Supported sources: No, per_Tensor, per_Token, per_1x128, per_1x32."
+    )
+
+
+def dequant_moe_weight_online(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    source_quant_type: QuantType,
+    source_quant_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Dequantize ``[E, N, K]`` by flattening row-local expert groups."""
+    assert (
+        weight.dim() == 3
+    ), f"expected batched MoE weight [E, N, K], got shape={tuple(weight.shape)}"
+    experts, rows, cols = weight.shape
+    flat_weight = weight.reshape(experts * rows, cols)
+    if source_quant_type == QuantType.No:
+        return flat_weight
+
+    assert (
+        weight_scale is not None
+    ), f"source quant_type={source_quant_type} requires a weight scale"
+    if source_quant_type == QuantType.per_Token:
+        flat_scale = weight_scale.reshape(experts * rows, -1)
+    elif source_quant_type == QuantType.per_1x128:
+        assert (
+            rows % 128 == 0
+        ), f"per_1x128 expert rows must be 128-aligned, got N={rows}"
+        flat_scale = weight_scale.reshape(experts * (rows // 128), -1)
+    elif source_quant_type == QuantType.per_1x32:
+        flat_scale = weight_scale.reshape(experts * rows, -1)
+    else:
+        raise ValueError(
+            "Batched MoE online dequant does not support "
+            f"source quant_type={source_quant_type}."
+        )
+    return dequant_weight_online(
+        flat_weight.contiguous(),
+        flat_scale.contiguous(),
+        source_quant_type,
+        source_quant_dtype,
+    )
+
+
+def quant_mxfp4_online_even(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Online MXFP4 weight quant via the aiter HIP kernel with ``Even`` round mode.
+
+    Round-half-to-even on the FP4/E2M1 grid + an E8M0 block scale (note: on
+    gfx942 ``Even`` falls back to round-half-away in software). Returns the
+    packed weight viewed as ``dtypes.fp4x2`` and the block scale as
+    ``dtypes.fp8_e8m0``.
+
+    Shared by the Linear and MoE online-quant paths so both stay in sync.
+    ``quant_mxfp4_hip`` requires a 2D contiguous fp16/bf16 input, so we
+    normalise the input accordingly before calling it.
+    """
+    from aiter import dtypes
+    from aiter.ops.quant import quant_mxfp4_hip
+    from aiter.utility.mx_types import MxScaleRoundModeInt
+
+    q_in = weight.contiguous()
+    if q_in.dtype not in (torch.float16, torch.bfloat16):
+        q_in = q_in.to(torch.bfloat16)
+    q_weight, weight_scale = quant_mxfp4_hip(q_in, round_mode=MxScaleRoundModeInt.Even)
+    return q_weight.view(dtypes.fp4x2), weight_scale.view(_mx_block_scale_dtype())
+
+
+def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype):
+    """Quantize a 2D weight to FP8 with 128x128 block scales.
+
+    Returns:
+        q_weight: quantized weight with the same shape as input ``weight``.
+        scale: per-block scale with shape ``(ceil(N/128), ceil(K/128))``.
+    """
+    assert weight.dim() == 2, f"expected 2D weight, got shape={tuple(weight.shape)}"
+
+    w = weight.to(torch.float32).contiguous()
+    n, k = w.shape
+    n_blocks = (n + 127) // 128
+    k_blocks = (k + 127) // 128
+    n_padded = n_blocks * 128
+    k_padded = k_blocks * 128
+
+    if n_padded != n or k_padded != k:
+        w = torch.nn.functional.pad(w, (0, k_padded - k, 0, n_padded - n))
+
+    w_blocks = w.view(n_blocks, 128, k_blocks, 128).permute(0, 2, 1, 3).contiguous()
+
+    finfo = torch.finfo(quant_dtype)
+    block_amax = w_blocks.abs().amax(dim=(2, 3))
+    scale = (block_amax / finfo.max).clamp_min(torch.finfo(torch.float32).tiny)
+
+    q_blocks = torch.clamp(
+        w_blocks / scale.unsqueeze(-1).unsqueeze(-1), min=finfo.min, max=finfo.max
+    ).to(quant_dtype)
+
+    q_weight = (
+        q_blocks.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(n_padded, k_padded)[:n, :k]
+        .contiguous()
+    )
+    return q_weight, scale.contiguous()
+
+
+def quant_weight_online(
+    weight: torch.Tensor,
+    online_quant_type: QuantType,
+    online_quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch online weight quantization by target dtype / scheme.
+
+    Single entry point shared by the Linear and MoE online-quant paths so both
+    stay in sync:
+
+    - MXFP4 (``dtypes.fp4x2``): use the aiter HIP kernel with ``Even`` round
+      mode (:func:`quant_mxfp4_online_even`), matching the offline Quark kernel.
+    - per_1x128 FP8: use :func:`quantize_weight_to_fp8_128x128_blockscale` to
+      produce a true 128x128 block scale of shape ``(N//128, K//128)``. This is
+      what the blockscale GEMM consumes; ``get_hip_quant(per_1x128)`` would
+      instead produce a 1x128-along-K scale ``(N, K//128)`` that is inconsistent
+      with the GEMM and collapses generation.
+    - MXFP8 (``per_1x32`` + ``dtypes.fp8``): fp8 weights with a per-32 block
+      scale. See the e8m0 note below for why ``scale_type`` must be forced.
+    - other FP8 (incl. ptpc_fp8 per-token / per-channel): use the aiter quant
+      function resolved from ``get_hip_quant(online_quant_type)``.
+
+    :param weight: The (already dequantized) weight tensor to quantize.
+    :param online_quant_type: Online quantization scheme, used to resolve the
+        FP8 quant function via ``get_hip_quant``.
+    :param online_quant_dtype: Target online quantization dtype.
+    :return: ``(q_weight, weight_scale)``.
+    """
+    from aiter import dtypes, get_hip_quant
+
+    if online_quant_dtype == dtypes.fp4x2:
+        return quant_mxfp4_online_even(weight)
+    if online_quant_type == QuantType.per_1x128:
+        return quantize_weight_to_fp8_128x128_blockscale(weight, online_quant_dtype)
+    quant_func = get_hip_quant(online_quant_type)
+    # A per_1x32 scheme *is* MX (microscaling): its block scale is E8M0 by
+    # definition of the format, independent of the element dtype. So the scale
+    # dtype is derived from the scheme, not chosen per case — the MXFP4 branch
+    # above already relies on this (aiter forces e8m0 for fp4x2), and here the
+    # MXFP8 (fp8) branch needs the same E8M0 scale. We only have to pass it
+    # explicitly because aiter's per_1x32 fp8 quantizer keeps scale_type=fp32 as
+    # a backward-compat default, whereas the whole consuming side is E8M0:
+    # Fp8MoEMethod.create_weights allocates an e8m0 (uint8) scale buffer and the
+    # MXFP8 GEMM / flydsl MoE kernels only read that byte scale. Without it the
+    # scale silently reverts to fp32 and weight loading / inference break.
+    if online_quant_type == QuantType.per_1x32:
+        mx_scale_type = _mx_block_scale_dtype()
+        return quant_func(
+            weight,
+            quant_dtype=online_quant_dtype,
+            scale_type=mx_scale_type,
+        )
+    return quant_func(weight, quant_dtype=online_quant_dtype)

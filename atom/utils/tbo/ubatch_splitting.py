@@ -3,7 +3,6 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -12,6 +11,37 @@ from atom.utils import envs
 from atom.utils.forward_context import AttentionMetaData
 
 logger = logging.getLogger("atom")
+
+
+def derive_prefill_lens_from_positions(
+    positions,
+    full_cu_seqlens_q,
+    ub_slice,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (extend_lens, seq_lens) for a prefill ubatch.
+
+    ``positions`` are the absolute positions for this ubatch's new tokens.
+    ``seq_lens`` are the total visible sequence lengths for sparse metadata,
+    preserving the absolute prefix length of a straddled request instead of
+    treating the ubatch as a standalone prompt.
+    """
+    rs = ub_slice.request_slice
+    ts = ub_slice.token_slice
+    ub_num_reqs = rs.stop - rs.start
+    positions_np = np.asarray(positions)
+    full_cu = np.asarray(full_cu_seqlens_q)
+
+    req_global_starts = full_cu[rs.start : rs.stop].astype(np.int64)
+    req_global_ends = full_cu[rs.start + 1 : rs.stop + 1].astype(np.int64)
+    clamped_starts = np.maximum(req_global_starts, ts.start)
+    clamped_ends = np.minimum(req_global_ends, ts.stop)
+    extend_lens = (clamped_ends - clamped_starts).astype(np.int32)
+
+    ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+    np.cumsum(extend_lens, dtype=np.int32, out=ub_cu[1:])
+    start_positions = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
+    seq_lens = (start_positions + extend_lens).astype(np.int32)
+    return extend_lens, seq_lens
 
 
 @dataclass
@@ -27,9 +57,10 @@ def maybe_create_ubatch_slices(
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[list[int]] = None,
-    max_tokens_per_ubatch: Optional[int] = None,
-) -> Optional[list[UBatchSlice]]:
+    num_scheduled_tokens: np.ndarray | None = None,
+    max_tokens_per_ubatch: int | None = None,
+    force: bool = False,
+) -> list[UBatchSlice] | None:
     """Split a batch into N micro-batch slices.
 
     For decode: split by request count (uniform tokens per request).
@@ -38,6 +69,11 @@ def maybe_create_ubatch_slices(
 
     Returns None if the batch is too small to split or if the split
     would produce a ubatch exceeding max_tokens_per_ubatch.
+
+    ``force`` bypasses the ATOM_TBO_PREFILL_MIN_TOKENS gate: the cross-DP
+    decision is OR-reduced, so a rank below the min-token bar can still be
+    told to split (because a peer cleared it). It MUST split anyway to keep
+    the per-ubatch collectives size-aligned, or RCCL will hang.
     """
     if num_ubatches <= 1:
         return None
@@ -51,6 +87,14 @@ def maybe_create_ubatch_slices(
         return None
 
     if num_scheduled_tokens is not None:
+        # Skip TBO for small prefills — unless force-split (OR-reduced cross-DP
+        # decision put this under-filled rank on the TBO path; it must split to
+        # stay aligned with peers).
+        _min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
+        if _min_pref > 0 and not force:
+            _pref_total = int(num_scheduled_tokens[:num_reqs].sum())
+            if _pref_total < _min_pref:
+                return None
         # Prefill: token-balanced split
         if token_split:
             if num_tokens < num_ubatches:
@@ -91,8 +135,8 @@ def _split_prefill_balanced(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """Split prefill requests into ubatches balanced by token count.
 
     Finds the request boundary closest to total_tokens / num_ubatches,
@@ -123,14 +167,15 @@ def _split_prefill_balanced(
     ub1_tokens = total_tokens - tok_boundary
 
     # Reject if either ubatch exceeds the AsyncLL buffer
-    if max_tokens_per_ubatch is not None:
-        if ub0_tokens > max_tokens_per_ubatch or ub1_tokens > max_tokens_per_ubatch:
-            logger.info(
-                f"[TBO] prefill split rejected: ubatch tokens "
-                f"({ub0_tokens}, {ub1_tokens}) exceed buffer "
-                f"{max_tokens_per_ubatch}"
-            )
-            return None
+    if max_tokens_per_ubatch is not None and (
+        ub0_tokens > max_tokens_per_ubatch or ub1_tokens > max_tokens_per_ubatch
+    ):
+        logger.info(
+            f"[TBO] prefill split rejected: ubatch tokens "
+            f"({ub0_tokens}, {ub1_tokens}) exceed buffer "
+            f"{max_tokens_per_ubatch}"
+        )
+        return None
 
     return [
         UBatchSlice(
@@ -148,8 +193,8 @@ def _split_prefill_token_midpoint(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """split prefill at the exact token midpoint."""
     toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
     total_tokens = int(toks.sum())
@@ -193,10 +238,52 @@ def _split_prefill_token_midpoint(
     return slices
 
 
+def attach_tbo_cpu_lens(
+    attn_metadata: AttentionMetaData, field_name: str, np_array
+) -> None:
+    """Publish a ready-made CPU (numpy) copy of a per-request length array.
+
+    Called from a backend's prefill ``prepare_prefill`` AFTER all metadata is
+    finalized, where the source numpy already exists (e.g.
+    ``forward_vars["context_lens"].np``). ``split_attn_metadata`` then reads it
+    via ``_get_tbo_cpu_lens`` (host math, zero device sync) instead of copying
+    the freshly-sliced device tensors back to the host.
+
+    NOTE: ``forward_vars[...].np`` is a *reused* pinned buffer that the next
+    forward will overwrite, so callers MUST pass a ``.copy()`` (or a freshly
+    allocated array) to keep it valid for this batch's lifetime.
+    """
+    setattr(attn_metadata, "_tbo_cpu_lens_" + field_name, np_array)
+
+
+def _get_tbo_cpu_lens(attn_metadata: AttentionMetaData, field_name: str):
+    """Fetch a CPU (numpy) copy of a per-request length array.
+
+    Fast path: one was already published by ``attach_tbo_cpu_lens`` from the
+    backend's prepare path (numpy was free there) — zero device sync.
+
+    Fallback path: if none was published (a backend whose prepare_prefill
+    doesn't attach one), lazily copy the device tensor to host once and cache it
+    under ``_tbo_cpu_lens_<field>``; subsequent ubatch slices in the same
+    forward reuse it. This is TBO-only: reached only through
+    ``split_attn_metadata`` and never touched when TBO is disabled, so non-TBO
+    runs pay zero extra cost.
+    """
+    cache_attr = "_tbo_cpu_lens_" + field_name
+    if not hasattr(attn_metadata, cache_attr):
+        t = getattr(attn_metadata, field_name, None)
+        setattr(
+            attn_metadata,
+            cache_attr,
+            None if t is None else t.detach().cpu().numpy(),
+        )
+    return getattr(attn_metadata, cache_attr)
+
+
 def split_attn_metadata(
     attn_metadata: AttentionMetaData,
     ub_slice: UBatchSlice,
-    padded_bs: int,
+    running_bs: int,
 ) -> AttentionMetaData:
     """Split AttentionMetaData for a single micro-batch."""
     rs = ub_slice.request_slice
@@ -212,10 +299,10 @@ def split_attn_metadata(
         # clamp absolute token offsets to [ts.start, ts.stop], then re-base
         clamped = torch.clamp(seg, min=ts.start, max=ts.stop)
         ub_cu_seqlens_q = clamped - clamped[0]
-        # Pad remaining entries up to padded_bs + 1
-        if padded_bs > ub_num_reqs:
+        # Pad remaining entries up to running_bs + 1
+        if running_bs > ub_num_reqs:
             last_val = ub_cu_seqlens_q[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_cu_seqlens_q = torch.cat([ub_cu_seqlens_q, padding])
 
@@ -225,9 +312,7 @@ def split_attn_metadata(
         ub_slot_mapping = attn_metadata.slot_mapping[ts]
         # Pad with -1 for padded positions
         tok_count = ts.stop - ts.start
-        # max_q_len = attn_metadata.max_seqlen_q
-        # padded_tok_count = padded_bs * max_q_len
-        padded_tok_count = padded_bs
+        padded_tok_count = running_bs
         if padded_tok_count > tok_count:
             pad = torch.full(
                 (padded_tok_count - tok_count,),
@@ -241,9 +326,9 @@ def split_attn_metadata(
     ub_context_lens = None
     if attn_metadata.context_lens is not None:
         ub_context_lens = attn_metadata.context_lens[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.context_lens.dtype,
                 device=attn_metadata.context_lens.device,
             )
@@ -253,9 +338,9 @@ def split_attn_metadata(
     ub_block_tables = None
     if attn_metadata.block_tables is not None:
         ub_block_tables = attn_metadata.block_tables[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 attn_metadata.block_tables.shape[1],
                 dtype=attn_metadata.block_tables.dtype,
                 device=attn_metadata.block_tables.device,
@@ -268,22 +353,30 @@ def split_attn_metadata(
         orig_indptr = attn_metadata.kv_indptr
         base = orig_indptr[req_start]
         ub_kv_indptr = orig_indptr[req_start : req_end + 1] - base
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             last_val = ub_kv_indptr[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_kv_indptr = torch.cat([ub_kv_indptr, padding])
 
     # kv_indices: shared (indexed via kv_indptr, no slicing needed)
     ub_kv_indices = attn_metadata.kv_indices
 
+    # batch_id_per_k_token: sliced and re-based, not rebuilt -- the parent laid
+    # the requests out contiguously and `cu_seqlens_k` says where this one starts.
+    ub_batch_id_per_k_token = None
+    if attn_metadata.batch_id_per_k_token is not None:
+        cuk_cpu = _get_tbo_cpu_lens(attn_metadata, "cu_seqlens_k")
+        kv = slice(int(cuk_cpu[req_start]), int(cuk_cpu[req_end]))
+        ub_batch_id_per_k_token = attn_metadata.batch_id_per_k_token[kv] - req_start
+
     # kv_last_page_lens: slice by request
     ub_kv_last_page_lens = None
     if attn_metadata.kv_last_page_lens is not None:
         ub_kv_last_page_lens = attn_metadata.kv_last_page_lens[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.kv_last_page_lens.dtype,
                 device=attn_metadata.kv_last_page_lens.device,
             )
@@ -295,9 +388,9 @@ def split_attn_metadata(
     ub_num_cached_tokens = None
     if attn_metadata.num_cached_tokens is not None:
         ub_num_cached_tokens = attn_metadata.num_cached_tokens[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.num_cached_tokens.dtype,
                 device=attn_metadata.num_cached_tokens.device,
             )
@@ -306,9 +399,9 @@ def split_attn_metadata(
     ub_seq_starts = None
     if attn_metadata.seq_starts is not None:
         ub_seq_starts = attn_metadata.seq_starts[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.seq_starts.dtype,
                 device=attn_metadata.seq_starts.device,
             )
@@ -322,16 +415,11 @@ def split_attn_metadata(
         orig = attn_metadata.sparse_kv_indptr
         base = orig[req_start]
         ub_sparse_kv_indptr = orig[req_start : req_end + 1] - base
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             last_val = ub_sparse_kv_indptr[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_sparse_kv_indptr = torch.cat([ub_sparse_kv_indptr, padding])
-
-    # max_seqlen_k: recompute from the sliced context_lens
-    ub_max_seqlen_k = attn_metadata.max_seqlen_k
-    if ub_context_lens is not None and ub_num_reqs > 0:
-        ub_max_seqlen_k = int(ub_context_lens[:ub_num_reqs].max().item())
 
     # cu_seqlens_k: re-base like cu_seqlens_q (needed for prefill attention)
     ub_cu_seqlens_k = None
@@ -343,18 +431,34 @@ def split_attn_metadata(
             ub_cu_seqlens_k = clamped_k - clamped_k[0]
         else:
             ub_cu_seqlens_k = seg_k - seg_k[0]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             last_val = ub_cu_seqlens_k[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_cu_seqlens_k = torch.cat([ub_cu_seqlens_k, padding])
 
-    # max_seqlen_q: recompute from cu_seqlens_q for this ubatch
+    # Scalars (max_seqlen_q/k, total_kv) are derived from per-request lengths
+    # that originate as numpy on the CPU (see the attention builders). Instead of
+    # syncing the freshly-sliced device tensors back to the host, slice the CPU
+    # length copies and compute these with numpy — no GPU sync, no kernel
+    # launches. The copies are published by attach_tbo_cpu_lens (or created
+    # lazily on first use as a fallback) and are TBO-only.
+    ub_max_seqlen_k = attn_metadata.max_seqlen_k
     ub_max_seqlen_q = attn_metadata.max_seqlen_q
-    if ub_cu_seqlens_q is not None and ub_num_reqs > 0:
-        # Per-request q lengths are the diffs of consecutive cu_seqlens entries
-        per_req_q = ub_cu_seqlens_q[1 : ub_num_reqs + 1] - ub_cu_seqlens_q[:ub_num_reqs]
-        ub_max_seqlen_q = int(per_req_q.max().item())
+
+    if ub_num_reqs > 0:
+        # max_seqlen_k: max over this ubatch's context lengths.
+        ctx_cpu = _get_tbo_cpu_lens(attn_metadata, "context_lens")
+        if ctx_cpu is not None:
+            ub_ctx_cpu = ctx_cpu[req_start:req_end]
+            ub_max_seqlen_k = int(ub_ctx_cpu.max())
+
+        # max_seqlen_q: max per-request q length, matching the clamp/re-base that
+        # produced ub_cu_seqlens_q above (clamp to the token window, then diff).
+        cuq_cpu = _get_tbo_cpu_lens(attn_metadata, "cu_seqlens_q")
+        if cuq_cpu is not None:
+            seg = np.clip(cuq_cpu[req_start : req_end + 1], ts.start, ts.stop)
+            ub_max_seqlen_q = int(np.diff(seg).max())
 
     ub_total_kv = None
     if attn_metadata.has_cached:
@@ -385,6 +489,7 @@ def split_attn_metadata(
         sparse_kv_indptr=ub_sparse_kv_indptr,
         has_cached=attn_metadata.has_cached,
         total_kv=ub_total_kv,
+        batch_id_per_k_token=ub_batch_id_per_k_token,
         num_cached_tokens=ub_num_cached_tokens,
         seq_starts=ub_seq_starts,
         work_meta_data=None,

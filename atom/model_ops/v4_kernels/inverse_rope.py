@@ -11,6 +11,9 @@ inverse rotation in-place. GPT-J (interleaved) style only.
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.torch_guard import torch_compile_guard
+
+from atom.utils.decorators import mark_trace
 
 
 @triton.jit
@@ -29,10 +32,11 @@ def _inverse_rope_gptj_kernel(
     BLOCK_RD: tl.constexpr,
     BLOCK_RD_HALF: tl.constexpr,
 ):
-    pid_h = tl.program_id(0)
-    pid_s = tl.program_id(1)
+    # int64 to avoid 32-bit overflow in x_offs (s_offs * stride_x_s).
+    pid_h = tl.program_id(0).to(tl.int64)
+    pid_s = tl.program_id(1).to(tl.int64)
 
-    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S).to(tl.int64)
     d_offs = tl.arange(0, BLOCK_RD)
     s_mask = s_offs < S
 
@@ -69,32 +73,44 @@ def _inverse_rope_gptj_kernel(
     tl.store(x_ptr + x_offs, out, mask=x_mask)
 
 
+@mark_trace
+@torch_compile_guard(mutates_args=["x"], gen_fake=lambda *a, **k: None)
 def inverse_rope_inplace(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
+    rope_dim: int,
+    prefix: str = "",
 ) -> None:
     """In-place inverse RoPE (GPT-J style) on the rope slice of attention output.
 
+    A custom op so callers can run it inside a compiled region; the mutation has
+    to be declared or the compiler may reorder or drop the write.
+
+    Slices the rope lanes itself instead of taking ``o[..., -rd:]``: mutating a
+    strided view functionalizes into a scatter back over the whole output.
+
     Args:
-        x: ``[num_tokens, n_heads, rotary_dim]`` bf16 — typically ``o[..., -rd:]``.
+        x: ``[num_tokens, n_heads, head_dim]`` bf16 attention output.
         cos: ``[max_seq_len, 1, 1, rotary_dim // 2]`` bf16 cache.
         sin: ``[max_seq_len, 1, 1, rotary_dim // 2]`` bf16 cache.
         positions: ``[num_tokens]`` int — per-token position ids.
+        rope_dim: width of the trailing rope slice of ``head_dim``.
     """
-    S, H, rd = x.shape
+    rope = x[..., -rope_dim:]
+    S, H, rd = rope.shape
     BLOCK_RD = triton.next_power_of_2(rd)
     BLOCK_S = 32
     grid = (H, triton.cdiv(S, BLOCK_S))
     _inverse_rope_gptj_kernel[grid](
-        x,
+        rope,
         cos,
         sin,
         positions,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
+        rope.stride(0),
+        rope.stride(1),
+        rope.stride(2),
         cos.stride(0),
         cos.stride(3),
         S,

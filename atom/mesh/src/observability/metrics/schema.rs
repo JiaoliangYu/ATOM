@@ -50,7 +50,11 @@ pub const STREAMING_TRUE: &str = "true";
 pub const STREAMING_FALSE: &str = "false";
 
 pub const fn bool_to_static_str(b: bool) -> &'static str {
-    if b { STREAMING_TRUE } else { STREAMING_FALSE }
+    if b {
+        STREAMING_TRUE
+    } else {
+        STREAMING_FALSE
+    }
 }
 
 /// Static lookup table for common HTTP status codes to avoid allocations.
@@ -361,7 +365,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::ROUTER_TTFT_SECONDS,
         kind: MetricKind::Histogram,
-        help: "Time to first token by router_type, backend_type, model, endpoint (gRPC only)",
+        help: "Time to first generated output by router_type, backend_type, model, endpoint; HTTP measures ingress to first generated SSE payload",
         status: MetricStatus::Active,
     },
     MetricSpec {

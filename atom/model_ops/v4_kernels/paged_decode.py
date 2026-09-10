@@ -11,9 +11,9 @@ indices, mirroring `aiter.mla.mla_decode_fwd`'s API style.
 Caller contract:
   unified_kv:       [total_pages, D] BF16  (page_size=1)
     Conceptually merges the SWA ring buffer and the compressor paged cache
-    of a single V4 layer. Slots in `[0, swa_pages)` reference SWA entries
-    (state_slot * win + ring); slots in `[swa_pages, ...)` reference
-    compressed-K entries (block_id * K_PER_BLOCK + slot_in_block).
+    of a single V4 layer: one row space holding this layer's sliding-window
+    rows and its compressed blocks alike (see `v4_pool_geometry`), so a row
+    index says nothing about which of the two it names.
   kv_indices: [total_indices] int32 — per-token slot lists, flat.
     Per-token entries live in
     `kv_indices[kv_indptr[t] : kv_indptr[t+1]]`.
@@ -54,8 +54,13 @@ import os
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
+
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels.pool_index import row_offset
+from atom.utils.decorators import mark_trace
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
@@ -265,7 +270,7 @@ def _paged_decode_fused_kernel(
 
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + row_offset(slot, kv_stride_n)[:, None]
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
@@ -278,7 +283,9 @@ def _paged_decode_fused_kernel(
             # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
             # NUM_GROUPS-wide load per row.
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr
+                + row_offset(slot, ks_stride_n)[:, None]
+                + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -431,14 +438,16 @@ def _paged_decode_split_kernel(
 
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + row_offset(slot, kv_stride_n)[:, None]
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr
+                + row_offset(slot, ks_stride_n)[:, None]
+                + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -902,6 +911,147 @@ def sparse_attn_v4_paged_decode_reference(
     return _sparse_attn_ragged_torch(q, unified_kv, attn_sink, topk_idxs, softmax_scale)
 
 
+def _sparse_attn_v4_paged_decode_asm(
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    unified_kv_rope: torch.Tensor,
+    q_packed_in: torch.Tensor,
+    q_rope_in: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor | None = None,  # unused on v4 nm (page_size=1)
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """Native 2buff fp8 V4 decode via the aiter assembly kernel
+    ``mla_decode_fwd_v4_nm`` (ROCm/aiter#3112, mi350/gfx950).
+
+    ``unified_kv`` is the packed 512-byte fp8 NoPE pool ``[P, 512]`` and
+    ``unified_kv_rope`` is the bf16 RoPE pool ``[P, 64]`` — consumed with NO
+    requant (caller stored the 2buff layout natively). Q is supplied pre-packed
+    (``q_packed_in``/``q_rope_in``) by the compute-only 2buff quant; no per-call
+    quantize.
+
+    The flat-CSR ``unified_kv`` is made compatible with the kernel's paged
+    format by treating each token as a 1-token page (``page_size=1``):
+    ``kv_page_indices = kv_indices``, ``kv_indptr`` is the existing CSR indptr,
+    ``qo_indptr = arange(N+1)``, ``max_seqlen_q = 1``. No translation layer
+    needed. ``kv_last_page_lens`` is not built/forwarded: page_size=1 makes it
+    logically ones(N), but the kernel derives kv_seq_len from the token-level
+    ``kv_indptr`` and ignores the values (aiter synthesizes a throwaway buffer).
+
+    softmax_scale is ignored by the kernel (hardcodes 1/sqrt(512)); passed
+    through for API parity.
+    """
+    import aiter
+    import aiter.mla
+
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_NOPE,
+        V4_DIM_QK_PACKED,
+        V4_DIM_ROPE,
+    )
+
+    assert q_packed_in.dim() == 3 and q_packed_in.shape[-1] == V4_DIM_QK_PACKED, (
+        f"asm v4 nm: q_packed_in must be [N, H, {V4_DIM_QK_PACKED}] fp8, "
+        f"got {tuple(q_packed_in.shape)}"
+    )
+    assert q_rope_in.dim() == 3 and q_rope_in.shape[-1] == V4_DIM_ROPE, (
+        f"asm v4 nm: q_rope_in must be [N, H, {V4_DIM_ROPE}] bf16, "
+        f"got {tuple(q_rope_in.shape)}"
+    )
+    q_packed = q_packed_in
+    q_rope = q_rope_in
+    device = q_packed.device
+    N, H, _ = q_packed.shape
+
+    # gqa (== H, since num_kv_heads==1 for V4 MQA) head-count padding.
+    # The gfx950 v4 nm asm decode kernel only ships gqa in {16, 32, 64, 128}
+    # at qSeqLen=1 (aiter asm_mla_v4.cu heuristic); a TP sharding with fewer
+    # local heads (e.g. TP8 -> 8) hits "no shipped variant for gqa:8". Pad the
+    # Q heads up to the smallest supported gqa (16) — the extra heads compute
+    # discardable output that we slice off after the kernel. attn_sink is
+    # per-head so it pads too. Padded heads carry zero Q (finite scores, no
+    # NaN) and their outputs are never read.
+    H_real = H
+    _GQA_MIN = 16
+    if H < _GQA_MIN:
+        pad_h = _GQA_MIN - H
+        q_packed = torch.nn.functional.pad(q_packed, (0, 0, 0, pad_h))  # [N,16,512]
+        q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, pad_h))  # [N,16,64]
+        attn_sink = torch.nn.functional.pad(attn_sink, (0, pad_h))  # [16]
+        H = _GQA_MIN
+
+    assert unified_kv.dim() == 2 and unified_kv.shape[-1] == V4_DIM_QK_PACKED, (
+        f"asm v4 nm: native fp8 unified_kv must be [P, {V4_DIM_QK_PACKED}] fp8, "
+        f"got {tuple(unified_kv.shape)}"
+    )
+    assert unified_kv_rope.dim() == 2 and unified_kv_rope.shape[-1] == V4_DIM_ROPE, (
+        f"asm v4 nm: native fp8 unified_kv_rope must be [P, {V4_DIM_ROPE}] bf16, "
+        f"got {tuple(unified_kv_rope.shape)}"
+    )
+
+    nhead_kv = 1
+    page_size = 1
+    # Kernel expects KV as [num_page, page_size=1, num_kv_heads=1, dim].
+    kv_packed = unified_kv.view(-1, page_size, nhead_kv, V4_DIM_QK_PACKED)
+    kv_rope = unified_kv_rope.view(-1, page_size, nhead_kv, V4_DIM_ROPE)
+
+    # ---- per-token paged layout (one slot per token, decode=1) ----------
+    # qo_indptr = arange(N+1) and kv_last_page_lens = ones(N) are per-token
+    # (max_seqlen_q=1, page_size=1) and depend ONLY on N. They are built by the
+    # attn_metadata builder (deepseek_v4_attn._attach_v4_paged_decode_meta /
+    # prepare_mtp_decode) via the SAME forward_vars staging path as kv_indptr /
+    # kv_indices — re-staged (H2D into a persistent CpuGpuBuffer) every fwd so
+    # the captured graph reads a freshly-copied backing store at replay — and
+    # threaded in through `sparse_attn_v4_paged_decode`.
+    # The per-seq index tensors (qo_indptr [num_seqs+1], kv_indptr [num_seqs+1],
+    # kv_last_page_lens [num_seqs]) are staged by the attn-metadata builder at the
+    # PADDED decode grid T_pad so one set of buffers serves both a CG-captured
+    # (padded) replay and an eager (real-T) forward. The asm kernel derives
+    # num_seqs from qo_indptr.numel()-1, so on an EAGER forward whose real token
+    # count N is smaller than the staged T_pad — e.g. an uncaptured MTP verify
+    # batch of bs*(k+1) tokens that is not a captured cudagraph size — the kernel
+    # would emit T_pad output rows while q_packed and the `output` buffer hold
+    # only N=q_packed.shape[0] rows. That is an OOB write into `output` on the
+    # split>1 path and a shape mismatch on the logits[:,0] path (o=[T_pad,...] vs
+    # q=[N,...]). Trim every per-seq tensor to the ACTUAL query count N: the real
+    # region is self-consistent (qo_indptr[:N+1] == arange(N+1), kv_indptr[:N+1]
+    # is the real ragged cumsum) and the dropped tail is exactly the 0-length
+    # CG-padded slots. No-op when captured/padded (N == T_pad).
+    # These are all staged as int32 by the metadata builder, so no dtype cast is
+    # needed — only the trim to the real query count N (and a contiguity fixup on
+    # the possibly-viewed kv_indices).
+    qo_indptr = qo_indptr[: N + 1]
+    kv_indptr_i32 = kv_indptr[: N + 1]
+    kv_page_indices_i32 = kv_indices.contiguous()
+    max_seqlen_q = 1
+
+    output = torch.empty(
+        (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
+    )
+
+    aiter.mla.mla_decode_fwd_v4_nm(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        output,
+        qo_indptr,
+        kv_indptr_i32,
+        kv_page_indices_i32,
+        max_seqlen_q,
+        sink=attn_sink,
+        sm_scale=softmax_scale,
+        num_kv_splits=num_kv_splits,
+    )
+    # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
+    # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
+    return output[:, :H_real].contiguous() if H_real != H else output
+
+
+@mark_trace
 def sparse_attn_v4_paged_decode(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -910,13 +1060,50 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
+    q_packed_in: torch.Tensor | None = None,
+    q_rope_in: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    kv_last_page_lens: torch.Tensor | None = None,
+    prefix: str = "",
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
-    will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the aiter asm
+    kernel (op5) with pre-packed fp8 Q (``q_packed_in``/``q_rope_in``); the
+    fp8 NoPE pool + bf16 RoPE pool are read with no requant.
+
+    Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
+    is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
+    in-kernel using 1xGROUP_SIZE (default 64) block scales (legacy 1buff,
+    unreachable from the model).
     """
-    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+    if unified_kv_rope is not None:
+        return _sparse_attn_v4_paged_decode_asm(
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            unified_kv_rope,
+            q_packed_in,
+            q_rope_in,
+            qo_indptr=qo_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+        )
+    gfx = get_gfx()
+    if gfx == "gfx1250" or gfx.startswith("gfx94"):
+        return pa_decode_sparse(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            has_invalid=False,
+            kv_scales=kv_scales,
+        )
+    elif os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
         return _sparse_attn_v4_paged_decode_triton(
             q,
             unified_kv,

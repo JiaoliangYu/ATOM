@@ -4,13 +4,14 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::{
-        BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig,
-        PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+        AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
+        HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
     routers::atom_standalone::AtomStandaloneRuntime,
-    server::ServerConfig,
+    server::{ServerConfig, ServerTlsConfig},
 };
 
 pub fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
@@ -213,7 +214,12 @@ pub struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "Routing Policy")]
+    #[arg(
+        long,
+        default_value = "cache_aware",
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "Routing Policy"
+    )]
     pub policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -258,12 +264,24 @@ pub struct CliArgs {
     pub decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "PD Disaggregation")]
+    #[arg(
+        long,
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "PD Disaggregation"
+    )]
     pub prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "PD Disaggregation")]
+    #[arg(
+        long,
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "PD Disaggregation"
+    )]
     pub decode_policy: Option<String>,
+
+    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks
+    #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
+    pub atom_pd_rank_mapping_policy: String,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -451,6 +469,15 @@ pub struct CliArgs {
     /// API key for worker connections
     #[arg(long, help_heading = "Control Plane Authentication")]
     pub api_key: Option<String>,
+
+    // ==================== TLS ====================
+    /// PEM certificate chain path for serving HTTPS
+    #[arg(long, requires = "tls_key_path", help_heading = "TLS")]
+    pub tls_cert_path: Option<std::path::PathBuf>,
+
+    /// PEM private key path for serving HTTPS
+    #[arg(long, requires = "tls_cert_path", help_heading = "TLS")]
+    pub tls_key_path: Option<std::path::PathBuf>,
 }
 
 impl CliArgs {
@@ -488,6 +515,7 @@ impl CliArgs {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
+            "dp_sticky" => PolicyConfig::DpSticky,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
@@ -506,10 +534,24 @@ impl CliArgs {
         }
     }
 
+    fn validate_tls_args(&self) -> ConfigResult<()> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(_), Some(_)) | (None, None) => Ok(()),
+            (Some(_), None) => Err(ConfigError::MissingRequired {
+                field: "tls_key_path".to_string(),
+            }),
+            (None, Some(_)) => Err(ConfigError::MissingRequired {
+                field: "tls_cert_path".to_string(),
+            }),
+        }
+    }
+
     pub fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        self.validate_tls_args()?;
+
         // Determine routing mode based on PD disaggregation flag
         let mode = if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
@@ -525,6 +567,14 @@ impl CliArgs {
         };
 
         let policy = self.parse_policy(&self.policy);
+        let atom_pd_rank_mapping_policy = self
+            .atom_pd_rank_mapping_policy
+            .parse::<AtomPdRankMappingPolicy>()
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "atom_pd_rank_mapping_policy".to_string(),
+                value: self.atom_pd_rank_mapping_policy.clone(),
+                reason,
+            })?;
 
         let metrics = Some(MetricsConfig {
             port: self.prometheus_port,
@@ -552,6 +602,7 @@ impl CliArgs {
         RouterConfig::builder()
             .mode(mode)
             .backend(self.backend.into())
+            .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)
@@ -644,8 +695,77 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+            tls: self
+                .tls_cert_path
+                .as_ref()
+                .zip(self.tls_key_path.as_ref())
+                .map(|(cert_path, key_path)| ServerTlsConfig {
+                    cert_path: cert_path.clone(),
+                    key_path: key_path.clone(),
+                }),
             atom_standalone_runtime,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_policy_accepts_dp_sticky() {
+        let args = CliArgs::default();
+        assert!(matches!(
+            args.parse_policy("dp_sticky"),
+            PolicyConfig::DpSticky
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_dp_sticky_as_main_policy() {
+        let cli = Cli::try_parse_from(["atomesh", "launch", "--policy", "dp_sticky"])
+            .expect("dp_sticky should be accepted as a main policy");
+
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+
+        assert_eq!(args.policy, "dp_sticky");
+        assert!(matches!(
+            args.parse_policy(&args.policy),
+            PolicyConfig::DpSticky
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_dp_sticky_for_pd_specific_policies() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--pd-disaggregation",
+            "--prefill-policy",
+            "dp_sticky",
+            "--decode-policy",
+            "dp_sticky",
+        ])
+        .expect("dp_sticky should be accepted for PD-specific policies");
+
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+
+        assert_eq!(args.prefill_policy.as_deref(), Some("dp_sticky"));
+        assert_eq!(args.decode_policy.as_deref(), Some("dp_sticky"));
+        assert!(matches!(
+            args.parse_policy(args.prefill_policy.as_deref().unwrap()),
+            PolicyConfig::DpSticky
+        ));
+        assert!(matches!(
+            args.parse_policy(args.decode_policy.as_deref().unwrap()),
+            PolicyConfig::DpSticky
+        ));
     }
 }
 
@@ -668,6 +788,7 @@ impl Default for CliArgs {
             decode: Vec::new(),
             prefill_policy: None,
             decode_policy: None,
+            atom_pd_rank_mapping_policy: "none".to_string(),
             worker_startup_timeout_secs: 1800,
             worker_startup_check_interval: 30,
             log_dir: None,
@@ -712,6 +833,8 @@ impl Default for CliArgs {
             tool_call_parser: None,
             backend: Backend::Sglang,
             api_key: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }

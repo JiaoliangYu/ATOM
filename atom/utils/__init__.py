@@ -2,18 +2,25 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import contextlib
+import copy
+import dataclasses
+import importlib
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
 import signal
 import socket
+import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -22,16 +29,11 @@ import psutil
 import torch
 import zmq
 import zmq.asyncio
-from atom.utils.custom_register import direct_register_custom_op
-from transformers import PretrainedConfig
-
-import copy
-import dataclasses
-import importlib
-from contextlib import contextmanager
-
 from packaging import version
 from packaging.version import Version
+from transformers import PretrainedConfig
+
+from atom.utils.custom_register import direct_register_custom_op
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -41,17 +43,86 @@ from unittest.mock import patch
 logger = logging.getLogger("atom")
 
 
+def set_ulimit(target_soft_limit: int = 65535) -> None:
+    """Raise the open-file soft limit toward ``target_soft_limit`` (capped at
+    the hard limit).
+
+    High streaming concurrency needs roughly one file descriptor per in-flight
+    connection plus the engine's ZMQ/shared-memory fds. The default soft
+    ``RLIMIT_NOFILE`` (~1024) is exhausted under large concurrency (e.g. the
+    conc=1000 accuracy job), surfacing as EMFILE on ``accept()`` — which drops
+    incoming connections. vLLM and SGLang raise this at process startup for the
+    same reason; ATOM must too (the mesh launch scripts already pass
+    ``--ulimit nofile`` to docker, but plain server launches do not).
+    """
+    try:
+        import resource
+    except ImportError:  # POSIX-only; Windows has no RLIMIT_NOFILE.
+        logger.warning("resource module unavailable (non-POSIX); skipping ulimit bump.")
+        return
+
+    resource_type = resource.RLIMIT_NOFILE
+    soft, hard = resource.getrlimit(resource_type)
+    desired = (
+        target_soft_limit
+        if hard == resource.RLIM_INFINITY
+        else min(target_soft_limit, hard)
+    )
+    if soft >= desired:
+        return
+    try:
+        resource.setrlimit(resource_type, (desired, hard))
+        logger.info(
+            "Raised RLIMIT_NOFILE soft limit %d -> %d (hard=%d)", soft, desired, hard
+        )
+    except (ValueError, OSError) as e:
+        logger.warning(
+            "Found RLIMIT_NOFILE soft=%d hard=%d and failed to automatically "
+            "raise the soft limit to %d (error: %s). This can cause fd-limit "
+            "errors like `OSError: [Errno 24] Too many open files` under high "
+            "connection concurrency. The hard limit is the ceiling and cannot "
+            "be raised from inside the process — raise it where the server is "
+            "launched: docker `--ulimit nofile=65536:524288`, systemd "
+            "`LimitNOFILE=`, or /etc/security/limits.conf.",
+            soft,
+            hard,
+            desired,
+            e,
+        )
+
+
 @contextlib.contextmanager
 def set_device_control_env_var(config: "Config", local_dp_rank: int):
-    """
-    Temporarily set CUDA_VISIBLE_DEVICES or equivalent
-    for engine subprocess.
+    """Publish this engine's GPU slice under the RLHF device-map variable.
+
+    Inert for the DP path that calls it, and must stay that way. It sets a
+    variable named by the literal placeholder string; the only reader is
+    ``RLHFModelRunner.DP_DEVICE_MAP_ENV`` (atom/rollout/model_runner_ext.py),
+    which consults it solely when ``data_parallel_size <= 1``. ``CoreManager``
+    only wraps a spawn in this when ``data_parallel_size > 1``, so the two
+    never meet. Do not delete the placeholder string as dead -- it is a live
+    protocol constant for the rollout adapter.
+
+    Making it set a real ``HIP_VISIBLE_DEVICES`` was tried and reverted. The
+    mask renumbers devices in the child (``cuda:0`` becomes the first *visible*
+    GPU), but ``ModelRunner._setup_device_and_distributed`` independently
+    computes an ABSOLUTE index -- ``local_dp_rank * tp_size + rank`` -- and
+    selects ``cuda:{that}``. The two offsets compound: with ``-dp 4 -tp 2``,
+    DP rank 1 would get a mask of "2,3" (two visible devices) and then ask for
+    ``cuda:2``, which no longer exists. Startup dies on the
+    ``local_device_rank >= torch.cuda.device_count()`` check -- every
+    multi-GPU DP run, including ones that ship today.
+
+    Either the mask or the absolute index can own device placement, not both.
+    ATOM uses the absolute index, so this stays inert.
     """
     world_size = config.tensor_parallel_size
     evar = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     value = get_device_indices(evar, local_dp_rank, world_size)
-    print(f"Setting DP rank {local_dp_rank} to {value}")
+    logger.debug(
+        "%s=%s for local DP rank %d (inert placeholder)", evar, value, local_dp_rank
+    )
     with patch.dict(os.environ, values=((evar, value),)):
         yield
 
@@ -71,7 +142,7 @@ def get_device_indices(
             for i in range(local_dp_rank * world_size, (local_dp_rank + 1) * world_size)
         )
     except IndexError as e:
-        raise Exception(
+        raise ValueError(
             f"Error setting {device_control_env_var}: "
             f"local range: [{local_dp_rank * world_size}, "
             f"{(local_dp_rank + 1) * world_size}) "
@@ -83,8 +154,8 @@ def get_device_indices(
 
 def mark_spliting_op(
     is_custom: bool,
-    gen_fake: Optional[Callable[..., Any]] = None,
-    mutates_args: list[str] = [],
+    gen_fake: Callable[..., Any] | None = None,
+    mutates_args: list[str] | None = None,
 ):
     def decorator(func):
         if not is_custom:
@@ -94,7 +165,7 @@ def mark_spliting_op(
         direct_register_custom_op(
             op_name=func.__name__,
             op_func=func,
-            mutates_args=mutates_args,
+            mutates_args=mutates_args if mutates_args is not None else [],
             fake_impl=gen_fake,
         )
         registered_op = getattr(torch.ops.aiter, func.__name__)
@@ -118,9 +189,49 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
-def get_mp_context() -> Union[ForkContext, SpawnContext]:
+def get_mp_context() -> ForkContext | SpawnContext:
     """Get a multiprocessing context with 'spawn' start method."""
     return multiprocessing.get_context("spawn")
+
+
+def set_process_title(name: str, suffix: str = "", prefix: str | None = None) -> None:
+    """Set the current process title (comm/cmdline) for ps/top/rocm-smi.
+
+    rocm-smi --showpids reads the process ``comm`` field, which defaults to the
+    interpreter name (``python``). Setting a title makes GPU-holding worker
+    processes distinguishable by rank. Soft dependency: no-op if setproctitle
+    is not installed.
+    """
+    try:
+        import setproctitle
+    except ImportError:
+        return
+    from atom.utils import envs
+
+    if prefix is None:
+        prefix = envs.ATOM_PROCESS_NAME_PREFIX
+    if suffix:
+        name = f"{name}_{suffix}"
+    setproctitle.setproctitle(f"{prefix}::{name}")
+
+
+def engine_process_name(config: "Config") -> str:
+    """What an EngineCore process is called, in `ps` and in its own logs."""
+    pc = config.parallel_config
+    if config.pipeline_parallel_size > 1:
+        return f"EngineCore_PP{pc.pipeline_parallel_rank}"
+    if pc.data_parallel_size > 1:
+        return f"EngineCore_DP{pc.data_parallel_rank}"
+    return "EngineCore"
+
+
+def worker_process_name(config: "Config | None", rank: int) -> str:
+    """What a ModelRunner worker is called. `config` may be absent on paths
+    that build a worker without one."""
+    pc = getattr(config, "parallel_config", None)
+    if pc is not None and pc.data_parallel_size > 1:
+        return f"DP{pc.data_parallel_rank}TP{rank}"
+    return f"TP{rank}"
 
 
 def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
@@ -152,6 +263,76 @@ def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
             proc.close()
         except (ValueError, OSError):
             pass
+
+
+def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
+    """Arm the kernel to reap *this* process if its parent ever exits.
+
+    ATOM runs a tree of processes: the server (main) -> one ``EngineCore``
+    process per DP rank -> ``tensor_parallel_size`` ``ModelRunner`` worker
+    processes.  Each worker holds a large slice of GPU VRAM plus the custom
+    all-reduce IPC resources (``hipIpcGetMemHandle`` handles + the rendezvous
+    ``TCPStore`` bound to ``MASTER_PORT``).
+
+    If a parent exits abnormally (OOM-kill, segfault, ``SIGKILL``,
+    ``docker stop``) the kernel does not clean up its children: the worker's
+    ``busy_loop`` blocks forever on the shared-memory RPC dequeue and the
+    EngineCore blocks on its input queue.  These orphans keep the VRAM and the
+    IPC/TCP resources pinned, so a subsequent restart either fails to bind the
+    rendezvous port or, worse, opens a *stale* IPC mem handle exported by the
+    dead run -> the ``hipIpcGetMemHandle`` all-reduce crash operators work
+    around with ``docker rm -f`` + a lowered ``--gpu-memory-utilization``.
+
+    This helper wires up ``prctl(PR_SET_PDEATHSIG)`` so the kernel delivers
+    ``sig`` to the caller the instant its parent exits, for *any* reason --
+    turning a silent orphan into an immediate, self-reaping exit that releases
+    every GPU and IPC resource it held.  The setting is per-thread and is
+    cleared across ``execve``, so it cannot be inherited: each process must arm
+    itself early in its entrypoint, before any GPU / IPC state is created.
+
+    Linux-only (no-op elsewhere).  Returns ``True`` when reaping is armed and
+    ``False`` if it could not be set.  If the parent is found to be already gone
+    at arm time, it does not return: it calls ``os._exit(1)`` rather than let the
+    process linger as the orphan this is meant to prevent.
+
+    Caveat: ``PR_SET_PDEATHSIG`` fires when the *thread that created this
+    process* exits, not when the parent process as a whole exits.  Arm it only
+    from a process whose creating thread lives for the process's lifetime --
+    ATOM spawns workers from the main thread, so this holds; a short-lived
+    creator thread could otherwise trigger a premature kill.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+
+        PR_SET_PDEATHSIG = 1
+        # Resolve libc from the already-loaded image (``CDLL(None)``) rather than
+        # hard-coding ``libc.so.6``; this works on glibc and musl (e.g. Alpine)
+        # alike, where the soname differs.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+            err = ctypes.get_errno()
+            logger.warning("prctl(PR_SET_PDEATHSIG) failed: errno=%d", err)
+            return False
+    except Exception as e:  # noqa: BLE001 - best-effort; platform-dependent
+        # ctypes/prctl is Linux-specific and can fail on a restricted or
+        # non-glibc image. Orphan reaping is a safety net, so losing it must
+        # not stop the process that was trying to arm it.
+        logger.warning("Could not arm orphan reaping: %s", e)
+        return False
+
+    # The parent can die between spawning us and this call -- before or after the
+    # prctl above -- so PR_SET_PDEATHSIG may never fire.  Detect it unambiguously
+    # via multiprocessing's parent handle (a sentinel pipe): unlike
+    # ``getppid() == 1``, this is not fooled by a parent that legitimately runs
+    # as PID 1 (ATOM's server is PID 1 in the container).  If the parent is
+    # already gone, exit now rather than linger as the orphan this prevents.
+    parent = multiprocessing.parent_process()
+    if parent is not None and not parent.is_alive():
+        logger.warning("Parent already exited while arming orphan reaping; exiting.")
+        os._exit(1)
+    return True
 
 
 def kill_process_tree(pid: int):
@@ -254,7 +435,7 @@ def _get_open_port() -> int:
             return s.getsockname()[1]
 
 
-@lru_cache()
+@lru_cache
 def get_zmq_base_path() -> str:
     return tempfile.gettempdir()
 
@@ -280,7 +461,7 @@ def get_engine_client_zmq_addr(local_only: bool, host: str, port: int = 0) -> st
     )
 
 
-def close_sockets(sockets: Sequence[Union[zmq.Socket, zmq.asyncio.Socket]]):
+def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
     for sock in sockets:
         if sock is not None:
             sock.close(linger=0)
@@ -307,7 +488,7 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
     return scheme, host, port
 
 
-def make_zmq_path(scheme: str, host: str, port: Optional[int] = None) -> str:
+def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
     """Make a ZMQ path from its parts.
 
     Args:
@@ -325,15 +506,15 @@ def make_zmq_path(scheme: str, host: str, port: Optional[int] = None) -> str:
     return f"{scheme}://{host}:{port}"
 
 
-# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501
+# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783
 def make_zmq_socket(
-    ctx: Union[zmq.asyncio.Context, zmq.Context],  # type: ignore[name-defined]
+    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]
     path: str,
     socket_type: Any,
-    bind: Optional[bool] = None,
-    identity: Optional[bytes] = None,
-    linger: Optional[int] = None,
-) -> Union[zmq.Socket, zmq.asyncio.Socket]:  # type: ignore[name-defined]
+    bind: bool | None = None,
+    identity: bytes | None = None,
+    linger: int | None = None,
+) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
 
     mem = psutil.virtual_memory()
@@ -408,9 +589,9 @@ def init_exit_handler(self: Any):
 def zmq_socket_ctx(
     path: str,
     socket_type: Any,
-    bind: Optional[bool] = None,
+    bind: bool | None = None,
     linger: int = 0,
-    identity: Optional[bytes] = None,
+    identity: bytes | None = None,
 ) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket"""
 
@@ -424,12 +605,101 @@ def zmq_socket_ctx(
         ctx.destroy(linger=linger)
 
 
+# A pageable host-to-device copy larger than the driver's staging buffer cannot
+# be handed off and returned from: the host waits for it, and because it goes
+# out on the current stream it waits behind everything already queued there.
+# Under it, the driver stages the bytes and returns immediately.
+#
+# Measured on MI355X with 4 ms of work in flight, host time charged to the copy:
+#
+#     bytes    pageable   pin_memory()   persistent pinned
+#     64 KB    0.018 ms      0.021 ms         0.022 ms
+#    400 KB    0.037 ms      0.167 ms         0.014 ms
+#    512 KB    0.032 ms          --           0.014 ms
+#    560 KB    3.047 ms          --           0.015 ms   <-- cliff
+#    800 KB    3.058 ms      0.168 ms         0.031 ms
+#
+# Three things follow. Below the cliff every route costs about the same, so the
+# one that allocates nothing wins. Above it pageable is ~100x worse and the
+# choice is forced. And neither route here is as good as a persistent pinned
+# buffer: charged against queue depth at 1.5 MB, pageable grows +84 us per
+# queued matmul and a `CpuGpuBuffer` is flat, while a per-call `pin_memory()`
+# lands anywhere from +3 to +36 depending on how fragmented the caching host
+# allocator already is -- better than pageable, and not something to rely on.
+# That is why `CpuGpuBuffer` exists and why a per-forward buffer should be one.
+_PAGEABLE_H2D_LIMIT = 512 * 1024
+
+
+@lru_cache(maxsize=8)
+def _warn_oversize_upload(nbytes: int) -> None:
+    logger.warning(
+        "upload_numpy: %d B is past the %d B pageable limit, so it is staged "
+        "through a fresh pinned block every call. A per-forward upload this "
+        "size should own a CpuGpuBuffer instead.",
+        nbytes,
+        _PAGEABLE_H2D_LIMIT,
+    )
+
+
+def upload_numpy(arr: np.ndarray, device, *, non_blocking: bool = True) -> torch.Tensor:
+    """Copy a numpy array to `device` by whichever route its size calls for.
+
+    For one-off and size-varying uploads, where the size can cross the cliff as
+    a config knob moves and nobody notices until a step takes milliseconds
+    longer. A buffer uploaded every forward should be a `CpuGpuBuffer`.
+
+    A shared reusable staging block is not a third option, and was tried: its
+    copy goes out on the current stream, so the event that makes reuse safe
+    sits behind whatever is queued, and waiting on it costs what pageable
+    costs. Only a block nobody else touches escapes that.
+    """
+    if arr.nbytes <= _PAGEABLE_H2D_LIMIT:
+        return torch.from_numpy(arr).to(device, non_blocking=non_blocking)
+    _warn_oversize_upload(arr.nbytes)
+    return torch.from_numpy(arr).pin_memory().to(device, non_blocking=non_blocking)
+
+
+def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
+    """Left-align ragged `rows` into a 2-D int32 `dst`, zero-filling the rest.
+
+    A numpy row assign costs ~245ns on MI355X and does not vary with the row's
+    length until the bytes start to matter (~500 ints), so a marshal of short
+    rows is dispatch and nothing else -- 4.0 ms at 16k rows. Through one
+    `memoryview` of the destination the same write is ~46ns.
+
+    `.cast` is what makes the flattening safe: it refuses a non-contiguous
+    buffer, where `reshape(-1)` would hand back a copy and silently drop every
+    write. Rows must export a buffer of int32 -- an `array("i")` or an int32
+    ndarray -- since that is what makes each write a memcpy.
+    """
+    if dst.dtype != np.int32:
+        # `.cast("i")` would reinterpret the bits of any other dtype rather
+        # than convert them, so this must be checked and not assumed.
+        raise TypeError(f"pack_rows needs an int32 destination, got {dst.dtype}")
+    # Both dimensions are checked here because a flat write has no edge in
+    # either: an over-wide row would land in the next row, and an over-long
+    # batch would run off the end with only a memoryview structure error to
+    # say so. The numpy form this replaces raised on both.
+    n_rows, (max_rows, cols) = len(rows), dst.shape
+    if n_rows > max_rows:
+        raise ValueError(f"{n_rows} rows exceed the {max_rows}-row destination")
+    dst[:n_rows] = 0  # one memset over the rows in play, not one per row
+    flat = memoryview(dst).cast("B").cast("i")
+    base = 0
+    for row in rows:
+        n = len(row)
+        if n > cols:
+            raise ValueError(f"row of {n} exceeds the {cols}-column destination")
+        flat[base : base + n] = row
+        base += cols  # the destination's stride, not the row's length
+
+
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
     def __init__(
         self,
-        *size: Union[int, torch.SymInt],
+        *size: int | torch.SymInt,
         dtype: torch.dtype,
         device: torch.device,
         pin_memory: bool = True,
@@ -449,17 +719,33 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
-    def copy_to_cpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
         if n is None:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
+
+    def clone(self) -> "CpuGpuBuffer":
+        """Allocate an independent buffer with the same shape/dtype/device and
+        copy over the current cpu+gpu contents (preserves one-time inits like
+        arange/zeros). Used to build per-in-flight-slot metadata rings so
+        concurrent pipeline microbatches never share a staging buffer."""
+        new = CpuGpuBuffer(
+            *self.cpu.shape,
+            dtype=self.cpu.dtype,
+            device=self.gpu.device,
+            pin_memory=self.cpu.is_pinned(),
+            with_numpy=hasattr(self, "np"),
+        )
+        new.cpu.copy_(self.cpu)
+        new.gpu.copy_(self.gpu)
+        return new
 
 
 context_manager = None
@@ -477,7 +763,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
     """
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any parse failure falls back to PKG-INFO
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version("torch")) >= Version(target)
 
@@ -488,21 +774,112 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
     return torch_version >= version.parse(target)
 
 
+# Lazily-compiled fallback weak-ref op. vLLM ships a `torch.ops._C.weak_ref_tensor`
+# (csrc/libtorch_stable/ops.h) that returns a tensor SHARING the input's memory
+# but NOT owning its storage — so once the original tensor is freed the
+# CUDACachingAllocator block is reclaimable and a cudagraph memory pool can
+# OVERLAY it across shapes. That op is absent in some ROCm builds (no vLLM _C),
+# and a pure-Python weak ref is impossible: dlpack / set_(untyped_storage) both
+# share the Storage object and thus KEEP it alive -> the pool cannot reuse the
+# memory -> every captured piece's output accumulates (35GB+ on DSV4 TP8
+# PIECEWISE). We therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)`
+# equivalent once (cached under ~/.cache/torch_extensions) so PIECEWISE cudagraph
+# pools overlay exactly like upstream vLLM.
+_ATOM_WEAKREF_OP = None  # None = not attempted, False = unavailable, else callable
+
+
+def _get_weak_ref_op():
+    global _ATOM_WEAKREF_OP
+    if _ATOM_WEAKREF_OP is not None:
+        return _ATOM_WEAKREF_OP or None
+
+    # 1) Prefer a native op if this build already registered one (e.g. vLLM _C).
+    try:
+        op = torch.ops._C.weak_ref_tensor
+        # Probe that it is actually callable / registered.
+        op  # noqa: B018
+        _ATOM_WEAKREF_OP = op
+        return op
+    except (AttributeError, RuntimeError):
+        pass
+
+    # 2) JIT-compile a minimal from_blob weak ref (no-op deleter => shares memory
+    #    without owning the allocator block). One-time compile, then cached.
+    try:
+        import os as _os
+
+        if _os.environ.get("ATOM_DISABLE_JIT_WEAKREF", "0") == "1":
+            _ATOM_WEAKREF_OP = False
+            return None
+        from torch.utils.cpp_extension import load_inline
+
+        _cpp = r"""
+#include <torch/extension.h>
+at::Tensor atom_weak_ref_tensor(at::Tensor input) {
+  TORCH_CHECK(input.is_cuda(), "weak_ref_tensor: input must be CUDA");
+  void* data_ptr = input.data_ptr();
+  auto options = at::TensorOptions()
+                     .dtype(input.scalar_type())
+                     .device(input.device());
+  // Empty deleter: the returned tensor shares `input`'s memory but does NOT own
+  // the CUDACachingAllocator block, so freeing `input` lets the pool reclaim it.
+  return at::from_blob(data_ptr, input.sizes(), input.strides(),
+                       [](void*) {}, options);
+}
+"""
+        _mod = load_inline(
+            name="atom_weakref",
+            cpp_sources=[_cpp],
+            functions=["atom_weak_ref_tensor"],
+            with_cuda=True,
+            verbose=False,
+        )
+        _ATOM_WEAKREF_OP = _mod.atom_weak_ref_tensor
+        return _ATOM_WEAKREF_OP
+    except Exception as _e:  # noqa: BLE001
+        # Any build/compile failure -> disable (return-as-is is functionally
+        # correct, just uses more memory). Logged once.
+        try:
+            from aiter import logger as _logger
+
+            _logger.warning(
+                "atom weak_ref_tensor JIT compile failed (%s); PIECEWISE "
+                "cudagraph pools will NOT overlay -> higher memory. Set "
+                "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
+                _e,
+            )
+        except Exception:  # noqa: BLE001, S110 - the logger itself is what failed
+            # Deliberately silent: this handler wraps the *warning* above, so
+            # the only thing left to report with is the thing that just broke.
+            # The caller still gets the correct (unoptimized) fallback below.
+            pass
+        _ATOM_WEAKREF_OP = False
+        return None
+
+
 def weak_ref_tensor(tensor: Any) -> Any:
     """
     Create a weak reference to a tensor.
-    The new tensor will share the same data as the original tensor,
-    but will not keep the original tensor alive.
+    The new tensor shares the same data as the original tensor but does NOT keep
+    the original tensor's storage alive — essential for cudagraph memory pools to
+    overlay captured outputs across shapes. Falls back to returning the tensor
+    unchanged (functionally correct, more memory) if no weak-ref op is available.
     """
-    if isinstance(tensor, torch.Tensor):
-        return torch.ops._C.weak_ref_tensor(tensor)
+    if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+        op = _get_weak_ref_op()
+        if op is not None:
+            try:
+                return op(tensor)
+            except (AttributeError, RuntimeError):
+                return tensor
+        return tensor
     else:
         return tensor
 
 
 def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
+    tensors: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor],
+) -> torch.Tensor | list[Any] | tuple[Any] | Any:
     """
     Convenience function to create weak references to tensors,
     for single tensor, list of tensors or tuple of tensors.
@@ -567,10 +944,87 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     return getattr(module, obj_name)
 
 
+# Mirrored from Torch 2.11's private
+# _get_dynamo_config_for_logging().clean_for_json(). The cleanup function is
+# nested, so ATOM cannot reuse it while fixing the serializer below.
+_TORCH_DYNAMO_METRICS_CONFIG_BLOCKLIST = {
+    "TYPE_CHECKING",
+    "log_file_name",
+    "verbose",
+    "repro_after",
+    "repro_level",
+    "repro_forward_only",
+    "repro_tolerance",
+    "repro_ignore_non_fp",
+    "same_two_models_use_fp64",
+    "base_dir",
+    "debug_dir_root",
+    "_save_config_ignore",
+    "log_compilation_metrics",
+    "inject_BUILD_SET_unimplemented_TESTING_ONLY",
+    "_autograd_backward_strict_mode_banned_ops",
+    "reorderable_logging_functions",
+    "ignore_logger_methods",
+    "traceable_tensor_subclasses",
+    "nontraceable_tensor_subclasses",
+    "_custom_ops_profile",
+}
+
+# ATOM adds bound logger methods to this Torch 2.11 setting. Those callables are
+# the only extra value excluded from the metrics JSON.
+_DYNAMO_METRICS_CONFIG_BLOCKLIST = _TORCH_DYNAMO_METRICS_CONFIG_BLOCKLIST | {
+    "ignore_logging_functions"
+}
+
+
+def _patch_torch_dynamo_metrics_config_logging() -> None:
+    """Extend Torch's metrics cleanup for ATOM's callable logging ignores."""
+    config = torch._dynamo.config
+    if not hasattr(config, "ignore_logging_functions"):
+        return
+
+    try:
+        from torch._dynamo import utils as dynamo_utils
+    except ImportError:
+        return
+
+    original = getattr(dynamo_utils, "_get_dynamo_config_for_logging", None)
+    if original is None or getattr(
+        original, "_atom_ignore_logging_functions_patched", False
+    ):
+        return
+
+    try:
+        original()
+    except TypeError:
+        pass
+    else:
+        return
+
+    def wrapped_get_dynamo_config_for_logging():
+        config_dict = {
+            key: sorted(value) if isinstance(value, set) else value
+            for key, value in config.get_config_copy().items()
+            if key not in _DYNAMO_METRICS_CONFIG_BLOCKLIST
+        }
+        return json.dumps(config_dict, sort_keys=True)
+
+    # Verify the copied serializer before replacing Torch's private helper.
+    try:
+        wrapped_get_dynamo_config_for_logging()
+    except (TypeError, ValueError):
+        return
+
+    wrapped_get_dynamo_config_for_logging._atom_ignore_logging_functions_patched = True
+    dynamo_utils._get_dynamo_config_for_logging = wrapped_get_dynamo_config_for_logging
+
+
 def getLogger():
-    global logger
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        # Must match the handler level below: a logger at DEBUG feeding a
+        # handler at INFO still builds a LogRecord per logger.debug() call
+        # and then discards it -- 10.4% of the API server's CPU at c=2048.
+        logger.setLevel(logging.INFO)
 
         console_handler = logging.StreamHandler()
         from atom.utils import envs as _envs
@@ -589,15 +1043,22 @@ def getLogger():
         console_handler.setLevel(logging.INFO)
 
         logger.addHandler(console_handler)
-        if hasattr(torch._dynamo.config, "ignore_logger_methods"):
-            torch._dynamo.config.ignore_logger_methods = (
-                logging.Logger.info,
-                logging.Logger.warning,
-                logging.Logger.debug,
-                logger.warning,
-                logger.info,
-                logger.debug,
+        ignored_logger_methods = {
+            logging.Logger.info,
+            logging.Logger.warning,
+            logging.Logger.debug,
+            logger.warning,
+            logger.info,
+            logger.debug,
+        }
+        if hasattr(torch._dynamo.config, "ignore_logging_functions"):
+            torch._dynamo.config.ignore_logging_functions = set(
+                torch._dynamo.config.ignore_logging_functions
             )
+            torch._dynamo.config.ignore_logging_functions.update(ignored_logger_methods)
+            _patch_torch_dynamo_metrics_config_logging()
+        elif hasattr(torch._dynamo.config, "ignore_logger_methods"):
+            torch._dynamo.config.ignore_logger_methods = tuple(ignored_logger_methods)
 
     return logger
 

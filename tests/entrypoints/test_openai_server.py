@@ -21,7 +21,6 @@ import socket
 import subprocess
 import sys
 import time
-from typing import List, Optional
 
 import pytest
 import requests
@@ -55,7 +54,16 @@ try:
 except ImportError:
     _HAS_GPU = False
 
-pytestmark = pytest.mark.skipif(not _HAS_GPU, reason="No GPU available")
+# Opt-in guard. This module spawns a real ATOM server (Popen + model load, blocks
+# up to TIMEOUT on /health), so a bare `pytest tests/` on a GPU box would hang and
+# leave an orphan server holding VRAM. Require an explicit opt-in in addition to a
+# GPU so the default full-suite run always skips it. CI runs it (when it does) via
+# the entrypoints path with ATOM_RUN_SERVER_INTEGRATION=1, not the unit gate.
+_OPT_IN = os.environ.get("ATOM_RUN_SERVER_INTEGRATION") == "1"
+pytestmark = pytest.mark.skipif(
+    not (_HAS_GPU and _OPT_IN),
+    reason="server integration test; set ATOM_RUN_SERVER_INTEGRATION=1 (needs GPU) to run",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +81,8 @@ class RemoteATOMServer:
         self,
         model: str,
         host: str = HOST,
-        port: Optional[int] = None,
-        extra_args: Optional[List[str]] = None,
+        port: int | None = None,
+        extra_args: list[str] | None = None,
         timeout: int = TIMEOUT,
     ):
         self.model = model
@@ -82,7 +90,7 @@ class RemoteATOMServer:
         self.port = port or _find_free_port()
         self.base_url = f"http://{self.host}:{self.port}"
         self.timeout = timeout
-        self.proc: Optional[subprocess.Popen] = None
+        self.proc: subprocess.Popen | None = None
 
         cmd = [
             sys.executable,
@@ -183,6 +191,18 @@ class TestHealthAndModels:
         assert len(data["data"]) == 1
         assert data["data"][0]["id"] == MODEL
         assert data["data"][0]["owned_by"] == "atom"
+
+    def test_metrics(self, base_url):
+        r = requests.get(f"{base_url}/metrics")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/plain")
+        assert "atom:metrics_snapshot_available" in r.text
+        assert "atom:requests_running" in r.text
+        assert "vllm:" not in r.text
+
+        head = requests.head(f"{base_url}/metrics")
+        assert head.status_code == 200
+        assert head.content == b""
 
 
 # ---------------------------------------------------------------------------

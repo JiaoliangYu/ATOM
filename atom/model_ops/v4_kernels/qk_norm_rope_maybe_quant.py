@@ -29,11 +29,64 @@ Designed for the decode path only — prefill (large num_tokens) keeps the
 ops anyway.
 """
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
+
+from atom.model_ops.v4_kernels.state_writes import swa_scatter_rows
+from atom.utils.decorators import mark_trace
+
+
+@dataclass
+class QKNormRopeOut:
+    """Unified carrier for :func:`qk_norm_rope_maybe_quant`.
+
+    The bf16 and fp8-2buff paths return genuinely different tensors, so both
+    are named fields on one struct (the inactive path's fields stay ``None``).
+    Downstream ``sparse_attn_v4_paged_{decode,prefill}`` / ``swa_write`` read
+    the fields they need and dispatch on the kv-cache layout themselves — the
+    model no longer branches on ``kv_fp8`` to pick tensors.
+
+    bf16 path (fp8 fields None):
+      - ``q_sa``    [T, H, D] bf16 — post norm+rope Q (a.k.a. the old ``q_out``).
+      - ``kv``      [T, D]    bf16 — post norm+rope KV.
+      - ``q_scale`` [T, H]    fp32 — only when per-row ``quant_q``, else None.
+      - ``kv_scale``[T]       fp32 — only when per-row ``quant_k``, else None.
+
+    fp8 2buff path (bf16 fields None):
+      - ``q_packed`` [T, H, 512] fp8  — NoPE fp8 + inline e8m0 scale + pad.
+      - ``q_rope``   [T, H, 64]  bf16 — rotated Q-PE (not quantized).
+      - ``k_packed`` [T, 1, 512] fp8  — NoPE fp8 (single MQA KV head).
+      - ``k_rope``   [T, 1, 64]  bf16 — rotated K-PE.
+    """
+
+    q_sa: torch.Tensor | None = None
+    kv: torch.Tensor | None = None
+    q_scale: torch.Tensor | None = None
+    kv_scale: torch.Tensor | None = None
+    q_packed: torch.Tensor | None = None
+    q_rope: torch.Tensor | None = None
+    k_packed: torch.Tensor | None = None
+    k_rope: torch.Tensor | None = None
+
+    def custom_op_return(self) -> list["torch.Tensor"]:
+        """This struct as a custom op's return value: the active layout's
+        tensors, in the order the boundary carries them.
+
+        A custom op schema cannot express this struct. It has no dataclass, and
+        `Tensor[]` cannot hold None (`infer_schema` rejects
+        `list[Tensor | None]` outright), while half of these fields always are
+        None -- so what crosses is the live ones only, and the ORDER is the
+        contract the caller re-expands by. Which layout is live is readable off
+        the struct itself -- the inactive path's fields stay None, as above --
+        so callers do not thread `kv_fp8` through to say it a second time.
+        """
+        if self.q_packed is not None:
+            return [self.q_packed, self.q_rope, self.k_packed, self.k_rope]
+        return [self.q_sa, self.kv]
+
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
@@ -42,7 +95,7 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_AVAILABLE = True
-except Exception:
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_AVAILABLE = False
 
 
@@ -303,7 +356,7 @@ def _qk_norm_rope_maybe_quant_kernel(
         tl.store(kv_out_base + NOPE + rd_offs[None, :], pe.to(ot), mask=m_mask[:, None])
 
 
-def qk_norm_rope_maybe_quant(
+def _qk_norm_rope_maybe_quant_bf16(
     q: torch.Tensor,
     kv: torch.Tensor,
     kv_weight: torch.Tensor,
@@ -316,7 +369,11 @@ def qk_norm_rope_maybe_quant(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    swa_kv: torch.Tensor | None = None,
+    swa_dest_rows: torch.Tensor | None = None,
+    batch_id_per_q_token: torch.Tensor | None = None,
+    prefix: str = "",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
     Args:
@@ -333,6 +390,20 @@ def qk_norm_rope_maybe_quant(
         eps: RMSNorm epsilon.
         quant_q, quant_k: independently emit per-row FP8 + per-row fp32 scale.
             ``False`` keeps the bf16 output and returns ``None`` for that scale.
+        swa_kv: ``[rows, D]`` bf16 — this layer's view of the KV plane. When
+            provided, the (bf16) KV row is also written to
+            ``swa_kv[swa_dest_rows[t]]``. The flydsl path fuses this into the
+            qk_norm launch; the Triton fallback emits a separate
+            ``swa_scatter_rows`` so both backends have identical side effects.
+            Decode-only (prefill writes its window tail post-attention).
+            BF16 only (requires ``quant_k=False``).
+        swa_dest_rows: ``[>=T]`` int32 — plane row for each token, built once
+            per forward by ``write_v4_paged_decode_indices``. Required when
+            ``swa_kv`` is set. The row is handed in rather than derived because
+            the window's layout is not something a kernel in another repo
+            should have to restate.
+        batch_id_per_q_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
+            map; padded tokens are skipped.
 
     Returns:
         ``(q_out, kv_out, q_scale_or_None, k_scale_or_None)``:
@@ -397,6 +468,11 @@ def qk_norm_rope_maybe_quant(
     # "auto" picks flydsl whenever the shape matches.
     # ------------------------------------------------------------------
     if _FLYDSL_AVAILABLE:
+        # When swa_kv is provided, the flydsl kernel additionally scatters the
+        # post-norm/rope KV row into `swa_kv[swa_dest_rows[t]]` in the same
+        # launch, replacing a separate scatter launch. BF16 only (quant_k off).
+        if swa_kv is not None and swa_dest_rows is None:
+            raise ValueError("swa_kv requires swa_dest_rows")
         return flydsl_qk_norm_rope_quant(
             q,
             kv,
@@ -410,6 +486,11 @@ def qk_norm_rope_maybe_quant(
             quant=quant_q,
             q_out=q_out,
             kv_out=kv_out,
+            swa_kv=swa_kv,
+            swa_dest_rows=swa_dest_rows,
+            # aiter's parameter name -- NOT ours. Do not sweep it along when
+            # renaming the ATOM-side spelling.
+            batch_id_per_token=batch_id_per_q_token,
         )
 
     q_scale = (
@@ -476,7 +557,140 @@ def qk_norm_rope_maybe_quant(
         num_warps=num_warps,
         waves_per_eu=1,
     )
+
+    # Triton fallback does not fuse the SWA cache-write — emit it as a separate
+    # launch so callers get identical side effects regardless of which kernel
+    # backend ran (the flydsl path fuses it above). Only fires when the caller
+    # requested it (swa_kv provided) AND supplied the fallback's cu_seqlens_q
+    # path args.
+    if swa_kv is not None:
+        if swa_dest_rows is None or batch_id_per_q_token is None:
+            raise ValueError(
+                "swa_kv on the Triton fallback path requires swa_dest_rows "
+                "and batch_id_per_q_token"
+            )
+        swa_scatter_rows(
+            kv_out,
+            swa_dest_rows,
+            batch_id_per_q_token,
+            swa_kv,
+            prefix=f"{prefix}.swa_scatter_rows" if prefix else "",
+        )
+
     return q_out, kv_out, q_scale, kv_scale
+
+
+@mark_trace
+def qk_norm_rope_maybe_quant(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    eps: float,
+    quant_q: bool = False,
+    quant_k: bool = False,
+    swa_kv: torch.Tensor | None = None,
+    swa_dest_rows: torch.Tensor | None = None,
+    batch_id_per_q_token: torch.Tensor | None = None,
+    prefix: str = "",
+    *,
+    fp8_2buff: bool = False,
+    swa_nope_scale_buff: torch.Tensor | None = None,
+    swa_rope_buff: torch.Tensor | None = None,
+) -> QKNormRopeOut:
+    """Per-token RMSNorm + GPT-J RoPE, dispatching on the kv-cache layout.
+
+    This is the single entry the V4 model calls; it picks the kernel from the
+    kv-cache dtype so the model no longer branches on ``kv_fp8``:
+
+    - ``fp8_2buff=False`` (bf16 kv cache): the existing fused Triton / flydsl
+      per-token RMSNorm + RoPE (+ optional per-row FP8 quant + fused bf16 SWA
+      scatter). All the ``swa_*`` / ``quant_*`` args behave exactly as before.
+      Returns a :class:`QKNormRopeOut` with ``q_sa`` / ``kv`` (/ ``q_scale`` /
+      ``kv_scale``) populated.
+
+    - ``fp8_2buff=True`` (fp8 kv cache): dispatches to aiter's
+      ``fused_qk_norm_rope_group_quant`` — per-head weightless Q RMSNorm +
+      weighted KV RMSNorm + GPT-J RoPE + 1x64 e8m0 fp8 group-quant into the
+      native 2buff layout (NoPE-fp8 [.,512] + RoPE-bf16 [.,64]) consumed by op4
+      (prefill) / op5 (decode) with no requant. The decode path additionally
+      fuses the SWA scatter into the same launch via ``swa_nope_scale_buff``
+      / ``swa_rope_buff`` / ``swa_dest_rows`` /
+      ``batch_id_per_q_token`` (pass ``None`` for prefill, which scatters its
+      window tail post-attention). Returns a :class:`QKNormRopeOut` with
+      ``q_packed`` / ``q_rope`` / ``k_packed`` / ``k_rope`` populated.
+
+    See :func:`_qk_norm_rope_maybe_quant_bf16` for the bf16 arg contract.
+    """
+    if not fp8_2buff:
+        q_out, kv_out, q_scale, kv_scale = _qk_norm_rope_maybe_quant_bf16(
+            q,
+            kv,
+            kv_weight,
+            cos_cache,
+            sin_cache,
+            positions,
+            n_local_heads,
+            head_dim,
+            rope_head_dim,
+            eps,
+            quant_q=quant_q,
+            quant_k=quant_k,
+            swa_kv=swa_kv,
+            swa_dest_rows=swa_dest_rows,
+            batch_id_per_q_token=batch_id_per_q_token,
+            prefix=prefix,
+        )
+        return QKNormRopeOut(q_sa=q_out, kv=kv_out, q_scale=q_scale, kv_scale=kv_scale)
+
+    # ---- fp8 native 2buff path (aiter group-quant, moved here from the model).
+    # Single fused launch: per-head weightless Q RMSNorm + weighted KV RMSNorm +
+    # GPT-J RoPE + 1x64 e8m0 fp8 group-quant into the 2buff layout
+    # (NoPE-fp8 [.,512] + RoPE-bf16 [.,64]) that op4 (prefill) / op5 (decode)
+    # consume directly. is_neox=False = GPT-J adjacent-pair RoPE; q_weight=None =
+    # V4-Pro weightless Q. Decode fuses the paged SWA cache-write via the
+    # swa_* buffers; prefill passes them None and scatters its tail post-attn.
+    from aiter import dtypes
+    from aiter.ops.fused_qk_norm_rope_cache_quant import (
+        fused_qk_norm_rope_group_quant,
+    )
+
+    num_tokens = q.shape[0]
+    # aiter derives rot_dim from cos_cache.shape[-1]*2, so it needs the 2D
+    # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [., rd//2, 1, 1].
+    cos_2d = cos_cache.squeeze(-2).squeeze(-2)
+    sin_2d = sin_cache.squeeze(-2).squeeze(-2)
+    q_packed, q_rope, k_packed, k_rope = fused_qk_norm_rope_group_quant(
+        q.view(num_tokens, n_local_heads, head_dim),
+        kv,
+        kv_weight,
+        positions,
+        cos_2d,
+        sin_2d,
+        eps,
+        is_neox=False,
+        q_out_dtype=dtypes.fp8,
+        q_weight=None,
+        quant_group_size=64,
+        scale_dtype="e8m0",
+        swa_nope_scale_buff=swa_nope_scale_buff,
+        swa_rope_buff=swa_rope_buff,
+        # The destination row per token, precomputed. `swa_dest_row` is what
+        # selects it over the block-table path. The window's own arithmetic
+        # (which entry, which run inside it) stays in `v4_pool_geometry`, so a
+        # layout change never needs this kernel rebuilt.
+        swa_dest_row=swa_dest_rows,
+        # aiter's parameter name -- NOT ours (see the flydsl call above).
+        batch_id_per_token=batch_id_per_q_token,
+    )
+    return QKNormRopeOut(
+        q_packed=q_packed, q_rope=q_rope, k_packed=k_packed, k_rope=k_rope
+    )
 
 
 def qk_norm_rope_maybe_quant_reference(
@@ -492,7 +706,7 @@ def qk_norm_rope_maybe_quant_reference(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Pure-torch reference. Matches the kernel modulo bf16 reduction-order
     noise. Performs RMSNorm (Q weightless, KV weighted), then a manual GPT-J
     interleaved RoPE on the tail ``rope_head_dim``, then optional per-row
@@ -563,3 +777,60 @@ def qk_norm_rope_maybe_quant_reference(
         kv_scale = None
 
     return q_out, kv_out, q_scale, kv_scale
+
+
+def qk_norm_rope_maybe_quant_fp8_2buff(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compile-safe Triton fp8 2buff Q/K: per-head weightless Q RMSNorm +
+    weighted KV RMSNorm + GPT-J RoPE (bf16), then per-64-elt-tile e8m0 fp8 quant
+    of the NoPE half + 2buff pack (RoPE tail kept bf16).
+
+    Composed from two already-tuned Triton pieces (kept separate for reuse and
+    independent testability rather than fused into one launch):
+
+    1. :func:`qk_norm_rope_maybe_quant` (bf16, quant off) — per-head weightless
+       Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE.
+    2. :func:`quantize_bf16_to_v4_2buff_triton` — per-64-elt-tile e8m0 fp8 quant
+       of the NoPE half + 2buff pack, RoPE tail kept bf16.
+
+    Compute-only: it does NOT perform a fused SWA scatter. Callers on the decode
+    path must additionally call ``swa_write_2buff_prepacked`` on the returned
+    ``k_packed``/``k_rope`` (the prefill call site scatters its tail post-attn).
+
+    Returns ``(q_packed [T, H, 512] fp8, q_rope [T, H, 64] bf16,
+    k_packed [T, 1, 512] fp8, k_rope [T, 1, 64] bf16)``.
+    """
+    from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff_triton
+
+    # bf16 norm+rope (existing Triton/flydsl kernel, no quant, no SWA scatter).
+    q_bf16, kv_bf16, _, _ = _qk_norm_rope_maybe_quant_bf16(
+        q,
+        kv,
+        kv_weight,
+        cos_cache,
+        sin_cache,
+        positions,
+        n_local_heads,
+        head_dim,
+        rope_head_dim,
+        eps,
+        quant_q=False,
+        quant_k=False,
+    )
+
+    # q_bf16: [T, H, D]; kv_bf16: [T, D] -> [T, 1, D] (single KV head).
+    T = q_bf16.shape[0]
+    q_packed, q_rope = quantize_bf16_to_v4_2buff_triton(q_bf16)
+    k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(kv_bf16.view(T, 1, head_dim))
+
+    return q_packed, q_rope, k_packed, k_rope

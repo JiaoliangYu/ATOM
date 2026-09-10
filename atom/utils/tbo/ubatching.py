@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -24,8 +24,99 @@ def tbo_enabled() -> bool:
 
 # =====================================================================
 # DP-side TBO helpers (formerly ModelRunner._local_tbo_precompute and
-# the inline sync block inside ModelRunner._preprocess).
+# the inline sync block inside ForwardMode.decide).
 # =====================================================================
+
+
+def _precompute_prefill_token_split(
+    num_scheduled_tokens: np.ndarray,
+    num_pref_reqs: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Prefill, token-midpoint split (ATOM_TBO_PREFILL_TOKEN_SPLIT=1).
+
+    Cut at the exact token midpoint — this can slice THROUGH a request, so
+    request count is irrelevant (bs==1 still splits). Only the token total
+    matters. MUST mirror `_split_prefill_token_midpoint` in
+    ubatch_splitting.py, or the cross-DP MAX-reduced ub0/ub1 disagree with
+    the realised slices → all_gather size mismatch → RCCL hang.
+    """
+    num_pref_tokens = int(
+        np.asarray(num_scheduled_tokens[:num_pref_reqs], dtype=np.int64).sum()
+    )
+    # can_split: need >= 2 tokens to cut into two non-empty halves.
+    if num_pref_tokens < 2:
+        return False, False, 0, 0
+    # meets_min_tokens: this rank's prefill reached the min-token bar
+    # (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k) — big enough to be worth TBO.
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    ub0 = num_pref_tokens // 2
+    ub1 = num_pref_tokens - ub0
+    return meets_min_tokens, True, ub0, ub1
+
+
+def _precompute_prefill_req_split(
+    num_scheduled_tokens: np.ndarray,
+    num_pref_reqs: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Prefill, request-boundary balanced split (ATOM_TBO_PREFILL_TOKEN_SPLIT=0).
+
+    Split on a request boundary closest to the token midpoint, so each ubatch
+    gets a whole number of requests. Needs >= 2 requests to put at least one in
+    each ubatch.
+
+    Same two-bit contract as the token-split path, only the can_split structural
+    gate differs: here it's bs>=2 (request boundaries) instead of tokens>=2.
+    The min-token (8k) bar stays the soft OR-reduced `meets_min_tokens`, so one
+    rank clearing it turns TBO on for all and under-filled peers force-split.
+    """
+    # can_split: need >= 2 requests to give each ubatch at least one.
+    if num_pref_reqs < 2:
+        return False, False, 0, 0
+    toks = np.asarray(num_scheduled_tokens[:num_pref_reqs], dtype=np.int64)
+    num_pref_tokens = int(toks.sum())
+    # meets_min_tokens: this rank's prefill reached the min-token bar
+    # (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k) — big enough to be worth TBO.
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    target = num_pref_tokens // 2
+    cumsum = 0
+    split_idx = 1
+    for j in range(num_pref_reqs):
+        cumsum += int(toks[j])
+        if cumsum >= target:
+            prev = cumsum - int(toks[j])
+            if j > 0 and (target - prev) < (cumsum - target):
+                split_idx = j
+            else:
+                split_idx = j + 1
+            break
+    split_idx = max(1, min(split_idx, num_pref_reqs - 1))
+    ub0 = int(toks[:split_idx].sum())
+    ub1 = num_pref_tokens - ub0
+    return meets_min_tokens, True, ub0, ub1
+
+
+def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
+    """Decode, split by request count (uniform tokens per request).
+
+    can_split gate is bs > 2: it must be at least as strict as the strictest
+    backend's per-ubatch metadata / CUDAGraph-capture threshold, or a rank can
+    report "can_split" for a batch size that has no captured graph / no prepared
+    ubatch meta, tripping build_ubatch_metadata's assert. Decode ubatch graphs
+    are captured only for bs > 2 (model_runner) and V4 prepares meta only for
+    scheduled_bs > 2. Decode has no min-token bar, so meets_min_tokens is always
+    True here — if it can split, it's worth splitting.
+    """
+    scheduled_bs = batch.total_seqs_num_decode
+    if scheduled_bs <= 2:
+        return False, False, 0, 0
+    num_tokens = batch.total_tokens_num
+    tokens_per_req = num_tokens // scheduled_bs if scheduled_bs else 1
+    reqs_per_ub = scheduled_bs // 2
+    ub0 = reqs_per_ub * tokens_per_req
+    ub1 = num_tokens - ub0
+    return True, True, ub0, ub1
 
 
 def local_tbo_precompute(
@@ -33,126 +124,148 @@ def local_tbo_precompute(
     batch,
     is_prefill: bool,
     num_scheduled_tokens: np.ndarray,
-) -> tuple[bool, int, int]:
-    """Decide locally whether this rank could TBO-split into 2 ubatches,
-    and if so what (ub0_tokens, ub1_tokens) the split would produce.
+) -> tuple[bool, bool, int, int]:
+    """Decide locally this rank's TBO status, split into two bits.
 
-    Returns ``(eligible, ub0_tokens, ub1_tokens)``. All zeros when
-    ineligible. The eligibility bit is later AND-reduced across DP ranks
-    by :func:`sync_dp_for_tbo`; the ub0/ub1 counts are MAX-reduced so
-    every rank picks the same per-ubatch CUDAGraph buffer size.
+    Dispatches to exactly one of three paths:
+      * prefill + ATOM_TBO_PREFILL_TOKEN_SPLIT=1 -> token-midpoint split
+      * prefill + ATOM_TBO_PREFILL_TOKEN_SPLIT=0 -> request-boundary split
+      * decode                                    -> request-count split
+
+    Returns ``(meets_min_tokens, can_split, ub0_tokens, ub1_tokens)``:
+
+      * ``can_split`` — this rank is *structurally* able to split into 2
+        ubatches. AND-reduced across DP: if ANY rank can't split, TBO must
+        stay off, else that rank runs 1 ubatch while peers run 2 → per-ubatch
+        collective size mismatch → RCCL hang.
+      * ``meets_min_tokens`` — this rank's prefill reached the min-token bar
+        (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k), i.e. big enough to be worth TBO.
+        OR-reduced: one rank clearing the bar turns TBO on for everyone, so
+        under-filled-but-splittable ranks are force-split to stay aligned.
+
+    Net: ``collective_active = OR(meets_min_tokens) AND AND(can_split)`` (plus
+    the uniform-mode guard in :func:`sync_dp_metadata`). The ub0/ub1 counts are
+    MAX-reduced so every rank picks the same per-ubatch CUDAGraph buffer size.
     """
     if not config.enable_tbo:
-        return False, 0, 0
+        return False, False, 0, 0
+
     if is_prefill:
-        n_pref = batch.total_seqs_num_prefill
-        # token-midpoint split: cut at exact total//2 even
-        # inside a request, so bs==1 can still split. MUST mirror
-        # `_split_prefill_token_midpoint` in ubatch_splitting.py exactly, or
-        # the cross-DP MAX-reduced ub0/ub1 will disagree with the realised
-        # slices → all_gather size mismatch → RCCL hang.
         from atom.utils import envs
 
-        # MUST mirror maybe_create_ubatch_slices' gating exactly, or the
-        # cross-DP MAX-reduced ub0/ub1 disagree with the realised slices → hang.
+        num_pref_reqs = batch.total_seqs_num_prefill
+        min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
         if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
-            if n_pref < 1:
-                return False, 0, 0
-            toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
-            total = int(toks.sum())
-            if total < 2:
-                return False, 0, 0
-            ub0 = total // 2
-            ub1 = total - ub0
-            return True, ub0, ub1
-        if n_pref < 2:
-            return False, 0, 0
-        # Mirror _split_prefill_balanced: pick boundary closest to total/2
-        # so the packed value matches what maybe_create_ubatch_slices will
-        # produce post-decision.
-        toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
-        total = int(toks.sum())
-        target = total // 2
-        cumsum = 0
-        split_idx = 1
-        for j in range(n_pref):
-            cumsum += int(toks[j])
-            if cumsum >= target:
-                prev = cumsum - int(toks[j])
-                if j > 0 and (target - prev) < (cumsum - target):
-                    split_idx = j
-                else:
-                    split_idx = j + 1
-                break
-        split_idx = max(1, min(split_idx, n_pref - 1))
-        ub0 = int(toks[:split_idx].sum())
-        ub1 = total - ub0
-        return True, ub0, ub1
+            return _precompute_prefill_token_split(
+                num_scheduled_tokens, num_pref_reqs, min_pref
+            )
+        return _precompute_prefill_req_split(
+            num_scheduled_tokens, num_pref_reqs, min_pref
+        )
+
     # Decode path
     if not config.enable_tbo_decode or batch.is_dummy_run:
-        return False, 0, 0
-    scheduled_bs = batch.total_seqs_num_decode
-    if scheduled_bs < 2:
-        return False, 0, 0
-    num_tokens = batch.total_tokens_num
-    tokens_per_req = num_tokens // scheduled_bs if scheduled_bs else 1
-    reqs_per_ub = scheduled_bs // 2
-    ub0 = reqs_per_ub * tokens_per_req
-    ub1 = num_tokens - ub0
-    return True, ub0, ub1
+        return False, False, 0, 0
+    return _precompute_decode(batch)
 
 
 @dataclass
 class DPSyncResult:
-    """Output of :func:`sync_dp_for_tbo`."""
+    """Output of :func:`sync_dp_metadata`."""
 
     # [dp_size] int32 CPU tensor — each rank's input token count.
     num_tokens_across_dp: torch.Tensor
+    # DP-MAX of the scheduled SEQUENCE count -- the companion to
+    # `num_tokens_across_dp` in the other unit. Reduced on EVERY step, not just
+    # uniform decode: a captured graph holds its collective at one batch, so a
+    # per-rank count is precisely what splits the group into two widths.
+    max_bs_across_dp: int
     # True iff ANY rank has at least one prefill seq this step.
     any_rank_has_prefill: bool
-    # True iff TBO is on AND every rank reported local_tbo_eligible.
+    # True iff TBO on AND OR(meets_min_tokens) AND AND(can_split) AND uniform.
+    # (One rank clearing the min-token bar turns TBO on for all; under-filled
+    # but splittable ranks are force-split to stay collective-aligned. Any rank
+    # that structurally can't split, or a mixed prefill/decode step, vetoes it.)
     tbo_collective_active: bool
     # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
-    ub_max_tokens_across_dp: Optional[tuple[int, int]]
+    ub_max_tokens_across_dp: tuple[int, int] | None
+    # The same two rows UNREDUCED, per ubatch. The MAX above is one reduction of
+    # this and an all2all's receive width takes the SUM, so the row is what
+    # travels and each consumer reduces it. (The MAX stays a field only because
+    # it is a ForwardContext constructor kwarg the sglang bridge passes.)
+    ub_tokens_across_dp: tuple[tuple[int, ...], ...] | None
+    # DP-MAX of the per-seq decode length — only set when ``max_seqlen_q`` was
+    # passed in (a block drafter under DP). Folded into this packed all_gather so
+    # the graph-shape sync no longer needs its own separate all_reduce (halves
+    # the per-step DP round-trips).
+    max_seqlen_q_across_dp: int | None = None
 
 
-def sync_dp_for_tbo(
+def sync_dp_metadata(
     *,
     dp_group,
     dp_size: int,
-    num_input_tokens: int,
+    scheduled_tokens: int,
+    scheduled_bs: int,
     is_prefill: bool,
     tbo_on: bool,
-    local_tbo_eligible: bool = False,
+    local_meets_min_tokens: bool = False,
+    local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
-    require_uniform_mode: bool = False,
+    max_seqlen_q: int | None = None,
 ) -> DPSyncResult:
-    """Single packed DP all_gather over the per-rank scalars needed to
-    decide DP padding, the prefill fan-out, and the cross-DP TBO gate.
+    """Single packed DP all_gather over all per-rank scalars a decode/prefill
+    step needs synchronized: DP token padding, the prefill fan-out, the
+    cross-DP TBO gate, and (when active) the DSpark graph-shape MAX.
+
+    A block drafter folds its per-seq length sync in here too (one extra field),
+    so the step issues one collective instead of two.
 
     Pre-Plan-B this required up to 3 separate all_reduces per step
-    (``get_dp_padding`` / ``sync_dp_for_tbo`` / a third inside
+    (``get_dp_padding`` / this sync / a third inside
     ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
-    per rank suffices. When TBO is off only the first 2 fields are
-    exchanged (saves 60 % payload + skips :func:`local_tbo_precompute`
+    per rank suffices. When TBO is off only the first 3 fields are
+    exchanged (saves 57 % payload + skips :func:`local_tbo_precompute`
     at the call site).
 
     Layout (``sync`` is ``[n_fields, dp_size]``):
 
-      row 0 : num_input_tokens         -> num_tokens_across_dp
-      row 1 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
-      row 2 : tbo_eligible (0/1)       -> tbo_collective_active (AND)   [TBO only]
-      row 3 : ub0_tokens               -> ub_max_tokens_across_dp[0]    [TBO only]
-      row 4 : ub1_tokens               -> ub_max_tokens_across_dp[1]    [TBO only]
+      row 0 : scheduled_tokens         -> num_tokens_across_dp
+      row 1 : scheduled_bs             -> max_bs_across_dp (MAX)
+      row 2 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
+      row 3 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
+      row 4 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
+      row 5 : ub0_tokens               -> ub_{max,total}_tokens_across_dp[0]      [TBO only]
+      row 6 : ub1_tokens               -> ub_{max,total}_tokens_across_dp[1]      [TBO only]
+      row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
+
+    Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
+    collective because agreeing on only one of them still leaves two shapes.
+
+    Gate: ``active = OR(meets_min_tokens) AND AND(can_split) AND uniform``.
+
+    ``max_seqlen_q`` folds a block drafter's per-step graph-shape sync into this
+    same packed all_gather. It is global-config gated (DSpark on + DP), so every
+    rank appends the same field and the payload stays symmetric.
+
+    Neither the batch nor the token total needs a row of its own here: rows 1 and
+    0 already carry them, and a step that reaches the reduction with every rank
+    decoding has `scheduled_tokens` == its decode total on every rank.
     """
-    n_fields = 5 if tbo_on else 2
+    tbo_fields = 7 if tbo_on else 3
+    dspark_on = max_seqlen_q is not None
+    n_fields = tbo_fields + (1 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
-    local[0] = num_input_tokens
-    local[1] = 1 if is_prefill else 0
+    local[0] = scheduled_tokens
+    local[1] = scheduled_bs
+    local[2] = 1 if is_prefill else 0
     if tbo_on:
-        local[2] = 1 if local_tbo_eligible else 0
-        local[3] = local_ub_tokens[0]
-        local[4] = local_ub_tokens[1]
+        local[3] = 1 if local_meets_min_tokens else 0
+        local[4] = 1 if local_can_split else 0
+        local[5] = local_ub_tokens[0]
+        local[6] = local_ub_tokens[1]
+    if dspark_on:
+        local[tbo_fields + 0] = max_seqlen_q
 
     gathered = [
         torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
@@ -161,34 +274,82 @@ def sync_dp_for_tbo(
     sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
 
     num_tokens_across_dp = sync[0]
-    any_rank_has_prefill = bool(sync[1].any())
+    max_bs_across_dp = int(sync[1].max())
+    any_rank_has_prefill = bool(sync[2].any())
     tbo_collective_active = False
-    ub_max_tokens_across_dp: Optional[tuple[int, int]] = None
+    ub_max_tokens_across_dp: tuple[int, int] | None = None
+    ub_tokens_across_dp: tuple[tuple[int, ...], ...] | None = None
     if tbo_on:
-        tbo_collective_active = bool(sync[2].all())
-        # Mixed-mode guard — only needed when `require_uniform_mode` is set
-        # (i.e. prefill token-split + TBO decode, see call site).
-        if tbo_collective_active and require_uniform_mode:
-            prefill_rank_count = int(sync[1].sum())
+        # OR(meets_min_tokens): one rank reaching the min-token bar turns TBO on
+        # for all. AND(can_split): but EVERY rank must be structurally splittable, else
+        # that rank would run 1 ubatch while peers run 2 → per-ubatch collective
+        # size mismatch → RCCL hang. Under-filled-but-splittable ranks are then
+        # force-split (see maybe_create_ubatch_slices force=True) to stay aligned.
+        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
+        # Mixed-mode guard: ALWAYS require a uniform batch mode (all prefill or
+        # all decode) across DP. A prefill rank running 2 ubatches alongside a
+        # decode rank running 2 ubatches still issues different collectives per
+        # ubatch → hang. (Previously gated behind require_uniform_mode; with the
+        # OR-reduce this must be unconditional.)
+        if tbo_collective_active:
+            prefill_rank_count = int(sync[2].sum())
             uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
-            ub_max_tokens_across_dp = (
-                int(sync[3].max()),
-                int(sync[4].max()),
-            )
+            ub_tokens_across_dp = (tuple(sync[5].tolist()), tuple(sync[6].tolist()))
+            ub_max_tokens_across_dp = tuple(max(row) for row in ub_tokens_across_dp)
+
+    max_seqlen_q_across_dp: int | None = None
+    if dspark_on:
+        max_seqlen_q_across_dp = int(sync[tbo_fields + 0].max())
 
     return DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
+        max_bs_across_dp=max_bs_across_dp,
         any_rank_has_prefill=any_rank_has_prefill,
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+        ub_tokens_across_dp=ub_tokens_across_dp,
+        max_seqlen_q_across_dp=max_seqlen_q_across_dp,
     )
 
 
 _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
 _CURRENT_CONTEXTS: list["TBOContext | None"] = []
 _NUM_UBATCHES: int = 2
+
+# Per-ubatch independent pynccl TP communicators for the pure-TP all_reduce
+# overlap (see `tbo_all_reduce`).
+_TBO_TP_UBATCH_COMMS: "list | None" = None
+
+
+def tbo_get_ubatch_tp_comm(ubatch_id: int):
+    """Return this ubatch's dedicated pynccl TP communicator, building the pair
+    lazily on first use. Returns None if TP world size == 1 (no AR needed)."""
+    global _TBO_TP_UBATCH_COMMS
+    if _TBO_TP_UBATCH_COMMS is not None:
+        return _TBO_TP_UBATCH_COMMS[ubatch_id]
+
+    from aiter.dist.device_communicators.communicator_pynccl import (
+        PyNcclCommunicator,
+    )
+    from aiter.dist.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size == 1:
+        _TBO_TP_UBATCH_COMMS = [None] * _NUM_UBATCHES
+        return None
+
+    # One independent communicator per ubatch. Construction runs a warmup
+    # all_reduce (a collective), so every rank must build the same number in the
+    # same order — guaranteed here because all ranks run TBO in lockstep and hit
+    # this on the same forward. Bound to the TP cpu_group (non-NCCL backend),
+    # exactly like the shared pynccl_comm.
+    comms = []
+    for _ in range(_NUM_UBATCHES):
+        comms.append(PyNcclCommunicator(group=tp.cpu_group, device=tp.device))
+    _TBO_TP_UBATCH_COMMS = comms
+    return _TBO_TP_UBATCH_COMMS[ubatch_id]
 
 
 class TBOContext:
@@ -229,13 +390,13 @@ class TBOContext:
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
         self.current_stream = compute_stream
-        self.recv_hook: Optional[Callable] = None
+        self.recv_hook: Callable | None = None
         # Set True when this ubatch's model.forward returns (or raises).
         # Partner thread checks this in `_cpu_yield` so it doesn't sleep
         # forever if we exited (cleanly or via exception) ahead of it.
         self.done: bool = False
         # Filled by `make_tbo_contexts` — points to the OTHER ubatch's ctx.
-        self.partner: Optional["TBOContext"] = None
+        self.partner: TBOContext | None = None
 
     # -- context manager protocol ----------------------------------------
 

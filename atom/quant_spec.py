@@ -14,14 +14,48 @@ This module introduces:
 
 from __future__ import annotations
 
+import functools
+import importlib
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
-from aiter import QuantType
-from aiter.utility.dtypes import d_dtypes
+
+
+class _LazyAiterAttr:
+    """One AITER attribute, resolved on first use rather than at import.
+
+    `atom.config` imports this module, and Python imports a package before its
+    submodule, so a plain `from aiter import QuantType` here makes *reading a
+    dataclass* require the AITER build. That is why the unit-test suite used to
+    replace `atom.config` with a hand-written stand-in, which then drifted from
+    the real thing and silently disabled test modules.
+
+    Only the name is deferred. Every attribute read returns the genuine AITER
+    object, so `quant_type` values compare and behave exactly as before -- this
+    is not a stand-in and never answers when AITER is missing.
+    """
+
+    __slots__ = ("_attr", "_module", "_value")
+
+    def __init__(self, module: str, attr: str):
+        self._module = module
+        self._attr = attr
+        self._value = None
+
+    def _resolve(self) -> Any:
+        if self._value is None:
+            self._value = getattr(importlib.import_module(self._module), self._attr)
+        return self._value
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+
+QuantType = _LazyAiterAttr("aiter", "QuantType")
+d_dtypes = _LazyAiterAttr("aiter.utility.dtypes", "d_dtypes")
 
 # ──────────────────────────────────────────────────────────────────────
 # Typed layer-level spec
@@ -32,7 +66,10 @@ from aiter.utility.dtypes import d_dtypes
 class LayerQuantConfig:
     """Immutable description of how a single layer (or default) is quantized."""
 
-    quant_type: QuantType = QuantType.No
+    # `default_factory`, not `default`: a plain default is evaluated when the
+    # class is created, which would resolve the lazy AITER name at import time
+    # and undo the deferral above. The factory runs per instantiation instead.
+    quant_type: QuantType = field(default_factory=lambda: QuantType.No)
     quant_dtype: Any = torch.bfloat16  # torch.dtype (use Any for forward compat)
     is_dynamic: bool = True
     quant_method: str | None = None
@@ -57,6 +94,32 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     """
     return online_cfg.quant_type == QuantType.No or (
         cur_type == online_cfg.quant_type and cur_dtype == online_cfg.quant_dtype
+    )
+
+
+def should_stream_online_quant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+) -> bool:
+    """Return whether this source can be streamed to a distinct online target."""
+    # Attention stays in the post-load pass because MLA post-processing reads
+    # an already-loaded and processed kv_b_proj.
+    # Imported lazily to avoid a module-load cycle (envs/quark pull in config
+    # which can pull in quant_spec).
+    from atom.quantization.quark.utils import can_dequant_weight_online
+    from atom.utils import envs
+
+    if not envs.ATOM_ONLINE_QUANT_STREAMING:
+        return False
+    if quant_config is None or not getattr(quant_config, "online_quant", False):
+        return False
+    if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
+        return False
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return not should_skip_online_quant(
+        source_quant_type, source_quant_dtype, online_cfg
     )
 
 
@@ -124,18 +187,27 @@ def get_quant_parser(method_name: str) -> QuantConfigParser:
 
 # -- helpers ----------------------------------------------------------------
 
-_QSCHEME_TO_QUANT_TYPE: dict[str, QuantType] = {
-    "per_channel": QuantType.per_Token,
-    "per_tensor": QuantType.per_Tensor,
-    "per_group": QuantType.per_1x32,
-    "per_block": QuantType.per_1x128,
-}
+
+@functools.cache
+def _qscheme_to_quant_type() -> dict[str, QuantType]:
+    """qscheme string -> AITER quant type, built on first use.
+
+    A module-level dict literal would read the lazy AITER names at import time,
+    which is exactly what the deferral above exists to avoid. Cached, so the
+    lookup stays a dict access after the first call.
+    """
+    return {
+        "per_channel": QuantType.per_Token,
+        "per_tensor": QuantType.per_Tensor,
+        "per_group": QuantType.per_1x32,
+        "per_block": QuantType.per_1x128,
+    }
 
 
 def _parse_quant_type(qscheme: str | None) -> QuantType:
     if qscheme is None:
         return QuantType.No
-    return _QSCHEME_TO_QUANT_TYPE.get(qscheme, QuantType.No)
+    return _qscheme_to_quant_type().get(qscheme, QuantType.No)
 
 
 def _parse_quant_dtype(dtype_str: str | None) -> Any:
@@ -212,34 +284,33 @@ class QuarkOnlineParser(QuantConfigParser):
         and ``online_exclude_layers_list``.
 
         Supported format strings:
-        - ``"ptpc_fp8"``  — per-tensor-per-channel FP8
-        - ``"mxfp4"``     — microscaling FP4 (block size 32)
+        - ``"ptpc_fp8"``        — per-tensor-per-channel FP8
+        - ``"per_block_fp8"``   — per-block FP8 (128x128; alias of per_block128_fp8)
+        - ``"per_block128_fp8"``— per-block FP8, 128x128 block
+        - ``"mxfp4"``           — microscaling FP4 (block size 32)
+        - ``"mxfp8"``           — microscaling FP8 (block size 32)
         """
         if not isinstance(online_quant_config, dict):
             raise TypeError("online_quant_config must be a dict parsed from JSON.")
 
-        SCHEME_MAP = {
-            "ptpc": QuantType.per_Token,
+        # Explicit table of supported online quant formats -> (QuantType, dtype_str).
+        # per_block / per_block128 are aliases (128 is the default block size).
+        FORMAT_MAP = {
+            "ptpc_fp8": (QuantType.per_Token, "fp8"),
+            "per_block_fp8": (QuantType.per_1x128, "fp8"),
+            "per_block128_fp8": (QuantType.per_1x128, "fp8"),
+            "mxfp4": (QuantType.per_1x32, "fp4"),
+            "mxfp8": (QuantType.per_1x32, "fp8"),
         }
 
         def _parse_online_quant_format(quant_format_str: str) -> LayerQuantConfig:
             quant_format_str = quant_format_str.strip().lower()
-            quant_type = None
-            dtype_str = None
-
-            if quant_format_str.startswith("mx"):
-                quant_type = QuantType.per_1x32
-                dtype_str = quant_format_str[2:]
-            else:
-                parts = quant_format_str.split("_", 1)
-                if len(parts) == 2 and parts[0] in SCHEME_MAP:
-                    quant_type = SCHEME_MAP[parts[0]]
-                    dtype_str = parts[1]
-                else:
-                    raise ValueError(
-                        f"Unsupported online quant format: '{quant_format_str}'. "
-                        f"Expected '<scheme>_<dtype>' (e.g. ptpc_fp8) or 'mx<dtype>' (e.g. mxfp4)."
-                    )
+            if quant_format_str not in FORMAT_MAP:
+                raise ValueError(
+                    f"Unsupported online quant format: '{quant_format_str}'. "
+                    f"Expected one of: {sorted(FORMAT_MAP)}."
+                )
+            quant_type, dtype_str = FORMAT_MAP[quant_format_str]
 
             dtype_str = dtype_str.split("_")[0]
             if dtype_str.endswith("4"):
@@ -294,19 +365,28 @@ class GenericParser(QuantConfigParser):
     """Fallback parser that uses heuristics for compressed-tensors, etc."""
 
     # Regex patterns for identifying quantization types from config keys/values
-    _DTYPE_PATTERNS = {
+    _DTYPE_PATTERNS: ClassVar[dict[str, str]] = {
         r"fp8|float8": "fp8",
         r"fp4|float4|mxfp4": "fp4x2",
         r"int8|w8a8": "int8",
         r"int4|w4a16|gptq|awq": "int4x2",
     }
 
-    _QTYPE_PATTERNS = {
-        r"block|per_block|blockwise|1x128": QuantType.per_1x128,
-        r"per_channel|channel|per_token|token": QuantType.per_Token,
-        r"per_tensor|tensor": QuantType.per_Tensor,
-        r"per_group|group": QuantType.per_1x32,
-    }
+    @staticmethod
+    @functools.cache
+    def _qtype_patterns() -> dict[str, QuantType]:
+        """Regex -> AITER quant type, built on first use.
+
+        A class-level dict literal runs when the class is created, i.e. at
+        import time, which would resolve the lazy AITER names and defeat the
+        deferral. Same reason as `_qscheme_to_quant_type`.
+        """
+        return {
+            r"block|per_block|blockwise|1x128": QuantType.per_1x128,
+            r"per_channel|channel|per_token|token": QuantType.per_Token,
+            r"per_tensor|tensor": QuantType.per_Tensor,
+            r"per_group|group": QuantType.per_1x32,
+        }
 
     def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
         quant_method = hf_quant_config.get("quant_method", "")
@@ -314,13 +394,33 @@ class GenericParser(QuantConfigParser):
 
         quant_dtype = self._infer_dtype(hf_quant_config, config_str)
         quant_type = self._infer_qtype(hf_quant_config, config_str)
+        if quant_method == "fbgemm_fp8":
+            # HF fbgemm_fp8 checkpoints store FP8 weights plus per-tensor
+            # weight_scale tensors, while activations are dynamically quantized.
+            # The config does not spell out a qscheme, so text heuristics would
+            # otherwise leave dense linears as QuantType.No and run GEMM on raw
+            # FP8 weights without scales.
+            quant_type = QuantType.per_Tensor
         # MXFP4 (fp4x2) uses microscaling with 1x32 block scaling by definition
         if quant_dtype == d_dtypes.get("fp4x2") and quant_type not in (
             QuantType.per_1x32,
             QuantType.per_1x128,
         ):
             quant_type = QuantType.per_1x32
-        is_dynamic = hf_quant_config.get("is_dynamic", True)
+        # Mxfp8 ``[1, K]`` block to per_1x32.
+        weight_block_size = hf_quant_config.get("weight_block_size")
+        if (
+            isinstance(weight_block_size, (list, tuple))
+            and len(weight_block_size) == 2
+            and weight_block_size[0] == 1
+        ):
+            quant_type = QuantType.per_1x32
+        # `activation_scheme: static` ships precomputed input_scales in the
+        # checkpoint, so the activation quant is NOT dynamic (load the scales);
+        # `dynamic` (or unspecified) quantizes activations at runtime.
+        act_scheme = (hf_quant_config.get("activation_scheme") or "").lower()
+        default_dynamic = False if act_scheme == "static" else True
+        is_dynamic = hf_quant_config.get("is_dynamic", default_dynamic)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",
         # gpt-oss/HF transformers -> "modules_to_not_convert",
@@ -372,11 +472,32 @@ class GenericParser(QuantConfigParser):
         return torch.bfloat16
 
     def _infer_qtype(self, cfg: dict, config_str: str) -> QuantType:
+        # Prefer explicit HF/compressed-tensors block size over text heuristics
+        # so MXFP8 1x32 and blockscale 1x128/128x128 are not conflated.
+        if "weight_block_size" in cfg:
+            wbs = cfg.get("weight_block_size")
+            if wbs is None:
+                return QuantType.per_Tensor
+            if isinstance(wbs, (list, tuple)) and len(wbs) >= 2:
+                try:
+                    m, n = int(wbs[0]), int(wbs[1])
+                except (TypeError, ValueError):
+                    m = n = None
+                if (m, n) == (1, 128):
+                    return QuantType.per_1x128
+                if (m, n) == (128, 128):
+                    # per_128x128 enum has no consumers in linear.py / GEMM dispatch yet;
+                    # the per_1x128 path already allocates a (out//128, in//128)
+                    # scale grid which is exactly the (128, 128) block layout.
+                    return QuantType.per_1x128
+                if (m, n) == (1, 32):
+                    return QuantType.per_1x32
+                return QuantType.per_1x128
         # Check explicit fields
         for key in ("quant_type", "quantization_type", "scheme"):
             val = cfg.get(key)
             if val and isinstance(val, str):
-                for pattern, qtype in self._QTYPE_PATTERNS.items():
+                for pattern, qtype in self._qtype_patterns().items():
                     if re.search(pattern, val.lower()):
                         return qtype
         # Check compressed-tensors config_groups for weight strategy
@@ -388,13 +509,24 @@ class GenericParser(QuantConfigParser):
                 weights = group.get("weights") or {}
                 strategy = weights.get("strategy", "")
                 if strategy:
-                    mapped = _QSCHEME_TO_QUANT_TYPE.get(strategy)
+                    mapped = _qscheme_to_quant_type().get(strategy)
                     if mapped is None:
-                        mapped = _QSCHEME_TO_QUANT_TYPE.get(f"per_{strategy}")
+                        mapped = _qscheme_to_quant_type().get(f"per_{strategy}")
                     if mapped is not None:
                         return mapped
         # Fall back to regex heuristics on full config string
-        for pattern, qtype in self._QTYPE_PATTERNS.items():
+        for pattern, qtype in self._qtype_patterns().items():
             if re.search(pattern, config_str):
                 return qtype
+        # Bare compressed-tensors / vLLM fp8 (no weight_block_size, no config_groups,
+        # no explicit scheme/strategy) — e.g. Llama-3.1-8B-Instruct-FP8-KV with
+        # {"quant_method":"fp8","activation_scheme":"static"}. `activation_scheme`
+        # distinguishes per-tensor (static) from per-token (dynamic); default fp8 to
+        # per_Tensor so the weight/input scales actually get applied.
+        quant_method = (cfg.get("quant_method") or "").lower()
+        if quant_method in ("fp8", "float8") or re.search(r"fp8|float8", config_str):
+            act_scheme = (cfg.get("activation_scheme") or "").lower()
+            return (
+                QuantType.per_Token if act_scheme == "dynamic" else QuantType.per_Tensor
+            )
         return QuantType.No

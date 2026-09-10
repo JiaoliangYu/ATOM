@@ -48,12 +48,28 @@ python -m atom.entrypoints.openai_server \
   --method mtp --num-speculative-tokens 3
 ```
 
+### MXFP4-v2 Quantized
+
+`DeepSeek-R1-0528-MXFP4-v2` uses the same DeepSeek-V3/R1 model structure as `DeepSeek-R1-0528-MXFP4-MTP-MoEFP4`. The main difference is in the quantization config: the MTP-MoEFP4 checkpoint keeps an FP8 per-channel override for self-attention layers, while the v2 checkpoint uses the global MXFP4 per-group quantization config without a separate attention override.
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model amd/deepseek-ai/DeepSeek-R1-0528-MXFP4-v2 \
+  --kv_cache_dtype fp8 -tp 8 \
+  --gpu-memory-utilization 0.9 \
+  --no-enable_prefix_caching
+```
+
 Tips on server configuration:
 - Always use `--kv_cache_dtype fp8` for better memory efficiency.
 - MTP with `--num-speculative-tokens 3` provides the best throughput/latency tradeoff.
 - `--num-speculative-tokens 1` is more conservative with lower overhead per step.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
 - Clear compile cache before restarting: `rm -rf /root/.cache/atom/*`
+- With DP attention + EP, the MoE all2all wire format can be narrowed (both
+  opt-in, default off): `ATOM_MORI_FP4_DISPATCH=1` sends FP4 instead of bf16 on
+  dispatch, `ATOM_MORI_COMBINE_QUANT=fp8_blockwise` sends FP8 blockwise on
+  combine. See [environment variables](../docs/environment_variables.md). 
 
 ## Performance baseline
 

@@ -49,7 +49,7 @@ def extract_labeled_events(events: list[dict]) -> list[StepEvent]:
         name = e.get("name", "")
         if e.get("ph") != "X":
             continue
-        if name.startswith(("prefill[", "decode[", "draft[")):
+        if name.startswith(("prefill[", "decode[", "propose_")):
             labeled.append(
                 StepEvent(
                     name=name,
@@ -63,7 +63,7 @@ def extract_labeled_events(events: list[dict]) -> list[StepEvent]:
 
 
 def parse_label(name: str) -> dict[str, str]:
-    """Parse label like 'decode[bs=4 tok=16 d=4 spec=3]' into dict."""
+    """Parse label like 'decode[bs=4 tok=16 p=0 d=4 spec=3]' into dict."""
     m = re.match(r"(\w+)\[(.+)\]", name)
     if not m:
         return {"type": name}
@@ -84,7 +84,7 @@ def group_decode_iterations(events: list[StepEvent]) -> list[DecodeIteration]:
         if ev.name.startswith("decode["):
             current = DecodeIteration(decode=ev)
             iterations.append(current)
-        elif ev.name.startswith("draft[") and current is not None:
+        elif ev.name.startswith("propose_") and current is not None:
             current.draft_steps.append(ev)
 
     return iterations
@@ -102,7 +102,12 @@ def generate_report(events: list[StepEvent], filepath: str) -> str:
     lines.append("# Trace Performance Summary")
     lines.append(f"\n**File:** `{Path(filepath).name}`\n")
 
-    # Separate by phase
+    # Separate by phase. The exact "prefill[" / "decode[" prefixes exclude
+    # DP-sync dummy steps ("dummy_decode[" / "dummy_prefill[") and forced-eager
+    # decodes ("eager_decode[") — see atom/model_engine/run_labels.py.
+    # NOTE: pre-taxonomy traces labeled dummies as plain "decode[", so counts
+    # here differ vs an old trace of the same workload; re-baseline, don't read
+    # the delta as a perf change.
     prefills = [
         e
         for e in events
@@ -111,9 +116,12 @@ def generate_report(events: list[StepEvent], filepath: str) -> str:
     decodes = [
         e for e in events if e.name.startswith("decode[") and e.cat == "user_annotation"
     ]
-    # draft[i/k bs=N] — each MTP speculative step
+    # propose_eagle[i/k tok=N bs=R/P] / propose_dspark[bs=R/P T=N] — one per
+    # draft pass, whichever drafter flavor produced it.
     draft_steps = [
-        e for e in events if e.name.startswith("draft[") and e.cat == "user_annotation"
+        e
+        for e in events
+        if e.name.startswith("propose_") and e.cat == "user_annotation"
     ]
 
     # --- Prefill Summary ---
@@ -152,7 +160,8 @@ def generate_report(events: list[StepEvent], filepath: str) -> str:
         # Group by step index
         step_durations: dict[str, list[float]] = defaultdict(list)
         for ev in draft_steps:
-            step_key = ev.name.split(" bs=")[0] + "]"  # e.g. "draft[0/3]"
+            # e.g. "propose_eagle[0/3]"; drop tok=/bs=, which vary per step.
+            step_key = ev.name.split(" tok=")[0].split(" bs=")[0] + "]"
             step_durations[step_key].append(ev.dur_us)
 
         lines.append("| Step | Calls | Mean | Min | Max | Δ vs step 0 |")

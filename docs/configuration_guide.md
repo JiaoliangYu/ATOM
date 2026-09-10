@@ -1,17 +1,15 @@
-# ATOM Configuration Guide
+# ATOM configuration guide
 
 ATOM (AiTer Optimized Model) is AMD's lightweight LLM inference engine built on
 [AITER](https://github.com/ROCm/aiter) kernels for ROCm/HIP GPUs. This guide
 documents every configuration class, CLI flag, and environment variable that
 controls ATOM's runtime behaviour.
 
----
-
-## Quick Reference
+## Quick reference
 
 | Config Class | Primary Purpose |
 |---|---|
-| `Config` | Master dataclass -- model path, memory, TP size, scheduler limits, KV cache, profiler, and references to all sub-configs |
+| `Config` | Master dataclass — model path, memory, TP size, scheduler limits, KV cache, profiler, and references to all sub-configs |
 | `CompilationConfig` | Compilation level (0-3), CUDA graph capture sizes, piecewise splitting ops, inductor settings |
 | `CompilationLevel` | Integer constants for the four compilation levels |
 | `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (none / piecewise / full / hybrid) |
@@ -23,9 +21,7 @@ controls ATOM's runtime behaviour.
 | `SamplingParams` | Temperature, max tokens, stop strings, ignore-EOS flag |
 | `EngineArgs` | CLI argument parser that builds a `Config` for `LLMEngine` |
 
----
-
-## 1. Master Configuration (`Config`)
+## Master configuration (`Config`)
 
 Defined in `atom/config.py`. The root dataclass that the engine consumes.
 
@@ -37,24 +33,31 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `scheduler_delay_factor` | `float` | `0.0` | Multiplicative delay (factor x previous prompt latency) before scheduling the next prompt |
 | `max_num_seqs` | `int` | `512` | Maximum number of sequences batched together |
 | `max_model_len` | `int \| None` | `None` | Maximum context length; defaults to `hf_config.max_position_embeddings` (capped by it when set) |
-| `gpu_memory_utilization` | `float` | `0.9` | Fraction of GPU memory available for KV cache and weights (0.0 -- 1.0) |
-| `tensor_parallel_size` | `int` | `1` | Number of tensor-parallel GPUs (1 -- 8) |
+| `gpu_memory_utilization` | `float` | `0.9` | Fraction of GPU memory available for KV cache and weights (0.0 — 1.0) |
+| `tensor_parallel_size` | `int` | `1` | Number of tensor-parallel GPUs (1 — 8) |
 | `enforce_eager` | `bool` | `False` | Disable compilation and CUDA graphs; run in eager mode |
 | `parallel_config` | `ParallelConfig` | `ParallelConfig()` | Data-parallel configuration (see Section 4) |
 | `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
+| `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
+| `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
+| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
+| `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
 | `quant_config` | `QuantizationConfig` | *(auto-detected)* | Quantization settings; auto-detected from HuggingFace config during `__post_init__` via `QuantizationConfig(hf_config)` (see Section 3) |
 | `asyncio_mode` | `bool` | `False` | Enable asyncio-based engine loop |
-| `load_dummy` | `bool` | `False` | Skip loading model weights (for benchmarking / testing) |
+| `load_dummy` | `Optional[str]` | `None` | Dummy-weight mode (no checkpoint read): `None` off; `"empty"` skip load (uninitialized, legacy); `"zero"` all-zero; `"xavier"` xavier for bf16, constant target magnitude for fp4/fp8 |
 | `enable_expert_parallel` | `bool` | `False` | Enable Expert Parallelism for MoE models |
 | `master_addr` | `str` | `"127.0.0.1"` | Master address for distributed communication |
-| `graph_bs` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
+| `capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
+| `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`). Only effective when >1 DP rank. See distributed guide §2 |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
 | `speculative_config` | `Optional[SpeculativeConfig]` | `None` | Speculative decoding configuration (see Section 5) |
 | `bos_token_id` | `int` | `-1` | Beginning-of-sequence token ID (`-1` = use model default) |
@@ -67,80 +70,76 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
-| `per_req_cache_equiv_blocks` | `int` | Number of KV cache block equivalents reserved per request for the per-request stateful-attention cache (currently GDN recurrent state; future stateful attentions plug in via `AttentionMetadataBuilder.compute_per_req_cache_bytes()`); computed by `ModelRunner.get_num_blocks()` |
-| `num_per_req_cache_groups` | `int` | Number of per-request slot groups available (= `max_num_seqs` for stateful-attention models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
+| `pool_entries` | `dict[str, int]` | Entries sized for each cache class the attention builders declared via `AttentionMetadataBuilder.sub_pool_specs()` — the paged KV blocks, plus per-request STATE classes (GDN recurrent state, the DeepSeek-V4 compressor ring and sliding-window pool). Computed by `ModelRunner.get_num_blocks()` in the runner subprocess and carried to the engine process, where each consumer looks up the class it declared |
+| `pool_entries_per_req` | `dict[str, int]` | Per-request multiplicity of each class, so a consumer can turn an entry count into a request count (`entries // entries_per_req`); same origin as `pool_entries` |
 
----
-
-## 2. Compilation Configuration (`CompilationConfig`)
+## Compilation configuration (`CompilationConfig`)
 
 Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 
-### 2.1 Compilation Levels (`CompilationLevel`)
+### Compilation levels (`CompilationLevel`)
 
 | Constant | Value | Description |
 |---|---|---|
-| `NO_COMPILATION` | `0` | No compilation -- pure eager execution |
+| `NO_COMPILATION` | `0` | No compilation — pure eager execution |
 | `DYNAMO_AS_IS` | `1` | Use torch.compile / TorchDynamo as-is |
 | `DYNAMO_ONCE` | `2` | TorchDynamo with a single compilation pass |
 | `PIECEWISE` | `3` | Piecewise compilation with CUDA graph capture (recommended for production) |
 
-### 2.2 `CompilationConfig` Fields
+### `CompilationConfig` fields
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `level` | `int` | `0` | Compilation level (see table above); must be 0 -- 3 |
+| `level` | `int` | `0` | Compilation level (see table above); must be 0 — 3 |
 | `use_cudagraph` | `bool` | `True` | Whether to use CUDA graphs |
 | `cudagraph_capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; overrides `cuda_graph_sizes` when set |
 | `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1,2,4,8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see below); set to `PIECEWISE` automatically at level 3 |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `PIECEWISE` automatically at level 3 |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Ops that split the graph into sub-graphs for piecewise compilation; auto-populated at level 3 with `["aiter.unified_attention_with_output", "aiter.mla_attention"]` |
 | `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; only effective in PIECEWISE mode |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Sizes to compile for inductor; accepts integers and the string `"cudagraph_capture_sizes"` |
 | `inductor_compile_config` | `dict` | `{}` | Additional configuration passed to the inductor backend |
 
-### 2.3 CUDA Graph Mode (`CUDAGraphMode`)
+### CUDA graph mode (`CUDAGraphMode`)
 
 | Mode | Value | Description |
 |---|---|---|
 | `NONE` | `0` | No CUDA graph capture |
-| `PIECEWISE` | `1` | Piecewise CUDA graphs -- attention ops stay outside the graph for flexibility (default at level 3) |
+| `PIECEWISE` | `1` | Piecewise CUDA graphs — attention ops stay outside the graph for flexibility (default at level 3) |
 | `FULL` | `2` | Full CUDA graph capture for all batches; best for small models / short prompts |
 | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full CUDA graphs for decode batches only; mixed prefill-decode runs without graphs (useful in P/D setups) |
-| `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full graphs for decode, piecewise for prefill/mixed -- most performant mode for most models |
+| `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full graphs for decode, piecewise for prefill/mixed — most performant mode for most models |
 
 Helper methods on `CUDAGraphMode`:
 
-- `decode_mode()` -- returns the mode used for pure decode batches.
-- `mixed_mode()` -- returns the mode used for mixed prefill-decode batches.
-- `requires_piecewise_compilation()` -- whether the mode needs piecewise compilation.
-- `has_full_cudagraphs()` -- whether the mode includes full CUDA graph capture.
-- `separate_routine()` -- whether decode and mixed batches use different routines.
+- `decode_mode()` — returns the mode used for pure decode batches.
+- `mixed_mode()` — returns the mode used for mixed prefill-decode batches.
+- `requires_piecewise_compilation()` — whether the mode needs piecewise compilation.
+- `has_full_cudagraphs()` — whether the mode includes full CUDA graph capture.
+- `separate_routine()` — whether decode and mixed batches use different routines.
 
----
-
-## 3. Quantization Configuration (`QuantizationConfig` & `LayerQuantConfig`)
+## Quantization configuration (`QuantizationConfig` & `LayerQuantConfig`)
 
 Defined in `atom/config.py` and `atom/quant_spec.py`. The quantization system uses two classes:
 
-- **`QuantizationConfig`** -- the top-level orchestrator that holds a global config, per-layer overrides, and exclusion lists.
-- **`LayerQuantConfig`** -- a frozen dataclass (defined in `atom/quant_spec.py`) that stores the concrete quantization parameters for a single layer or as the global default. Typed, immutable, with attribute access (e.g., `spec.quant_type`).
+- **`QuantizationConfig`** — the top-level orchestrator that holds a global config, per-layer overrides, and exclusion lists.
+- **`LayerQuantConfig`** — a frozen dataclass (defined in `atom/quant_spec.py`) that stores the concrete quantization parameters for a single layer or as the global default. Typed, immutable, with attribute access (e.g., `spec.quant_type`).
 
-### 3.1 `LayerQuantConfig` Fields
+### `LayerQuantConfig` fields
 
 `LayerQuantConfig` is a frozen dataclass. Fields are accessed as typed attributes (e.g., `spec.quant_type`).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `quant_type` | `QuantType` | `QuantType.No` | Quantization granularity (see below) |
+| `quant_type` | `QuantType` | `QuantType.No` | Quantization granularity (see [`QuantType` values](#quanttype-values-from-aiter)) |
 | `quant_dtype` | `torch.dtype` | `torch.bfloat16` | Data type for quantized weights |
 | `is_dynamic` | `bool` | `True` | Use dynamic quantization (scales computed at runtime) |
 | `quant_method` | `str` | `""` | Quantization method (e.g., `"quark"`, `"compressed-tensors"`) |
 
-### 3.2 `QuantizationConfig` Attributes
+### `QuantizationConfig` attributes
 
 | Attribute | Type | Description |
 |---|---|---|
@@ -161,7 +160,7 @@ Key methods:
 | `compute_hash()` | Returns a SHA-256 hash of the quantization config for cache invalidation |
 
 
-### 3.3 `QuantType` Values (from AITER)
+### `QuantType` values (from AITER)
 
 | Value | Description |
 |---|---|
@@ -172,7 +171,7 @@ Key methods:
 | `QuantType.per_128x128` | Large 2D block quantization (remapped to `per_1x128` in MoE kernels) |
 | `QuantType.per_Tensor` | Per-tensor quantization |
 
-### 3.4 Supported Quantization Dtypes
+### Supported quantization dtypes
 
 | Dtype | AITER Key | Notes |
 |---|---|---|
@@ -181,7 +180,7 @@ Key methods:
 | INT8 | `"i8"` | 8-bit integer |
 | INT4 | `"i4x2"` | 4-bit integer (packed) |
 
-### 3.5 Auto-Detection from HuggingFace
+### Auto-detection from HuggingFace
 
 During `Config.__post_init__`, ATOM constructs `QuantizationConfig(hf_config)` which
 reads `hf_config.quantization_config` and automatically determines quantization
@@ -204,11 +203,11 @@ parameters:
 5. If `activation_scheme` is `"static"`, `is_dynamic` is set to `False`.
 6. Excluded layers are read from the `"ignore"` key.
 
-### 3.6 Layer-Level Quantization Dispatch
+### Layer-level quantization dispatch
 
 Linear layers, MoE layers, and fused ops call `quant_config.get_layer_quant_config(prefix)` to obtain the appropriate `LayerQuantConfig` for their position in the model. This enables mixed-precision quantization where different layers can have different quant types and dtypes (e.g., FP8 for attention, FP4 for MLP).
 
-### 3.7 Online Quantization at Load Time
+### Online quantization at load time
 
 ATOM can re-quantize model weights while loading them by passing
 `--online_quant_config` to the engine. This is useful when the source checkpoint
@@ -252,9 +251,7 @@ Notes:
 - Tensor-parallel weights are gathered before quantization only when local quantization would produce different scales than quantizing the full unpartitioned weight.
 - Rank 0 writes an `online_quant_info_*.json` summary with elapsed time and per-layer target formats. The file is written under `ATOM_TORCH_PROFILER_DIR` when set, otherwise the current working directory.
 
----
-
-## 4. Parallel Configuration (`ParallelConfig`)
+## Parallel configuration (`ParallelConfig`)
 
 Defined in `atom/config.py`. Controls data parallelism. Environment variables
 (Section 8) override defaults when set.
@@ -262,8 +259,8 @@ Defined in `atom/config.py`. Controls data parallelism. Environment variables
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `data_parallel_size` | `int` | `1` | Number of data-parallel groups; overridden by `ATOM_DP_SIZE` env var |
-| `data_parallel_size_local` | `int` | `1` | Number of local data-parallel groups |
-| `data_parallel_rank` | `int` | `0` | Rank within the data-parallel group; overridden by `ATOM_DP_RANK` |
+| `data_parallel_size_local` | `int \| None` | `None` → `data_parallel_size` | DP ranks on **this** node. Defaults to the global size, i.e. single-node. Set it lower to give a node one slice of a multi-node run; also reaches MoRI as `gpu_per_node`. Overridden by `ATOM_DP_SIZE_LOCAL` |
+| `data_parallel_rank` | `int` | `0` | First **global** DP rank owned by this node; overridden by `ATOM_DP_RANK` |
 | `data_parallel_rank_local` | `Optional[int]` | `None` | Local rank within the data-parallel group (SPMD mode); overridden by `ATOM_DP_RANK_LOCAL` |
 | `data_parallel_master_port` | `int` | `29500` | Port used by the data-parallel master for process group initialization |
 | `data_parallel_base_port` | `int` | `get_open_port()` | Base port for data-parallel communication (dynamically assigned) |
@@ -271,12 +268,10 @@ Defined in `atom/config.py`. Controls data parallelism. Environment variables
 
 **Computed property:**
 
-- `world_size` -- set during init, equals TP x PP.
-- `world_size_across_dp` -- `world_size * data_parallel_size`.
+- `world_size` — set during init, equals TP x PP.
+- `world_size_across_dp` — `world_size * data_parallel_size`.
 
----
-
-## 5. Speculative Decoding Configuration (`SpeculativeConfig`)
+## Speculative decoding configuration (`SpeculativeConfig`)
 
 Defined in `atom/config.py`. Currently only the Multi-Token Prediction (MTP)
 method with `num_speculative_tokens=1` is supported.
@@ -288,12 +283,12 @@ method with `num_speculative_tokens=1` is supported.
 | `num_speculative_tokens` | `Optional[int]` | `None` | Number of speculative tokens per iteration; **must be `1`** |
 | `draft_model_hf_config` | `Optional[PretrainedConfig]` | `None` | HuggingFace config for the draft model; auto-loaded from `model` when `None` |
 
-### 5.1 Table-Driven MTP Config
+### Table-driven MTP config
 
 MTP configuration uses two class-level lookup tables to support multiple model
 families without per-model branching.
 
-**`_MTP_TYPE_MAP`** -- maps a base `model_type` to its MTP `model_type`:
+**`_MTP_TYPE_MAP`** — maps a base `model_type` to its MTP `model_type`:
 
 | Base `model_type` | MTP `model_type` |
 |---|---|
@@ -305,7 +300,7 @@ families without per-model branching.
 | `qwen3_5_text` | `qwen3_5_mtp` |
 | `qwen3_5_moe_text` | `qwen3_5_mtp` |
 
-**`_MTP_CONFIG`** -- maps MTP `model_type` to a `(n_predict_attr, architecture)` tuple:
+**`_MTP_CONFIG`** — maps MTP `model_type` to a `(n_predict_attr, architecture)` tuple:
 
 | MTP `model_type` | `n_predict_attr` | Architecture |
 |---|---|---|
@@ -313,16 +308,16 @@ families without per-model branching.
 | `qwen3_next_mtp` | `num_nextn_predict_layers` | `Qwen3NextMTPModel` |
 | `qwen3_5_mtp` | `mtp_num_hidden_layers` | `Qwen3_5MTPModel` |
 
-### 5.2 Post-init behaviour (`hf_config_override`)
+### Post-init behaviour (`hf_config_override`)
 
 The static method `hf_config_override` applies a two-step transformation to the
 draft model's HuggingFace config:
 
-1. **Resolve model type** -- looks up `hf_config.model_type` in `_MTP_TYPE_MAP`.
+1. **Resolve model type** — looks up `hf_config.model_type` in `_MTP_TYPE_MAP`.
    If found, rewrites `model_type` to the MTP variant (e.g.
    `deepseek_v3` -> `deepseek_mtp`).
 
-2. **Apply MTP overrides** -- looks up the (possibly rewritten) `model_type` in
+2. **Apply MTP overrides** — looks up the (possibly rewritten) `model_type` in
    `_MTP_CONFIG`. If found:
    - Reads `n_predict` from the model-specific attribute (e.g.
      `num_nextn_predict_layers` or `mtp_num_hidden_layers`), defaulting to 1.
@@ -339,9 +334,7 @@ Other post-init steps:
 - Extracts `text_config` from multimodal model configs when present.
 - `Config.__post_init__` raises `ValueError` if `num_speculative_tokens != 1`.
 
----
-
-## 6. Sampling Parameters (`SamplingParams`)
+## Sampling parameters (`SamplingParams`)
 
 Defined in `atom/sampling_params.py`. Passed per-request to control generation.
 
@@ -352,9 +345,7 @@ Defined in `atom/sampling_params.py`. Passed per-request to control generation.
 | `ignore_eos` | `bool` | `False` | Continue generating past the EOS token |
 | `stop_strings` | `Optional[list[str]]` | `None` | List of strings that trigger generation to stop |
 
----
-
-## 7. CLI Arguments (`EngineArgs`)
+## CLI arguments (`EngineArgs`)
 
 Defined in `atom/model_engine/arg_utils.py`. The `EngineArgs` dataclass exposes
 all flags via `add_cli_args()` and converts them into a `Config` via
@@ -368,21 +359,26 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
+| `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
+| `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
+| `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
 | `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`) |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
 | `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |
-| `--level` | | `int` | `3` | Compilation level (0 -- 3) |
-| `--load_dummy` | | flag | `False` | Skip loading model weights |
+| `--level` | | `int` | `3` | Compilation level (0 — 3) |
+| `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
+| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between rungs of the per-request state checkpoint ladder; must be a multiple of the prefix-cache hash block size. `0` turns checkpointing off entirely; **`-1` turns off only the ladder**, leaving the prompt-end anchor and the demand rung as the placements. Prompts shorter than one interval publish no rung. A rung also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one — which is most of what `-1` buys back |
+| `--state-checkpoint-demand` / `--no-state-checkpoint-demand` | | `bool` | on | Let a prefix hit that was refused for want of a checkpoint place a rung of its own. Off leaves the prompt-end anchor as the only placement. `ATOM_STATE_CHECKPOINT_DEMAND=0` overrides this without touching a launch script |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
-| `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 -- 1.0) |
+| `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
 | `--online_quant_config` | | JSON string | `None` | Load-time online quantization override; see Section 3.7 |
 
@@ -399,11 +395,9 @@ python -m atom.entrypoint \
     --max-num-seqs 256
 ```
 
----
+## Environment variables
 
-## 8. Environment Variables
-
-### 8.1 Variables Registered in `atom/utils/envs.py`
+### Variables registered in `atom/utils/envs.py`
 
 All variables use lazy evaluation. Boolean variables treat `"1"` as `True` and
 anything else (including unset) as `False`, unless noted otherwise.
@@ -416,7 +410,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
-| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion; enable for Qwen3-MoE models |
+| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |
 | `ATOM_USE_TRITON_MXFP4_BMM` | `bool` | `False` | Use Triton-based MXFP4 batched matrix multiply |
 | `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` | `bool` | `True` | Enable fused input RMSNorm + quantization for DeepSeek models |
@@ -425,7 +419,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
 
-### 8.2 Additional Environment Variables (Used Outside `envs.py`)
+### Additional environment variables (used outside `envs.py`)
 
 | Variable | Type | Default | Where Used | Description |
 |---|---|---|---|---|
@@ -433,9 +427,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_PROFILER_MORE` | `str` | `"0"` | `atom/model_engine/model_runner.py` | Set to `"1"` to enable detailed profiling (`record_shapes`, `with_stack`, `profile_memory`) |
 | `HF_TOKEN` | `str` | `None` | `atom/config.py` (`get_hf_config`) | HuggingFace authentication token for gated model downloads |
 
----
-
-## 9. Decision Tree -- Choosing a Compilation Level
+## Decision tree — choosing a compilation level
 
 ```
 Start
@@ -473,9 +465,7 @@ Need maximum decode throughput?
 - When using `--enable-dp-attention` or Expert Parallelism (`--enable-expert-parallel`),
   level 3 is still recommended.
 
----
-
-## Source Files
+## Source files
 
 | File | Description |
 |---|---|

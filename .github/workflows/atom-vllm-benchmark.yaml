@@ -7,340 +7,136 @@ concurrency:
 
 on:
   schedule:
-    # Tue-Sun 00:30 Beijing (Mon-Sat 16:30 UTC): delayed previous-evening slot.
-    # Effective Mon/Wed AW P0; Tue/Thu AW P0+Met P0; Fri AW all; Sat AW P0+OOB.
-    - cron: '30 16 * * 1-6'
-    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AW P1+P2+Met P0; Sun AW all+Met P1.
-    - cron: '0 2 * * 0,6'
+    # Mon/Wed/Fri at 23:30 Beijing (15:30 UTC).
+    - cron: '30 15 * * 1,3,5'
   workflow_dispatch:
     inputs:
       benchmark_client:
-        description: "Benchmark client command. `InferenceMax bench` uses the repo benchmark script. `vLLM bench` uses the vLLM CLI benchmark command."
+        description: "Benchmark client command. Non-AW/MET/OOB cases always use InferenceMax bench."
         type: choice
         default: InferenceMax bench
         options:
           - InferenceMax bench
           - vLLM bench
+      benchmark_group:
+        description: "Optional manual benchmark group. Leave as none to use model slots."
+        type: choice
+        default: none
+        options:
+          - none
+          - ALL
       model_slot_1:
         description: "Manual selection slot 1: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8 TP8 (MET)
-          - DeepSeek-R1 MXFP4 TP8 (MET)
-          - gpt-oss-120b TP1 (MET)
-          - GLM-5.1-FP8 TP8 (OOB)
-          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
-          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
-          - Kimi-K2.5-MXFP4 TP4 (MET)
-          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
-          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
-          - Qwen3.5-397B-A17B TP8 (OOB)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
-          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP4 (AW)
-          - DeepSeek-V3.2 FP8 TP8 (AW)
-          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
-          - DeepSeek-V4-Pro TP8 (OOB)
-          - GLM-4.7-FP8 TP4 (AW)
-          - GLM-4.7-FP8 TP8 (AW)
-          - GLM-4.7-FP8 MTP TP4 (AW)
-          - GLM-4.7-FP8 MTP TP8 (AW)
-          - gpt-oss-120b TP1 (AW)
-          - gpt-oss-120b TP2 (AW)
-          - gpt-oss-120b TP8 (AW)
-          - Kimi-K2.5-MXFP4 TP4 (AW)
-          - Kimi-K2.5-MXFP4 TP8 (AW)
-          - MiniMax-M2.5 TP2 (AW)
-          - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4
+          - DeepSeek-V3.2 FP8 PTPC MTP TP4
+          - DeepSeek-V4-Pro TP8
+          - Kimi-K3 TP8
+          - GLM-5.2-MXFP4 TP4
+          - GLM-5.2-MXFP4-MTP TP4
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - MiniMax-M3-MXFP4 TP4
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -362,13 +158,13 @@ on:
         type: string
         default: ""
       publish_to_dashboard:
-        description: "Upload benchmark results to the dashboard"
+        description: "Upload benchmark results to the dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
-        default: true
+        default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the LLM-Booster dashboard"
+        description: "Upload benchmark results to the LLM-Booster dashboard (off by default for manual runs)"
         type: boolean
-        default: true
+        default: false
 
 jobs:
   wait-for-older-manual-runs:
@@ -545,18 +341,24 @@ jobs:
           BENCHMARK_CLIENT="${INPUT_BENCHMARK_CLIENT:-InferenceMax bench}"
 
           mapfile -t VLLM_MET < <(python3 - <<'PY'
-          import re
           from pathlib import Path
 
-          text = Path(".github/workflows/docker-release.yaml").read_text(encoding="utf-8")
-          commit_match = re.search(r'^\s*VLLM_COMMIT:\s*"([^"]+)"', text, re.MULTILINE)
-          version_match = re.search(r'^\s*VLLM_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
+          config = {}
+          for line in Path("atom/plugin/vllm/vllm-version.env").read_text(
+              encoding="utf-8"
+          ).splitlines():
+              key, separator, value = line.partition("=")
+              if separator and key:
+                  config[key] = value
 
-          if not commit_match or not version_match:
-              raise SystemExit("Failed to read VLLM_COMMIT/VLLM_VERSION from .github/workflows/docker-release.yaml")
+          try:
+              print(config["VLLM_COMMIT"])
+              print(config["VLLM_VERSION"])
+          except KeyError as error:
+              raise SystemExit(
+                  f"Missing {error.args[0]} in atom/plugin/vllm/vllm-version.env"
+              ) from error
 
-          print(commit_match.group(1))
-          print(version_match.group(1))
           PY
           )
 
@@ -632,7 +434,7 @@ jobs:
             printf -- '\nBecause an explicit `oot_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
-            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n' \
+            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `atom/plugin/vllm/vllm-version.env`\n' \
               "${OOT_BASE_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
@@ -821,6 +623,7 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
+          BENCHMARK_GROUP: ${{ inputs.benchmark_group || 'none' }}
           MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
           MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
           MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
@@ -829,59 +632,13 @@ jobs:
           MODEL_SLOT_6: ${{ inputs.model_slot_6 || 'none' }}
           MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
           MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            SCHEDULE_CREATED_AT="$(
-              python3 - <<'PY'
-          import json
-          import os
-          from urllib.error import HTTPError, URLError
-          from urllib.request import Request, urlopen
-
-          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-          repository = os.environ["GITHUB_REPOSITORY"]
-          run_id = os.environ["GITHUB_RUN_ID"]
-          token = os.environ.get("GITHUB_TOKEN", "")
-          request = Request(
-              f"{api_url}/repos/{repository}/actions/runs/{run_id}",
-              headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {token}",
-                  "User-Agent": "atom-vllm-benchmark-nightly-rotation",
-              },
-          )
-          try:
-              with urlopen(request, timeout=30) as response:
-                  payload = json.load(response)
-          except HTTPError as exc:
-              detail = exc.read().decode("utf-8", errors="replace").strip()
-              raise RuntimeError(
-                  f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
-              ) from exc
-          except URLError as exc:
-              raise RuntimeError(
-                  f"Failed to reach GitHub API for workflow run metadata: {exc}"
-              ) from exc
-
-          created_at = payload.get("created_at")
-          if not created_at:
-              raise RuntimeError("Workflow run metadata did not include created_at")
-          print(created_at)
-          PY
-            )"
-            export SCHEDULE_CREATED_AT
-          else
-            export SCHEDULE_CREATED_AT=""
-          fi
 
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
           import sys
-          from datetime import datetime, timedelta, timezone
           from pathlib import Path
 
           none_choice = "none"
@@ -918,153 +675,80 @@ jobs:
                   m for m in variants if str(m.get("display", "")) in displays
               ]
 
-          AW_P0 = {
-              "gpt-oss-120b TP1 (AW)",
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
-              "DeepSeek-V4-Pro TP8 (OOB)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "GLM-4.7-FP8 TP4 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "MiniMax-M2.5 TP2 (AW)",
-          }
-          AW_P1 = {
-              "MiniMax-M2.5 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 TP8 (AW)",
-              "gpt-oss-120b TP2 (AW)",
-              "gpt-oss-120b TP8 (AW)",
-              "GLM-4.7-FP8 MTP TP8 (AW)",
-          }
-          AW_P2 = {
-              "GLM-4.7-FP8 TP8 (AW)",
-              "Kimi-K2.5-MXFP4 TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
-          }
-          MET_P0 = {
-              "Kimi-K2.5-MXFP4 TP4 (MET)",
-              "gpt-oss-120b TP1 (MET)",
-          }
-          MET_P1 = {
-              "Kimi-K2-Thinking-MXFP4 TP4 (MET)",
-              "Kimi-K2-Thinking-MXFP4 TP8 (MET)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)",
-              "DeepSeek-R1 FP8 TP8 (MET)",
-              "DeepSeek-R1 MXFP4 TP8 (MET)",
-          }
-          OOB_DISPLAYS = {
-              str(m.get("display", ""))
-              for m in all_variants
-              if str(m.get("display", "")).endswith("(OOB)")
+          BENCHMARK_DISPLAYS = {
+              "DeepSeek-V3.2 FP8 PTPC TP4",
+              "DeepSeek-V3.2 FP8 PTPC MTP TP4",
+              "DeepSeek-V4-Pro TP8",
+              "Kimi-K3 TP8",
+              "GLM-5.2-MXFP4 TP4",
+              "GLM-5.2-MXFP4-MTP TP4",
+              "Qwen3.5-397B-A17B-MXFP4 TP4",
+              "MiniMax-M3-MXFP4 TP4",
           }
 
           if event == "schedule":
-              created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
-              if not created_at:
-                  raise SystemExit(
-                      "Scheduled selection requires a run creation timestamp."
+              selected_group = "ALL"
+              selected = select_by_display(all_variants, BENCHMARK_DISPLAYS)
+              missing = BENCHMARK_DISPLAYS - {
+                  str(m.get("display", "")) for m in selected
+              }
+              if missing:
+                  print(
+                      "Warning: scheduled targets missing from catalog: "
+                      + ", ".join(sorted(missing)),
+                      file=sys.stderr,
                   )
-              beijing_tz = timezone(timedelta(hours=8))
-              run_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-              beijing_dt = run_date.astimezone(beijing_tz)
-              beijing_hour = beijing_dt.hour
-
-              # Beijing weekday: Mon=0 .. Sun=6. The evening slot now runs just
-              # after midnight, so attribute it to the previous Beijing day.
-              is_delayed_evening_slot = beijing_hour < 3
-              effective_beijing_dt = (
-                  beijing_dt - timedelta(days=1)
-                  if is_delayed_evening_slot
-                  else beijing_dt
-              )
-              beijing_weekday = effective_beijing_dt.weekday()
-
-              # Hour buckets use 15:00 to split ~10:00 daytime vs delayed
-              # previous-evening scheduled runs.
-              is_daytime_slot = (not is_delayed_evening_slot) and beijing_hour < 15
-              aw_all = AW_P0 | AW_P1 | AW_P2
-
-              if beijing_weekday == 5:  # Saturday
-                  if is_daytime_slot:
-                      selected_group = "AW-P1+P2+MET-P0"
-                      target_displays = AW_P1 | AW_P2 | MET_P0
-                  else:
-                      selected_group = "AW-P0+OOB"
-                      target_displays = AW_P0 | OOB_DISPLAYS
-              elif beijing_weekday == 6:  # Sunday
-                  if is_daytime_slot:
-                      selected_group = "AW-ALL+MET-P1"
-                      target_displays = aw_all | MET_P1
-                  else:
-                      selected_group = "SKIP"
-                      target_displays = set()
-              elif beijing_weekday in (0, 2):  # Mon / Wed
-                  if is_daytime_slot:
-                      selected_group = "SKIP"
-                      target_displays = set()
-                  else:
-                      selected_group = "AW-P0"
-                      target_displays = AW_P0
-              elif beijing_weekday in (1, 3):  # Tue / Thu
-                  if is_daytime_slot:
-                      selected_group = "SKIP"
-                      target_displays = set()
-                  else:
-                      selected_group = "AW-P0+MET-P0"
-                      target_displays = AW_P0 | MET_P0
-              elif beijing_weekday == 4:  # Friday
-                  if is_daytime_slot:
-                      selected_group = "SKIP"
-                      target_displays = set()
-                  else:
-                      selected_group = "AW-ALL"
-                      target_displays = aw_all
-              else:
-                  selected_group = "SKIP"
-                  target_displays = set()
-
-              if target_displays is None:
-                  selected = list(all_variants)
-              else:
+          else:
+              group_map = {
+                  "ALL": BENCHMARK_DISPLAYS,
+              }
+              requested_group = os.environ.get("BENCHMARK_GROUP", "").strip()
+              if requested_group and requested_group != none_choice:
+                  target_displays = group_map.get(requested_group)
+                  if target_displays is None:
+                      available = ", ".join([none_choice] + sorted(group_map))
+                      raise SystemExit(
+                          f"Unknown benchmark group {requested_group!r}. Available choices: {available}"
+                      )
+                  selected_group = requested_group
                   selected = select_by_display(all_variants, target_displays)
                   missing = target_displays - {
                       str(m.get("display", "")) for m in selected
                   }
                   if missing:
                       print(
-                          "Warning: scheduled targets missing from catalog: "
+                          "Warning: manual group targets missing from catalog: "
                           + ", ".join(sorted(missing)),
                           file=sys.stderr,
                       )
-          else:
-              variant_map = {}
-              for family in families:
-                  for variant in family["variants"]:
-                      variant_map[str(variant["display"])] = flatten_variant(
-                          family, variant
-                      )
-
-              seen_prefixes = set()
-              for slot_idx in range(1, 9):
-                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
-                  if not label or label == none_choice:
-                      continue
-                  selected_variant = variant_map.get(label)
-                  if selected_variant is None:
-                      available = ", ".join(sorted(variant_map))
+                  if not selected:
                       raise SystemExit(
-                          f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                          f"No benchmark model variants were selected for group {requested_group}."
                       )
-                  prefix = str(selected_variant["prefix"])
-                  if prefix in seen_prefixes:
-                      continue
-                  selected.append(selected_variant)
-                  seen_prefixes.add(prefix)
+              else:
+                  variant_map = {}
+                  for family in families:
+                      for variant in family["variants"]:
+                          variant_map[str(variant["display"])] = flatten_variant(
+                              family, variant
+                          )
+
+                  seen_prefixes = set()
+                  for slot_idx in range(1, 9):
+                      label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                      if not label or label == none_choice:
+                          continue
+                      selected_variant = variant_map.get(label)
+                      if selected_variant is None:
+                          available = ", ".join(sorted(variant_map))
+                          raise SystemExit(
+                              f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                          )
+                      prefix = str(selected_variant["prefix"])
+                      if prefix in seen_prefixes:
+                          continue
+                      selected.append(selected_variant)
+                      seen_prefixes.add(prefix)
 
           if selected_group:
               print(
@@ -1114,7 +798,8 @@ jobs:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
         run: |
-          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          BENCHMARK_MATRIX_FILE="${RUNNER_TEMP:-/tmp}/benchmark_matrix.json"
+          python3 - <<'PY' > "${BENCHMARK_MATRIX_FILE}"
           import json
           import os
 
@@ -1122,22 +807,12 @@ jobs:
           params = json.loads(os.environ["PARAMS_JSON"])
 
           include = []
-          aw_p0_displays = {
-              "gpt-oss-120b TP1 (AW)",
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "GLM-4.7-FP8 TP4 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "MiniMax-M2.5 TP2 (AW)",
-          }
+          skip_512_concurrency_displays = set()
           for model in models:
               prefix = str(model.get("prefix", ""))
               display = str(model.get("display", ""))
               is_aw_model = "-aw-" in prefix
-              is_aw_p0_model = display in aw_p0_displays
+              should_skip_512_concurrency = display in skip_512_concurrency_displays
               aw_pairs = (
                   (1000, 100),
                   (5000, 500),
@@ -1187,7 +862,7 @@ jobs:
                       continue
                   if pair in excluded_pairs:
                       continue
-                  if is_aw_p0_model and int(param["concurrency"]) == 512:
+                  if should_skip_512_concurrency and int(param["concurrency"]) == 512:
                       continue
                   filtered_params.append(param)
 
@@ -1226,20 +901,27 @@ jobs:
 
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
-          )"
-          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
-          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+          {
+            echo "benchmark_matrix<<EOF"
+            cat "${BENCHMARK_MATRIX_FILE}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if python3 - "${BENCHMARK_MATRIX_FILE}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as matrix_file:
+              payload = json.load(matrix_file)
+          include = payload.get("include", [])
+          if not include:
+              sys.exit(1)
+          print(f"Benchmark matrix cells: {len(include)}")
+          PY
+          then
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+          else
             echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
-          else
-            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            BENCHMARK_MATRIX="${BENCHMARK_MATRIX}" python3 - <<'PY'
-          import json
-          import os
-
-          payload = json.loads(os.environ["BENCHMARK_MATRIX"])
-          print(f"Benchmark matrix cells: {len(payload.get('include', []))}")
-          PY
           fi
 
       - name: Persist benchmark matrix payload
@@ -1341,18 +1023,20 @@ jobs:
           docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
             --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f docker/vllm_release.dockerfile .
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom OOT image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+          .github/scripts/docker_push_retry.sh "${{ steps.image-meta.outputs.oot_image_tag }}"
 
       - name: Clean up build images
         if: always()
@@ -1403,7 +1087,7 @@ jobs:
       VLLM_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
-      BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
+      BENCHMARK_CLIENT: ${{ (!contains(matrix.model.display, '(AW)') && !contains(matrix.model.display, '(MET)') && !contains(matrix.model.display, '(OOB)')) && 'InferenceMax bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
       - name: Print runner user
         run: |
@@ -1495,7 +1179,10 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/it-share/models" ]; then
+          if [ -d "/shared_nfs/huggingface_models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
           elif [ -d "/models" ]; then
@@ -1535,7 +1222,9 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host \
+            --network=host \
+            --group-add video \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -1559,6 +1248,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -1594,6 +1285,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -2084,6 +1777,9 @@ jobs:
           fi
 
   summarize-benchmark-result:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'
@@ -2527,6 +2223,13 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --default-backend "ATOM-vLLM"
 
+      - name: Prepare existing dashboard data
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         uses: benchmark-action/github-action-benchmark@v1
@@ -2541,6 +2244,13 @@ jobs:
           fail-on-alert: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Push dashboard data to gh-pages
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'

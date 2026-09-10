@@ -1,10 +1,8 @@
-# ATOM Model Operations Guide
+# ATOM model operations guide
 
 ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions for LLM inference on AMD ROCm/HIP GPUs. This guide documents every operator class in `atom/model_ops/`, their AITER kernel mappings, quantization paths, and fused kernel chains.
 
----
-
-## Quick Reference
+## Quick reference
 
 | ATOM Class | File | AITER Kernel / Import | Purpose |
 |---|---|---|---|
@@ -26,9 +24,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
 
----
-
-## 1. AITER Integration Overview
+## AITER integration overview
 
 ATOM is a thin model-level inference engine. Every compute-heavy operation delegates to an AITER kernel. The general pattern is:
 
@@ -36,7 +32,7 @@ ATOM is a thin model-level inference engine. Every compute-heavy operation deleg
 2. Its `forward()` method selects the appropriate AITER function based on quantization type, parallelism settings, and phase (prefill vs. decode).
 3. Results are optionally reduced across tensor-parallel (TP) or data-parallel (DP) groups.
 
-### AITER Kernel Mapping Table
+### AITER kernel mapping table
 
 | ATOM Wrapper | AITER Function / Import Path | Backend Type |
 |---|---|---|
@@ -63,15 +59,13 @@ ATOM is a thin model-level inference engine. Every compute-heavy operation deleg
 | ASM MoE | `aiter.fused_moe_bf16_asm.asm_moe` | ASM |
 | Quantization | `aiter.get_hip_quant(QuantType)` | CK / Triton |
 
----
-
-## 2. Linear Operations
+## Linear operations
 
 All linear layers inherit from `LinearBase` in `atom/model_ops/linear.py`.
 
-### 2.1 Class Hierarchy
+### Class hierarchy
 
-```
+```text
 LinearBase (nn.Module)
   +-- ReplicatedLinear          # No TP sharding
   |     +-- MergedReplicatedLinear
@@ -81,7 +75,7 @@ LinearBase (nn.Module)
   +-- RowParallelLinear          # tp_dim=1, shard input, optional all-reduce
 ```
 
-### 2.2 Quantization Dispatch
+### Quantization dispatch
 
 `LinearBase.forward()` dispatches to different GEMM kernels based on `QuantType`:
 
@@ -96,14 +90,14 @@ LinearBase (nn.Module)
 
 When `x_scale` is not provided, the input is dynamically quantized via `get_hip_quant(quant_type)`.
 
-### 2.3 Tensor Parallel Sharding
+### Tensor parallel sharding
 
 - **ColumnParallelLinear** (`tp_dim=0`): Shards weight rows (output dimension) across GPUs. Each GPU owns `output_size / tp_size` rows.
 - **RowParallelLinear** (`tp_dim=1`): Shards weight columns (input dimension). If `reduce_results=True`, output is all-reduced across TP group.
 - **QKVParallelLinear**: Extends `ColumnParallelLinear` with per-head sharding. Q heads are evenly divided; KV heads are either divided or replicated when `num_kv_heads < tp_size`.
 - **MergedColumnParallelLinear**: Handles gate and up projections merged into a single weight with `output_sizes` as a list (e.g., `[intermediate_size, intermediate_size]`).
 
-### 2.4 Weight Processing
+### Weight processing
 
 After loading, `process_weights_after_loading()` handles:
 - **e4m3fn to e4m3fnuz normalization** (AMD FP8 format conversion).
@@ -111,18 +105,16 @@ After loading, `process_weights_after_loading()` handles:
 - **Scale reshuffling** via `fp4_utils.e8m0_shuffle()` for MXFP4 block scales.
 - **Per-tensor requantization** via `requantize_with_max_scale()` when multiple output partitions have separate scales.
 
----
+## Attention operations
 
-## 3. Attention Operations
-
-### 3.1 Base: `Attention` (`base_attention.py`)
+### Base: `Attention` (`base_attention.py`)
 
 The top-level `Attention` class in `base_attention.py` is a dispatcher. It:
 
 1. Selects the backend via `get_attn_backend()` from `atom/utils/selector.py`.
 2. Instantiates the backend's implementation class (`impl_cls`).
 3. Registers itself in `compilation_config.static_forward_context` under `layer_name`.
-4. On `forward()`, calls `torch.ops.aiter.unified_attention_with_output_base`, which is a custom op decorated with `@mark_spliting_op` -- this prevents `torch.compile` from tracing into attention internals, enabling full-graph capture.
+4. On `forward()`, calls `torch.ops.aiter.unified_attention_with_output_base`, which is a custom op decorated with `@mark_spliting_op` — this prevents `torch.compile` from tracing into attention internals, enabling full-graph capture.
 
 Backend selection logic (in `selector.py`):
 
@@ -131,7 +123,7 @@ Backend selection logic (in `selector.py`):
 | `use_mla=True` | `AiterMLABackend` | `MLAAttention` from `attention_mla.py` |
 | `use_mla=False` | `AiterBackend` | `Attention` from `attention_mha.py` |
 
-### 3.2 Multi-Head Attention (`attention_mha.py`)
+### Multi-head attention (`attention_mha.py`)
 
 The MHA `Attention` class handles standard models (Llama, Qwen3, Mixtral, etc.).
 
@@ -154,13 +146,26 @@ The MHA `Attention` class handles standard models (Llama, Qwen3, Mixtral, etc.).
 | Phase | Condition | Method | AITER Kernel |
 |---|---|---|---|
 | Prefill | Always | `prefill_attention` | `aiter.flash_attn_varlen_func` |
+| Decode | `ATOM_USE_UNIFIED_ATTN` and `block_size == 256` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
+| Decode | past a paged kernel's envelope, or `ATOM_USE_UNIFIED_ATTN` / `use_flash_layout` | `paged_attention_unified` | `aiter.ops.triton.unified_attention` |
 | Decode | `use_triton_attn=True` | `paged_attention_triton` | `torch.ops.aiter.pa_decode_gluon` |
-| Decode | `block_size == 1024` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
 | Decode | Default | `paged_attention_asm` | `aiter.pa_fwd_asm` |
 
 The `use_triton_attn` flag is set when `sliding_window != -1` or `head_dim != 128`.
 
-### 3.3 Multi-head Latent Attention (`attention_mla.py`)
+Both paged kernels stop short of unified, at different points, and drafting
+multiplies the query group into both limits (`base_attention.py`):
+
+| Kernel | Envelope | Past it |
+|---|---|---|
+| gluon | `query_length <= 4` and `next_pow2(qlen) * max(16 // next_pow2(qlen), next_pow2(ratio)) <= 64`, where `ratio = q_heads / kv_heads` | no layout arm; Triton fails to compile |
+| `pa_fwd_asm` | `qlen x q_heads/kv_heads <= 16` | `get_heuristic_kernel` silently re-runs with `mtp=1` |
+
+`_dispatch_decode` is the single place that answers this; the runners do not
+re-decide. Unified carries one descale for the whole tensor, so a per-token
+quantized layer routed there raises rather than returning wrong numbers.
+
+### Multi-head latent attention (`attention_mla.py`)
 
 `MLAAttention` implements DeepSeek's MLA with a compressed KV representation. Key data structures:
 
@@ -204,17 +209,17 @@ class MLAModules:
 | `ATOM_USE_TRITON_GEMM=True` + FP8 weights | `fused_gemm_a8w8_blockscale_preshuffle_split_cat` |
 | Default | `kv_b_proj(kv_c_normed)` then manual split + cat |
 
-### 3.4 Backend Abstraction (`attentions/backends.py`)
+### Backend abstraction (`attentions/backends.py`)
 
 The `AttentionBackend` abstract class defines three required methods:
 
-- `get_name()` -- Returns backend identifier string.
-- `get_builder_cls()` -- Returns the `AttentionMetadataBuilder` subclass.
-- `get_impl_cls()` -- Returns the attention implementation class.
+- `get_name()` — Returns backend identifier string.
+- `get_builder_cls()` — Returns the `AttentionMetadataBuilder` subclass.
+- `get_impl_cls()` — Returns the attention implementation class.
 
-`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`.
+`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`. It marshals `block_tables` on every prefill step, whether or not that step also uploads the buffer, because the slot arithmetic in `token_layout/prefill.py` reads the packed table back rather than the batch's ragged rows.
 
-### 3.5 KV Cache Operations
+### KV cache operations
 
 | Operation | AITER Kernel | Used By |
 |---|---|---|
@@ -223,11 +228,9 @@ The `AttentionBackend` abstract class defines three required methods:
 | MLA KV cache write | `aiter.concat_and_cache_mla` | MLA prefill |
 | Fused QK RoPE + MLA cache | `aiter.fused_qk_rope_concat_and_cache_mla` | MLA decode |
 
----
+## Mixture of experts (MoE)
 
-## 4. Mixture of Experts (MoE)
-
-### 4.1 `FusedMoE` Class (`moe.py`)
+### `FusedMoE` class (`moe.py`)
 
 `FusedMoE` is the top-level MoE module. It handles:
 - Expert routing via `select_experts()`.
@@ -250,7 +253,7 @@ FusedMoE(
 )
 ```
 
-### 4.2 Quantization Methods
+### Quantization methods
 
 `FusedMoE` selects a `quant_method` at construction time:
 
@@ -263,7 +266,7 @@ FusedMoE(
 
 The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 methods and supports `a16` mode where activations remain in BF16/FP16 while weights are FP8/INT8.
 
-### 4.3 TopK Routing (`topK.py`)
+### TopK routing (`topK.py`)
 
 | Routing Function | AITER Kernel | Used For |
 |---|---|---|
@@ -273,7 +276,7 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 
 **Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`.
 
-### 4.4 `FusedMoEParallelConfig`
+### `FusedMoEParallelConfig`
 
 ```python
 @dataclass
@@ -292,7 +295,7 @@ Key properties:
 - `use_all2all_kernels`: `True` when `dp_size > 1`, EP is enabled, and MORI is available.
 - `use_mori_kernels`: Always `True` (currently).
 
-### 4.5 MORI Integration (`fused_moe/mori_prepare_finalize.py`)
+### MORI integration (`fused_moe/mori_prepare_finalize.py`)
 
 MORI (MoE Router Infrastructure) provides all-to-all communication kernels for expert parallelism. `MoriPrepareAndFinalize` implements:
 
@@ -301,7 +304,7 @@ MORI (MoE Router Infrastructure) provides all-to-all communication kernels for e
 
 The `FusedMoEModularKernel` orchestrates the prepare-compute-finalize pipeline.
 
-### 4.6 MoE Quantization Config (`fused_moe/config.py`)
+### MoE quantization config (`fused_moe/config.py`)
 
 `FusedMoEQuantConfig` describes activation and weight quantization for MoE layers:
 
@@ -315,19 +318,17 @@ class FusedMoEQuantConfig:
 ```
 
 Factory functions:
-- `fp8_w8a8_moe_quant_config()` -- FP8 weights and activations.
-- `mxfp4_w4a16_moe_quant_config()` -- MXFP4 weights, unquantized activations.
-- `FUSED_MOE_UNQUANTIZED_CONFIG` -- No quantization.
+- `fp8_w8a8_moe_quant_config()` — FP8 weights and activations.
+- `mxfp4_w4a16_moe_quant_config()` — MXFP4 weights, unquantized activations.
+- `FUSED_MOE_UNQUANTIZED_CONFIG` — No quantization.
 
-### 4.7 Triton MoE Fallback (`fused_moe_triton.py`)
+### Triton MoE fallback (`fused_moe_triton.py`)
 
 `triton_kernel_moe_forward()` provides a Triton-based MoE path using the `triton_kernels` library. It uses `routing()` for expert assignment and `matmul_ogs()` for the expert GEMM. This path is currently used for MXFP4 MoE on GFX94x hardware.
 
----
+## Normalization
 
-## 5. Normalization
-
-### 5.1 `RMSNorm` (`layernorm.py`)
+### `RMSNorm` (`layernorm.py`)
 
 `RMSNorm` supports multiple forward paths depending on configuration flags:
 
@@ -353,7 +354,7 @@ RMSNorm(
 )
 ```
 
-### 5.2 `LayerNorm` (`layernorm.py`)
+### `LayerNorm` (`layernorm.py`)
 
 `LayerNorm` wraps `layernorm2d_fwd` and `layernorm2d_fwd_with_add` (with bias support):
 
@@ -364,11 +365,9 @@ LayerNorm(dim: int, eps: float = 1e-6)
 - Without residual: `layernorm2d_fwd(x, weight, bias, eps)`
 - With residual: `layernorm2d_fwd_with_add(out, x, residual, residual_out, weight, bias, eps)`
 
----
+## Activation functions
 
-## 6. Activation Functions
-
-### 6.1 `SiluAndMul` (`activation.py`)
+### `SiluAndMul` (`activation.py`)
 
 `SiluAndMul` computes `SiLU(x_first_half) * x_second_half`. It splits the last dimension in half.
 
@@ -386,11 +385,9 @@ SiluAndMul(
 )
 ```
 
----
+## Embedding and output head
 
-## 7. Embedding & Output Head
-
-### 7.1 `VocabParallelEmbedding` (`embed_head.py`)
+### `VocabParallelEmbedding` (`embed_head.py`)
 
 Partitions the vocabulary across TP ranks. Each rank holds `num_embeddings / tp_size` rows.
 
@@ -400,7 +397,7 @@ Partitions the vocabulary across TP ranks. Each rank holds `num_embeddings / tp_
 3. Zero out out-of-range positions.
 4. `all_reduce()` across TP group.
 
-### 7.2 `ParallelLMHead` (`embed_head.py`)
+### `ParallelLMHead` (`embed_head.py`)
 
 Extends `VocabParallelEmbedding` for the output projection. Key differences:
 
@@ -408,11 +405,9 @@ Extends `VocabParallelEmbedding` for the output projection. Key differences:
 - Uses `tgemm.mm(x, self.weight, self.bias)` for the logit computation (not `F.linear`).
 - Calls `tensor_model_parallel_all_gather()` to gather logits across TP ranks.
 
----
+## Rotary position embedding (RoPE)
 
-## 8. Rotary Position Embedding (RoPE)
-
-### 8.1 `RotaryEmbedding` (`rotary_embedding.py`)
+### `RotaryEmbedding` (`rotary_embedding.py`)
 
 Precomputes cos/sin caches at initialization and applies RoPE in-place.
 
@@ -430,7 +425,7 @@ RotaryEmbedding(
 
 **Forward:** Calls `aiter.rope_cached_positions_2c_fwd_inplace(query_, key_, cos, sin, positions, rotate_style, ...)` which applies RoPE to Q and K tensors in-place using precomputed caches indexed by position IDs.
 
-### 8.2 `get_rope()` Factory
+### `get_rope()` factory
 
 ```python
 get_rope(head_size, rotary_dim, max_position, base, rope_scaling=None)
@@ -438,16 +433,14 @@ get_rope(head_size, rotary_dim, max_position, base, rope_scaling=None)
 
 Returns a cached `RotaryEmbedding` instance. Currently `rope_scaling` must be `None`.
 
-### 8.3 Integration in Attention
+### Integration in attention
 
 - **MHA** (`attention_mha.py`): RoPE is applied during the `rope_cache()` phase, either via the fused `fused_qk_norm_rope_cache_quant_shuffle` kernel, via `fused_qk_rope_reshape_and_cache`, or via standalone `rotary_emb(position, q, k)`.
 - **MLA** (`attention_mla.py`): RoPE is applied to `q_pe` and `k_rope` tensors. During decode, this is fused into `fused_qk_rope_concat_and_cache_mla`. During prefill, it is applied via `self.rotary_emb(positions, prefill_q_pe, k_rope)`.
 
----
+## Sampling
 
-## 9. Sampling
-
-### 9.1 `Sampler` (`sampler.py`)
+### `Sampler` (`sampler.py`)
 
 Unified sampling supporting both greedy (temperature=0) and random (temperature>0) sampling in a single kernel call.
 
@@ -463,7 +456,7 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
-### 9.2 `RejectionSampler` (`rejection_sampler.py`)
+### `RejectionSampler` (`rejection_sampler.py`)
 
 Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
 
@@ -472,9 +465,7 @@ Implements rejection sampling for speculative decoding (MTP). Given draft token 
 3. On full acceptance, appends the bonus token.
 4. Returns `(output_token_ids, num_bonus_tokens)`.
 
----
-
-## 10. Fused Kernel Chains
+## Fused kernel chains
 
 ATOM uses fused kernels to reduce memory traffic by combining multiple operations into a single kernel launch.
 
@@ -494,9 +485,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | FP8 BMM + RoPE + cache (MLA) | Batched FP8 BMM, RoPE, MLA KV cache write | MLA decode with FP8 | `fused_fp8_bmm_rope_cat_and_cache_mla` |
 | FP4 BMM + RoPE + cache (MLA) | Batched FP4 BMM, RoPE, MLA KV cache write | MLA decode with MXFP4 | `fused_fp4_bmm_rope_cat_and_cache_mla` |
 
----
-
-## Source Files
+## Source files
 
 ### `atom/model_ops/`
 
@@ -507,14 +496,14 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `layernorm.py` | `RMSNorm`, `LayerNorm` with fused allreduce/quant/pad variants |
 | `base_attention.py` | Top-level `Attention` dispatcher with custom op registration |
 | `attention_mha.py` | MHA implementation: prefill (flash), decode (ASM/Triton paged attention) |
-| `attention_mla.py` | `MLAAttention`, `MLAModules` -- DeepSeek MLA with compressed KV |
+| `attention_mla.py` | `MLAAttention`, `MLAModules` — DeepSeek MLA with compressed KV |
 | `moe.py` | `FusedMoE`, `FusedMoEParallelConfig`, `UnquantizedFusedMoEMethod`, `Fp8MoEMethod`, `Mxfp4MoEMethod`, `CompressedTensorsFp8MoEMethod` |
-| `fused_moe_triton.py` | `triton_kernel_moe_forward` -- Triton MoE via `triton_kernels` library |
+| `fused_moe_triton.py` | `triton_kernel_moe_forward` — Triton MoE via `triton_kernels` library |
 | `embed_head.py` | `VocabParallelEmbedding`, `ParallelLMHead` |
 | `rotary_embedding.py` | `RotaryEmbedding`, `get_rope` |
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
-| `sampler.py` | `Sampler` -- unified greedy/random sampling |
-| `rejection_sampler.py` | `RejectionSampler` -- speculative decoding rejection sampling |
+| `sampler.py` | `Sampler` — unified greedy/random sampling |
+| `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 
@@ -523,20 +512,58 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | File | Description |
 |---|---|
 | `backends.py` | `AttentionBackend`, `AttentionMetadataBuilder`, `CommonAttentionBuilder`, `AttentionImpl` abstract classes |
-| `aiter_attention.py` | `AiterBackend`, `AiterAttentionMetadataBuilder` -- MHA backend with persistent ASM paged attention support |
-| `aiter_mla.py` | `AiterMLABackend`, `AiterMLAMetadataBuilder` -- MLA backend with sparse attention support |
+| `aiter_attention.py` | `AiterBackend`, `AiterAttentionMetadataBuilder` — MHA backend with persistent ASM paged attention support |
+| `aiter_mla.py` | `AiterMLABackend`, `AiterMLAMetadataBuilder` — MLA backend with sparse attention support |
+
+### `atom/model_ops/attentions/pool_layout/` and `.../token_layout/`
+
+Two packages, two axes. `pool_layout` answers **where a byte lives** in the
+cache pools and is a function of the config; `token_layout` answers **where
+this step's tokens go** and is a function of the batch, so it is rebuilt every
+step. A backend consumes both and belongs to neither.
+
+Membership has three parts, and only the third is machine-checkable. **By
+topic** — the axis decides, not the dependencies. **Arithmetic, not staging** —
+a member computes an answer and does not write or upload a `forward_vars`
+mirror; `page_unit_geometry` is a mixin over `self.model_runner` and still
+qualifies because it only reads, so taking `self` is not the line, having a
+side effect on the step's buffers is. **Reachable without `aiter` or the rest
+of `atom`**, so a member is importable on a runner with no AITER build and no
+GPU — CI is such a runner, and one import failure during collection aborts the
+whole run rather than one test, so `tests/test_layout_packages.py` enforces
+that part over both packages. Do not mistake the checkable part for the rule.
+
+Two absences are deliberate. `v4_kernels/pool_index.py` is
+`v4_pool_geometry`'s device-side half — the same row formulas as `@triton.jit`
+device functions for the eight kernels that address the pool — and stays with
+the kernels; `tests/test_pool_index.py` pins the two sides together. And a
+per-token shape that only one caller has stays with that caller: V4's decode
+positions are ragged, and the one-token decode slot mapping comes from
+`last_block_num_tokens` rather than from a position.
+
+| File | Description |
+|---|---|
+| `pool_layout/sub_pool_spec.py` | `SubPoolSpec`, `page_pool`, `state_pool`, `plan_pools` — sub-pool sizing as arithmetic over a byte budget |
+| `pool_layout/v4_pool_geometry.py` | `UnifiedPoolGeometry`, `WindowParams`, the compress ratios — where a DeepSeek-V4 row lives, and which rows a step may see |
+| `pool_layout/page_unit_geometry.py` | `PageUnitGeometryMixin` — where a K3 checkpoint image's bytes land in the MLA paged pool |
+| `pool_layout/entry_arena.py` | `EntryField`, `entry_bytes_for`, `plan_regions`, `EntryMajorArena` — what one entry of a cache class holds, and where those bytes are put |
+| `pool_layout/paged_state_copy.py` | `plan_segmented_copy`, `launch_copy_descriptor` — scattering that byte run across PAGE units and back |
+| `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
+| `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
+| `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
+| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable |
 
 ### `atom/model_ops/fused_moe/`
 
 | File | Description |
 |---|---|
 | `config.py` | `FusedMoEConfig`, `FusedMoEQuantConfig`, `FusedMoEQuantDesc`, `GroupShape`, factory functions (`fp8_w8a8_moe_quant_config`, `mxfp4_w4a16_moe_quant_config`) |
-| `modular_kernel.py` | `FusedMoEModularKernel`, `FusedMoEPrepareAndFinalize`, `ExpertTokensMetadata` -- modular MoE kernel pipeline |
-| `mori_prepare_finalize.py` | `MoriPrepareAndFinalize` -- MORI all-to-all dispatch/combine for expert parallelism |
+| `modular_kernel.py` | `FusedMoEModularKernel`, `FusedMoEPrepareAndFinalize`, `ExpertTokensMetadata` — modular MoE kernel pipeline |
+| `mori_prepare_finalize.py` | `MoriPrepareAndFinalize` — MORI all-to-all dispatch/combine for expert parallelism |
 | `utils.py` | MoE utility functions |
 
 ### `atom/utils/`
 
 | File | Description |
 |---|---|
-| `selector.py` | `get_attn_backend()` -- selects `AiterBackend` or `AiterMLABackend` based on `use_mla` flag |
+| `selector.py` | `get_attn_backend()` — selects `AiterBackend` or `AiterMLABackend` based on `use_mla` flag |

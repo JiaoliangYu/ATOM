@@ -1,4 +1,4 @@
-# ATOM Compilation & CUDA Graphs Guide
+# ATOM compilation & CUDA graphs guide
 
 > **Quick Reference**
 >
@@ -36,29 +36,27 @@
 > | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full for decode, none for mixed batches |
 > | `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full for decode, piecewise for prefill |
 
----
-
-## 1. Compilation Levels
+## Compilation levels
 
 ATOM provides four compilation levels via the `CompilationLevel` class in `atom/config.py`. The level is set through `CompilationConfig.level` and controls how `torch.compile` is applied to the model.
 
-### Level 0 -- NO_COMPILATION
+### Level 0 — NO_COMPILATION
 
 No `torch.compile` is applied. The model runs in pure eager mode. This is the simplest mode and is useful for debugging or when using models that are incompatible with `torch.compile`.
 
 When `level=0`, the `@support_torch_compile` decorator sets `self.do_not_compile = True` and the model's `__call__` method bypasses compilation entirely, calling `self.forward()` directly.
 
-### Level 1 -- DYNAMO_AS_IS
+### Level 1 — DYNAMO_AS_IS
 
 Uses `torch.compile` with `backend="eager"` and `fullgraph=True`. This runs Dynamo's bytecode analysis and graph capture but does not apply any compiler optimizations. It is useful as a quick check to verify that a model is compatible with Dynamo's tracing.
 
 Like level 0, `DYNAMO_AS_IS` causes the decorator to set `self.do_not_compile = True`, since the model runner (rather than the decorator) handles the compilation at this level.
 
-### Level 2 -- DYNAMO_ONCE
+### Level 2 — DYNAMO_ONCE
 
 Uses `torch.compile` with the Inductor backend. The model graph is traced by Dynamo and compiled once through Inductor for optimized GPU kernel generation. The `@support_torch_compile` decorator's custom dispatcher is activated when `compilation_level >= DYNAMO_ONCE`, allowing compiled bytecode to be dispatched directly after the first compilation without repeated guard evaluation.
 
-### Level 3 -- PIECEWISE (Production Default)
+### Level 3 — PIECEWISE (production default)
 
 The most advanced level. When `Config.__post_init__` detects `level == PIECEWISE`, it:
 
@@ -69,9 +67,7 @@ The most advanced level. When `Config.__post_init__` detects `level == PIECEWISE
 
 The `VllmBackend` is then used as the `torch.compile` backend. It splits the model graph into subgraphs at the splitting operations and compiles each subgraph independently via `PiecewiseBackend`.
 
----
-
-## 2. CUDA Graph Modes
+## CUDA graph modes
 
 The `CUDAGraphMode` enum in `atom/config.py` controls how CUDA graphs are captured and replayed. CUDA graphs record a sequence of GPU operations and replay them with minimal CPU overhead, which is critical for low-latency decode steps.
 
@@ -105,7 +101,7 @@ A tuple mode combining both strategies:
 
 This is described in the code as "the most performant mode for most models."
 
-### Helper Methods
+### Helper methods
 
 The `CUDAGraphMode` enum provides several helper methods for runtime dispatch:
 
@@ -118,23 +114,21 @@ The `CUDAGraphMode` enum provides several helper methods for runtime dispatch:
 | `requires_piecewise_compilation()` | `bool` | Returns `True` if either decode or mixed mode uses `PIECEWISE`. |
 | `max_cudagraph_mode()` | `CUDAGraphMode` | Returns the highest-valued mode across both decode and mixed modes. |
 
----
-
-## 3. CUDA Graph Capture
+## CUDA graph capture
 
 CUDA graph capture is handled by `ModelRunner.capture_cudagraph()` in `atom/model_engine/model_runner.py`. This method is called at startup (under `@torch.inference_mode()`) to pre-capture graphs for a set of batch sizes.
 
-### Capture Flow
+### Capture flow
 
-```
+```text
 capture_cudagraph()
   |
-  +-- Determine graph_bs list
+  +-- Determine capture_sizes list
   |     |-- If cudagraph_capture_sizes is set: use directly
   |     |-- If cuda_graph_sizes has 1 value N: [1, 2, 4, 8, 16, 32, ..., N]
   |     +-- If cuda_graph_sizes has >1 values: use the provided list
   |
-  +-- Sort graph_bs in descending order (largest batch first)
+  +-- Sort capture_sizes in descending order (largest batch first)
   |
   +-- Assert max batch size <= max_num_seqs
   |
@@ -154,22 +148,22 @@ capture_cudagraph()
   |     +-- Store: self.graphs[(bs, max_q_len)] = graph
   |     +-- torch.cuda.synchronize()
   |
-  +-- Sort graph_bs back to ascending order
-  +-- Return (elapsed_time, graph_bs)
+  +-- Sort capture_sizes back to ascending order
+  +-- Return (elapsed_time, capture_sizes)
 ```
 
-### Graph Keying
+### Graph keying
 
-Each captured graph is stored in a dictionary keyed by a `(graph_bs, max_q_len)` tuple:
+Each captured graph is stored in a dictionary keyed by a `(running_bs, max_q_len)` tuple:
 
 ```python
 self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
 ```
 
-- `graph_bs`: The padded batch size used during capture.
+- `running_bs`: The padded batch size used during capture.
 - `max_q_len`: The maximum query length per sequence. For standard decode, this is `1`. For MTP (Multi-Token Prediction) speculative decoding, this is `mtp_k + 1`.
 
-### Graph Pool Sharing
+### Graph pool sharing
 
 The first captured graph creates a CUDA memory pool via `graph.pool()`. All subsequent captures share this pool through the `self.graph_pool` parameter, enabling memory reuse across different batch sizes.
 
@@ -178,7 +172,7 @@ if self.graph_pool is None:
     self.graph_pool = graph.pool()
 ```
 
-### Default Capture Sizes
+### Default capture sizes
 
 When `cuda_graph_sizes` has a single value (e.g., `[512]`, the default), the capture sizes follow this pattern:
 
@@ -188,7 +182,7 @@ When `cuda_graph_sizes` has a single value (e.g., `[512]`, the default), the cap
 # [1, 2, 4, 8, 16, 32, 48, 64, ..., 496, 512]
 ```
 
-### Graph Replay in run_model()
+### Graph replay in run_model()
 
 During inference, `ModelRunner.run_model()` decides whether to use eager execution or graph replay:
 
@@ -200,14 +194,14 @@ def run_model(self, input_ids):
     is_prefill = context.is_prefill
     positions = context.positions
 
-    if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+    if is_prefill or self.enforce_eager or bs > self.capture_sizes[-1]:
         # Eager path: prefills, enforce_eager mode, or oversized batches
         hidden_states = self.model(input_ids, positions)
     else:
         # Graph replay path: decode batches within captured range
-        graph_bs = context.graph_bs
+        running_bs = context.running_bs
         max_q_len = forward_context.attn_metadata.max_seqlen_q
-        graph_key = (graph_bs, max_q_len)
+        graph_key = (running_bs, max_q_len)
         self.graphs[graph_key].replay()
         num_tokens = context.batch_size * max_q_len
         hidden_states = self.forward_vars["outputs"][:num_tokens]
@@ -221,13 +215,11 @@ Key decisions:
 - **Decode with bs > max captured size**: Fall back to eager execution.
 - **enforce_eager=True**: Always eager, regardless of batch size.
 
----
-
-## 4. Piecewise Compilation
+## Piecewise compilation
 
 Piecewise compilation splits the model's computation graph at specified operations and compiles each subgraph independently. This enables CUDA graph capture for the compilable parts while leaving incompatible operations (primarily attention) to run eagerly.
 
-### Splitting Operations
+### Splitting operations
 
 The `splitting_ops` field in `CompilationConfig` defines which operations split the graph. When `set_splitting_ops_for_v1()` is called (automatically at level 3), the default splitting ops are:
 
@@ -240,7 +232,7 @@ These attention operations are split out because:
 2. Some attention backends are not compatible with CUDA graph capture.
 3. Attention kernels are already highly optimized, so Inductor compilation provides minimal additional benefit.
 
-### Compilation Pipeline
+### Compilation pipeline
 
 The `VllmBackend.__call__` method orchestrates the piecewise compilation:
 
@@ -259,26 +251,24 @@ The `VllmBackend.__call__` method orchestrates the piecewise compilation:
    - For subsequent runs, if the runtime shape is in `compile_sizes`, it lazily compiles a shape-specialized version via `CompilerManager.compile()` and caches it.
    - For shapes not in `compile_sizes`, it falls back to the general-shape compiled graph.
 
-### Cache Management
+### Cache management
 
 The `CompilerManager` caches compiled graphs using a key of `(runtime_shape, graph_index, backend_name)`. The cache is stored in a Python file (`vllm_compile_cache.py`) at the local cache directory (`~/.cache/atom/torch_compile_cache/<hash>/rank_<i>/<prefix>/`).
 
 On subsequent runs with the same model and configuration, compiled graphs are loaded from the cache, bypassing Inductor compilation entirely.
 
----
+## Forward context & stateless dispatch
 
-## 5. Forward Context & Stateless Dispatch
+The `ForwardContext` dataclass in `atom/utils/forward_context.py` provides a module-level global mechanism for passing metadata to layers during the forward pass. This is critical for CUDA graphs because captured graphs cannot accept new arguments — all dynamic metadata must be accessible through a side channel.
 
-The `ForwardContext` dataclass in `atom/utils/forward_context.py` provides a module-level global mechanism for passing metadata to layers during the forward pass. This is critical for CUDA graphs because captured graphs cannot accept new arguments -- all dynamic metadata must be accessible through a side channel.
-
-### ForwardContext Fields
+### ForwardContext fields
 
 | Field | Type | Purpose |
 |-------|------|---------|
 | `no_compile_layers` | `dict[int, Any]` | Layers that should skip compilation (from `static_forward_context`) |
 | `attn_metadata` | `AttentionMetaData` or `dict` | Attention-specific metadata (sequence lengths, block tables, etc.) |
 | `kv_cache_data` | `dict[str, KVCacheTensor]` | KV cache tensors for each layer |
-| `context` | `Context` | Basic forward pass context (positions, is_prefill, batch_size, graph_bs) |
+| `context` | `Context` | Basic forward pass context (positions, is_prefill, batch_size, running_bs, running_tokens) |
 | `dp_metadata` | `DPMetadata` | Data-parallel metadata (token counts across DP ranks) |
 | `spec_decode_metadata` | `SpecDecodeMetadata` | Speculative decoding metadata (draft tokens, logits indices) |
 
@@ -292,7 +282,7 @@ The forward context follows a set-use-reset lifecycle:
 
 3. **Reset**: After the forward pass, `reset_forward_context()` replaces the global context with an empty `ForwardContext()`.
 
-### Context Dataclass
+### Context dataclass
 
 The `Context` object carries the most frequently accessed per-step state:
 
@@ -302,15 +292,16 @@ class Context:
     positions: torch.Tensor    # Token position IDs
     is_prefill: bool = False   # Whether this is a prefill step
     batch_size: int = 0        # Number of sequences in the batch
-    graph_bs: int = 0          # Padded batch size for graph lookup
+    running_bs: int = 0        # Padded SEQUENCE count: graph lookup, draft width
+    running_tokens: int = 0    # Padded ROW count: what MoE all_gather pads to
     is_draft: bool = False     # Whether this is a draft model forward
 ```
 
-The `graph_bs` field is particularly important for CUDA graph dispatch: it holds the padded batch size that maps to a pre-captured graph key.
+`running_bs` drives CUDA graph dispatch: it holds the padded batch size that maps to a pre-captured graph key. `running_tokens` is the same shape counted in hidden_states rows, which is what MoE pads to before the cross-DP all_gather -- the two are not interconvertible on a prefill (ragged prompts) or a DSpark ragged decode (flat token bucket), which is why both are stored.
 
-### Integration with CUDA Graphs
+### Integration with CUDA graphs
 
-For ModelRunner's direct CUDA graph path (non-piecewise), the forward context is set before `run_model()` via `set_forward_context()`, and `run_model()` reads `context.graph_bs` and `attn_metadata.max_seqlen_q` to look up the correct pre-captured graph.
+For ModelRunner's direct CUDA graph path (non-piecewise), the forward context is set before `run_model()` via `set_forward_context()`, and `run_model()` reads `context.running_bs` and `attn_metadata.max_seqlen_q` to look up the correct pre-captured graph.
 
 For the piecewise path, `CUDAGraphWrapper` (in `atom/utils/cuda_graph.py`) expects `batch_descriptor` and `cudagraph_runtime_mode` fields on the forward context to decide whether to capture, replay, or run eagerly:
 
@@ -322,9 +313,7 @@ cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
 > **Note:** The piecewise `CUDAGraphWrapper` integration is under development. The `batch_descriptor` and `cudagraph_runtime_mode` fields are expected by `CUDAGraphWrapper.__call__()` but are not currently defined on the `ForwardContext` dataclass. The per-subgraph wrapping in `backends.py` is also currently commented out. The direct CUDA graph path in `ModelRunner` is the active production path.
 
----
-
-## 6. Compiler Backend
+## Compiler backend
 
 ### CompilerManager
 
@@ -371,7 +360,7 @@ The preferred compiler for PyTorch 2.8+. Uses `torch._inductor.standalone_compil
 
 If `cudagraph_copy_inputs` is `True`, it wraps the callable to copy input tensors into static buffers before each call, ensuring CUDA graph input address stability.
 
-### @support_torch_compile Decorator
+### @support_torch_compile decorator
 
 The `@support_torch_compile` decorator in `atom/utils/decorators.py` augments a model class to support `torch.compile`:
 
@@ -383,7 +372,7 @@ The `@support_torch_compile` decorator in `atom/utils/decorators.py` augments a 
 
 4. **Safety check**: The bytecode hook checks for `update` in the compiled code's `co_names`, raising an error if the model modifies `nn.Module` buffers during the forward pass (which would cause silent errors with CUDA graphs).
 
-### Custom Op Registration
+### Custom op registration
 
 `direct_register_custom_op()` in `atom/utils/custom_register.py` registers custom operators with PyTorch's `torch.library` system:
 
@@ -400,9 +389,7 @@ This registers the op under the `"aiter"` library namespace (e.g., `aiter.my_op`
 
 Registered custom ops can be used as `splitting_ops` in piecewise compilation (e.g., `"aiter.unified_attention_with_output"`).
 
----
-
-## 7. Configuration Options
+## Configuration options
 
 All compilation-related configuration fields from `CompilationConfig`:
 
@@ -426,16 +413,14 @@ Related fields on `Config`:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enforce_eager` | `bool` | `False` | Force eager execution, skip all compilation and CUDA graphs. |
-| `graph_bs` | `Optional[list[int]]` | `None` | Final list of batch sizes for CUDA graph capture (computed from `CompilationConfig`). |
+| `capture_sizes` | `Optional[list[int]]` | `None` | Final list of batch sizes for CUDA graph capture (computed from `CompilationConfig`). |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | The compilation configuration dataclass. |
 
----
-
-## 8. Decision Tree
+## Decision tree
 
 Use this decision tree to select the right compilation level and CUDA graph mode for your workload:
 
-```
+```text
 Is the model supported by torch.compile?
 |
 +-- No --> Level 0 (NO_COMPILATION)
@@ -468,7 +453,7 @@ Is the model supported by torch.compile?
             +-- Maximum performance --> cudagraph_mode=FULL_AND_PIECEWISE
 ```
 
-### Common Configurations
+### Common configurations
 
 **Default production setup** (level 3, piecewise CUDA graphs):
 ```python
@@ -477,7 +462,7 @@ CompilationConfig(level=3)
 #   splitting_ops = ["aiter.unified_attention_with_output", "aiter.mla_attention"]
 #   cudagraph_mode = CUDAGraphMode.PIECEWISE
 #   cuda_graph_sizes = [512]
-#   graph_bs = [1, 2, 4, 8, 16, 32, ..., 512]
+#   capture_sizes = [1, 2, 4, 8, 16, 32, ..., 512]
 ```
 
 **Custom capture sizes**:
@@ -498,9 +483,7 @@ CompilationConfig(level=3, debug_dump_path="/tmp/atom_debug")
 # Dumps traced graphs and decompiled code to /tmp/atom_debug/rank_0/
 ```
 
----
-
-## Source Files
+## Source files
 
 | File | Description |
 |------|-------------|

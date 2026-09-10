@@ -12,8 +12,11 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
-import torch
+import logging
 
+import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -25,15 +28,19 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.plugin.prepare import is_vllm
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
-import triton
-import triton.language as tl
-
-from typing import Optional
-import logging
-
 logger = logging.getLogger("atom")
+
+# Byte budget (MB) for the dense fp8_mqa_logits prefill logits buffer. Mirrors
+# native ATOM (atom/models/deepseek_v4.py, issue #1376): the indexer logits
+# matrix is [rows, total_seq_lens] fp32 and total_seq_lens (the sum of all
+# co-scheduled prefill contexts) is unbounded by max_num_batched_tokens, so a
+# burst of long-context requests can push a single allocation to tens of GiB
+# and OOM the engine. Chunking along the Q-row dimension keeps the buffer within
+# this budget. 0 disables chunking (always single-shot).
+_SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
 
 @triton.jit
@@ -238,12 +245,14 @@ def sparse_attn_indexer_plugin_mode(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
     sparse_kv_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -253,6 +262,7 @@ def sparse_attn_indexer_plugin_mode(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
@@ -263,6 +273,8 @@ def sparse_attn_indexer_plugin_mode(
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available as is_vllm_ctx_available,
         )
 
@@ -338,6 +350,8 @@ def sparse_attn_indexer_plugin_mode(
 
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
+        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+        budget_bytes = _SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
         for chunk in prefill_metadata.chunks:
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
@@ -359,32 +373,67 @@ def sparse_attn_indexer_plugin_mode(
                 preshuffle=preshuffle_cache,
             )
 
-            logits = fp8_mqa_logits(
-                Q=q_fp8[chunk.token_start : chunk.token_end],
-                KV=k_fp8,
-                kv_scales=k_scale,
-                weights=weights[chunk.token_start : chunk.token_end],
-                cu_starts=chunk.cu_seqlen_ks,
-                cu_ends=chunk.cu_seqlen_ke,
-            )
-            num_rows = logits.shape[0]
-            assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-            topk_indices_prefill = topk_indices[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
-            # Use top_k_per_row_prefill from vLLM to correctly handle row starts
-            # and ends. It also produces 0-based local indices, eliminating the
-            # need for conversion from global.
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices_prefill,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            # The dense fp8_mqa_logits buffer is [rows, total_committed] fp32.
+            # total_committed (the column dim = sum of co-scheduled prefill
+            # contexts) is unbounded by max_num_batched_tokens, so a burst of
+            # long-context requests can push a single allocation to tens of GiB
+            # (#1376). Chunk along the Q (row) dimension so [row_chunk,
+            # total_committed] fp32 stays within budget_bytes — row_chunk shrinks
+            # as total_committed grows. Each row chunk still scores the FULL KV,
+            # so every row's top-k is exact with no cross-chunk merge and the
+            # kernel's per-row column indices need no remapping.
+            total_committed = int(chunk.total_seq_lens)
+            total_rows = chunk.token_end - chunk.token_start
+            if (
+                budget_bytes > 0
+                and total_committed > 0
+                and budget_bytes // (total_committed * 4) < total_rows
+            ):
+                # 4 bytes per fp32 logit; total_committed * 4 is one row's
+                # footprint. Round the budget-derived row count DOWN to a
+                # multiple of 128 (aligned to the kernel's row tiling); when the
+                # budget affords < 128 rows (extreme total_committed), fall back
+                # to a power-of-2 floor so it degrades 64/32/.../1 instead of
+                # collapsing straight to 1.
+                budget_rows = budget_bytes // (total_committed * 4)
+                if budget_rows >= 128:
+                    row_chunk = (budget_rows // 128) * 128
+                else:
+                    row_chunk = 1 << (max(1, budget_rows).bit_length() - 1)
+            else:
+                row_chunk = total_rows
+
+            for row_start in range(0, total_rows, row_chunk):
+                row_end = min(row_start + row_chunk, total_rows)
+                q_start = chunk.token_start + row_start
+                q_end = chunk.token_start + row_end
+                # cu_seqlen_ks/ke are per-row (length total_rows); slice 1:1 with
+                # this row chunk. KV stays full so per-row windows are unchanged.
+                row_ks = chunk.cu_seqlen_ks[row_start:row_end]
+                row_ke = chunk.cu_seqlen_ke[row_start:row_end]
+                logits = fp8_mqa_logits(
+                    Q=q_fp8[q_start:q_end],
+                    KV=k_fp8,
+                    kv_scales=k_scale,
+                    weights=weights[q_start:q_end],
+                    cu_starts=row_ks,
+                    cu_ends=row_ke,
+                )
+                num_rows = logits.shape[0]
+                topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
+                # Use top_k_per_row_prefill from vLLM to correctly handle row
+                # starts and ends. It also produces 0-based local indices,
+                # eliminating the need for conversion from global.
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    row_ks,
+                    row_ke,
+                    topk_indices_prefill,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
     if has_decode:
         decode_metadata = indexer_meta.decode
@@ -410,14 +459,27 @@ def sparse_attn_indexer_plugin_mode(
         batch_size = padded_q_fp8_decode_tokens.shape[0]
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
-        num_padded_tokens = batch_size * next_n
+        # deepgemm_fp8_paged_mqa_logits grids over `batch_size * next_n`, so that
+        # is the height its `logits` must have. Sizing off num_decode_tokens is
+        # only equivalent while the query rows are unpadded -- pack_seq_triton
+        # above pads to a rectangle, and the kernel would then write past the
+        # end. requires_padding is hardcoded False at the one construction site
+        # (attention/metadata.py), so this is unreachable today. Raised rather
+        # than asserted because `python -O` strips asserts, which would restore
+        # the overrun silently exactly when someone turns padding on.
+        if decode_metadata.requires_padding:
+            raise NotImplementedError(
+                "padded decode rows need logits sized [batch_size * next_n, "
+                f"{max_model_len}], got [{num_decode_tokens}, {max_model_len}]; "
+                "see deepgemm_fp8_paged_mqa_logits' grid"
+            )
         logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
+            [num_decode_tokens, max_model_len], dtype=torch.float32, device="cuda"
         )
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
-            weights[:num_padded_tokens],
+            weights[:num_decode_tokens],
             logits,
             decode_metadata.seq_lens,
             decode_metadata.block_table,
@@ -428,7 +490,6 @@ def sparse_attn_indexer_plugin_mode(
             WavePerEU=2,
         )
 
-        num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
@@ -436,9 +497,10 @@ def sparse_attn_indexer_plugin_mode(
             next_n,
             decode_metadata.seq_lens,
             topk_indices_decode,
-            num_rows,
+            num_decode_tokens,
             logits.stride(0),
             logits.stride(1),
+            stable=stable_topk,
         )
 
         if decode_metadata.requires_padding:
@@ -457,7 +519,7 @@ def sparse_attn_indexer_plugin_mode(
             )
 
     triton_convert_req_index_to_global_index(
-        sparse_meta.req_id_per_token.to(dtype=torch.int32),
+        sparse_meta.batch_id_per_q_token.to(dtype=torch.int32),
         sparse_meta.block_table.to(dtype=torch.int32),
         topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
         sparse_meta.paged_kv_indptr,
@@ -477,12 +539,14 @@ def sparse_attn_indexer_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
     sparse_kv_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -492,6 +556,7 @@ def sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -507,7 +572,11 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer_plugin_mode",
     op_func=sparse_attn_indexer_plugin_mode,
-    mutates_args=["sparse_kv_indices_buffer"],
+    mutates_args=[
+        "sparse_kv_indices_buffer",
+        "dcp_sparse_kv_indptr_buffer",
+        "dcp_owned_counts_buffer",
+    ],
     fake_impl=sparse_attn_indexer_fake,
 )
 
@@ -549,6 +618,10 @@ def _deepseek_v32_indexer_get_attn_backend(self):
     return AiterSparseMlaIndexerBackendForVllm
 
 
+def _deepseek_v32_indexer_bind_kv_cache(self, kv_cache):
+    self.kv_cache = kv_cache
+
+
 def DeepseekV32IndexerCacheDecoratorForPluginMode(cls):
     if getattr(cls, "_atom_vllm_indexer_cache_decorated", False):
         return cls
@@ -556,6 +629,7 @@ def DeepseekV32IndexerCacheDecoratorForPluginMode(cls):
         return cls
     cls.get_kv_cache_spec = _deepseek_v32_indexer_get_kv_cache_spec
     cls.get_attn_backend = _deepseek_v32_indexer_get_attn_backend
+    cls.bind_kv_cache = _deepseek_v32_indexer_bind_kv_cache
 
     # In ATOM, kv cache is a list of tensors and accessed through indexing [0].
     # But in vLLM plugin mode, kv cache is a single tensor. So we wrap it in a

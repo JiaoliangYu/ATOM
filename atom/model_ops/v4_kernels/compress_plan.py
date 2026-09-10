@@ -18,18 +18,23 @@ Each plan slot is a 16-byte struct of 4 int32 fields:
 Two plan tensors are produced per `compress_ratio`:
   - compress_plan: rows for tokens whose `(position+1) % ratio == 0`
                    (= compression boundaries). One row per fused-compress kernel
-                   program. Grid = `num_compress`.
+                   program.
   - write_plan:    rows for tokens whose `position` falls in the per-seq
                    "last K_pool positions" window (the only entries the
                    downstream compressor forward will actually read). One row
-                   per `update_compressor_states` kernel program. Grid = `num_write`.
+                   per `update_compressor_states` kernel program.
+
+Each plan is sliced to a kernel-grid length that depends on the mode: tight
+`num_compress` / `num_write` for eager, or a fixed `running_bs * per_seq_bound`
+for the decode CUDAGraph path (padding rows sentinel-filled). See
+`make_compress_plans` for the exact per-mode capacities.
 
 Caller (per-seq loop) gets `cu_compress_cpu` for slicing the kernel's flat
 output `[num_compress, head_dim]` back to per-seq chunks.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Tuple
 
 import numpy as np
 import torch
@@ -59,12 +64,30 @@ class CompressPlan:
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
 
 
+def plan_context_lens(
+    positions: np.ndarray, cu_seqlens_q: np.ndarray, extend_lens: np.ndarray
+) -> np.ndarray:
+    """`context_lens_cpu` for `make_compress_plans`, read off this step's positions.
+
+    The plan re-derives each token's position as `(ctx - extend) + j`, so `ctx`
+    must be the seq length THROUGH the last token this forward writes. Taking
+    the seq's first position from `positions` rather than recomputing an anchor
+    is what stops the plan from placing a token somewhere attention does not:
+    the two anchors differ by `full_q - len_i` on a DSpark ragged step, and by
+    nothing anywhere else.
+    """
+    bs = len(extend_lens)
+    return (positions[cu_seqlens_q[:bs]] + extend_lens).astype(np.int32)
+
+
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
     context_lens_cpu: np.ndarray,
-    unique_ratios_overlap: Iterable[Tuple[int, bool]],
+    unique_ratios_overlap: Iterable[tuple[int, bool]],
     *,
     plan_buffers: dict,
+    running_bs: int | None = None,
+    max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
@@ -86,19 +109,38 @@ def make_compress_plans(
                     calls (CUDAGraph requirement). Fresh per-call alloc is
                     not supported — that pattern caused allocator-churn
                     races (see `write_v4_paged_decode_indices` docstring).
-      decode_capacity_per_ratio: optional dict[ratio] -> int. Slice length
-                    for the returned `compress_plan_gpu`. When PROVIDED:
-                    the slice is exactly that fixed value (independent of
-                    `n_compress`) — required by the decode CUDAGraph path
-                    so capture and replay produce kernel calls with
-                    identical tensor shapes. Caller must size this to the
-                    decode worst case (`bs * ceil((1 + max_spec_steps) /
-                    ratio)`).
-                    When NONE: the slice is exactly `n_compress` (tight,
-                    eager-only) — gives the smallest possible kernel grid.
-                    The slice is contiguous-from-base so the data pointer
-                    is stable; only `shape[0]` shrinks. The underlying
-                    buffer is always sized to the prefill worst case.
+      running_bs: optional int — the CUDAGraph-padded batch size (>= bs). When
+                    PROVIDED this selects the DECODE CUDAGraph path: both
+                    `compress_plan_gpu` and `write_plan_gpu` are sliced to a
+                    FIXED, content-independent capacity `running_bs *
+                    per_seq_bound` (compress bound = `ceil(max_q_len / ratio)`;
+                    write bound = `min(max_q_len, K_pool)`), and rows
+                    `[n_actual, cap)` are sentinel-filled. The cap depends only
+                    on `running_bs` and `max_q_len` (both fixed at capture), so
+                    capture and replay dispatch identically-shaped kernels; the
+                    `[bs, running_bs)` padding seqs land in the sentinel region.
+                    `max_q_len` is required when `running_bs` is set. Because the
+                    decode write count is EXACTLY `bs * min(qlen, K_pool)`
+                    (content-independent), no separate write-capacity dict is
+                    needed — the write cap is derived from `running_bs`/`max_q_len`
+                    identically to compress.
+      max_q_len: optional int — uniform per-seq query length of the padded
+                    decode batch (`1 + max_spec_steps`). Required iff `running_bs`
+                    is set; used to compute the per-seq compress/write bounds.
+      decode_capacity_per_ratio: optional dict[ratio] -> int — explicit FIXED
+                    COMPRESS slice length, for CUDAGraph paths whose per-fwd
+                    token count is not the uniform `running_bs * max_q_len` shape
+                    (the extend-shaped target-verify graph, whose buffers are
+                    sized to a dynamic token count). Mutually exclusive with
+                    `running_bs`. The write plan then keeps the full-buffer legacy
+                    slice (fixed = buffer capacity, sentinel-filled) since that
+                    path's write grid is bounded by its buffer sizing.
+                    When BOTH this and `running_bs` are None (eager prefill /
+                    eager plugin bridges): compress slice = `n_compress` (tight)
+                    and write slice = full buffer (legacy). Slices are
+                    contiguous-from-base so data pointers stay stable; only
+                    `shape[0]` shrinks. Buffers are always sized to the prefill
+                    worst case.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -111,29 +153,59 @@ def make_compress_plans(
     context_lens_cpu = np.ascontiguousarray(context_lens_cpu, dtype=np.int32)
     total = int(extend_lens_cpu.sum())
     out: dict[int, CompressPlan] = {}
+    if running_bs is not None:
+        assert max_q_len is not None, "max_q_len is required when running_bs is set"
+        assert (
+            decode_capacity_per_ratio is None
+        ), "running_bs and decode_capacity_per_ratio are mutually exclusive"
+
+    def _slices(
+        ratio: int,
+        is_overlap: bool,
+        n_compress: int,
+        n_write: int,
+        full_wcap: int,
+    ) -> tuple[int, int]:
+        """(compress_slice, write_slice) — the fixed-or-tight kernel-grid lengths
+        for this ratio. Three modes:
+          * running_bs set (uniform decode CG): both = `running_bs * per_seq_bound`
+            (compress ceil(qlen/ratio); write min(qlen,K_pool)) — content-
+            independent, so capture/replay dispatch identical shapes and the
+            `[n_actual, cap)` region is exactly the `[bs, running_bs)` padding.
+          * decode_capacity_per_ratio set (extend-shaped verify CG): compress =
+            explicit cap; write = full buffer (fixed by buffer sizing).
+          * neither (eager): compress = n_compress (tight); write = full buffer.
+        """
+        if running_bs is not None:
+            k_pool = (2 if is_overlap else 1) * ratio
+            return (
+                running_bs * ((max_q_len + ratio - 1) // ratio),  # ceil(qlen/ratio)
+                running_bs * min(max_q_len, k_pool),
+            )
+        if decode_capacity_per_ratio is not None:
+            return decode_capacity_per_ratio[ratio], full_wcap
+        return n_compress, full_wcap
+
     if total == 0 or bs == 0:
         # Empty fwd: produce CompressPlans pointing at the pre-allocated
         # buffers so capture-time addresses match replay-time addresses
         # even on a zero-token fwd. Skipped via num_*=0.
-        #
-        # CG path (decode_capacity_per_ratio provided): slice = fixed cap.
-        # Eager path (None): slice = 0 — kernel grid is empty, no work
-        # dispatched, no sentinel fill required.
-        for ratio, _ in unique_ratios_overlap:
+        for ratio, is_overlap in unique_ratios_overlap:
             cbuf = plan_buffers[ratio]["compress"]
             wbuf = plan_buffers[ratio]["write"]
-            cap = (
-                decode_capacity_per_ratio.get(ratio)
-                if decode_capacity_per_ratio is not None
-                else 0
+            ccap, wcap = _slices(ratio, is_overlap, 0, 0, wbuf.np.shape[0])
+            assert ccap <= cbuf.np.shape[0] and wcap <= wbuf.np.shape[0], (
+                f"ratio={ratio} empty-fwd caps (compress={ccap}, write={wcap}) "
+                f"exceed buffers ({cbuf.np.shape[0]}, {wbuf.np.shape[0]}); "
+                f"bump plan-buffer sizing in the builder __init__."
             )
-            if cap > 0:
-                cbuf.np[:cap].fill(-1)
-            compress_plan_gpu = cbuf.copy_to_gpu(cap if cap > 0 else 0)
-            wbuf.np[:].fill(-1)
+            if ccap > 0:
+                cbuf.np[:ccap].fill(-1)
+            if wcap > 0:
+                wbuf.np[:wcap].fill(-1)
             out[ratio] = CompressPlan(
-                compress_plan_gpu=compress_plan_gpu,
-                write_plan_gpu=wbuf.copy_to_gpu(),
+                compress_plan_gpu=cbuf.copy_to_gpu(ccap),
+                write_plan_gpu=wbuf.copy_to_gpu(wcap),
                 num_compress=0,
                 num_write=0,
                 cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
@@ -151,14 +223,21 @@ def make_compress_plans(
     prefix_lens = context_lens_cpu - extend_lens_cpu
     positions = prefix_lens[batch_ids] + j_in_seq
 
+    # Only `window_len` depends on the ratio, so the row block is built once and
+    # the loop rewrites that one column. Both selections below are boolean
+    # fancy-indexing, which numpy always materializes as a copy -- that is what
+    # lets the next ratio overwrite column 3 without reaching a plan this one
+    # already published. Keep them gathers.
+    plan_rows = np.empty((total, 4), dtype=np.int32)
+    plan_rows[:, 0] = ragged_ids
+    plan_rows[:, 1] = batch_ids
+    plan_rows[:, 2] = positions
+
     for ratio, is_overlap in unique_ratios_overlap:
         K = ratio * (2 if is_overlap else 1)
         # window_len = K - min(j_in_seq + 1, K)
         # Number of leading K-loop iterations that go to state cache.
-        window_lens = np.maximum(0, K - np.minimum(j_in_seq + 1, K)).astype(np.int32)
-        plan_rows = np.stack(
-            [ragged_ids, batch_ids, positions, window_lens], axis=1
-        ).astype(np.int32)
+        plan_rows[:, 3] = np.maximum(0, K - np.minimum(j_in_seq + 1, K))
 
         # compress: token at a compression boundary
         compress_mask = (positions + 1) % ratio == 0
@@ -190,35 +269,35 @@ def make_compress_plans(
 
         cbuf = plan_buffers[ratio]["compress"]
         wbuf = plan_buffers[ratio]["write"]
-        full_cap = cbuf.np.shape[0]
-        # CG path: fixed slice (capture / replay must match). Eager
-        # path: slice = n_compress (smallest possible kernel grid).
-        cap = (
-            decode_capacity_per_ratio.get(ratio)
-            if decode_capacity_per_ratio is not None
-            else None
+        full_ccap = cbuf.np.shape[0]
+        full_wcap = wbuf.np.shape[0]
+        compress_slice, write_slice = _slices(
+            ratio, is_overlap, n_compress, n_write, full_wcap
         )
-        slice_cap = n_compress if cap is None else cap
-        assert n_compress <= slice_cap <= full_cap, (
-            f"ratio={ratio} num_compress={n_compress}, slice={slice_cap}, "
-            f"buffer={full_cap}: invariant violated. CG path requires "
-            f"n_compress ≤ decode_cap; eager path uses n_compress as slice."
+        assert n_compress <= compress_slice <= full_ccap, (
+            f"ratio={ratio} num_compress={n_compress}, slice={compress_slice}, "
+            f"buffer={full_ccap}: invariant violated. CG path requires "
+            f"n_compress ≤ running_bs·ceil(qlen/ratio) / decode_cap; eager uses "
+            f"n_compress."
         )
-        assert n_write <= wbuf.np.shape[0], (
-            f"ratio={ratio} num_write={n_write} exceeds buffer "
-            f"capacity {wbuf.np.shape[0]}; bump in builder __init__."
+        assert n_write <= write_slice <= full_wcap, (
+            f"ratio={ratio} num_write={n_write}, slice={write_slice}, "
+            f"buffer={full_wcap}: invariant violated. CG path requires "
+            f"n_write ≤ running_bs·min(qlen,K_pool); else uses full buffer."
         )
         if n_compress > 0:
             cbuf.np[:n_compress] = compress_plan
-        # Sentinel only within the slice we hand to the kernel; rows
-        # beyond `slice_cap` are unreachable from this launch.
-        if slice_cap > n_compress:
-            cbuf.np[n_compress:slice_cap].fill(-1)
+        # Sentinel only within the slice we hand to the kernel; rows beyond
+        # the slice are unreachable from this launch. For the CG path the
+        # `[n_*, cap)` region is exactly the `[bs, running_bs)` padding seqs.
+        if compress_slice > n_compress:
+            cbuf.np[n_compress:compress_slice].fill(-1)
         if n_write > 0:
             wbuf.np[:n_write] = write_plan
-        wbuf.np[n_write:].fill(-1)  # sentinel
-        compress_plan_gpu = cbuf.copy_to_gpu(slice_cap)
-        write_plan_gpu = wbuf.copy_to_gpu()
+        if write_slice > n_write:
+            wbuf.np[n_write:write_slice].fill(-1)  # sentinel
+        compress_plan_gpu = cbuf.copy_to_gpu(compress_slice)
+        write_plan_gpu = wbuf.copy_to_gpu(write_slice)
 
         out[ratio] = CompressPlan(
             compress_plan_gpu=compress_plan_gpu,
