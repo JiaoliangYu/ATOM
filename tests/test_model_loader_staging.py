@@ -466,12 +466,8 @@ class ExpertLoadingDifferentialTest(unittest.TestCase):
     def test_stream_concurrency_limit_preserves_loaded_weights(self):
         shards = per_expert_shards(self.NUM_LAYERS, self.NUM_ROUTED)
         hf_config = HFConfig(self.NUM_LAYERS, self.NUM_ROUTED)
-        serial_model = build_model(
-            FakeMoEModel, self.NUM_LAYERS, self.NUM_ROUTED
-        )
-        dynamic_model = build_model(
-            FakeMoEModel, self.NUM_LAYERS, self.NUM_ROUTED
-        )
+        serial_model = build_model(FakeMoEModel, self.NUM_LAYERS, self.NUM_ROUTED)
+        dynamic_model = build_model(FakeMoEModel, self.NUM_LAYERS, self.NUM_ROUTED)
         serial = run_load(serial_model, shards, hf_config, 1)
         dynamic = run_load(
             dynamic_model,

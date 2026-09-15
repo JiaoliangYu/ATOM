@@ -221,9 +221,7 @@ def load_weights_into_model(
         online_quant_streamer.setup_online_quant_pool()
     if num_threads > 1:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
-        stream_threads = max(
-            1, min(envs.ATOM_LOADER_STREAM_THREADS, num_threads)
-        )
+        stream_threads = max(1, min(envs.ATOM_LOADER_STREAM_THREADS, num_threads))
         worker_gate = (
             _LoadWorkerGate(stream_threads, num_threads)
             if stream_threads < num_threads
@@ -246,9 +244,7 @@ def load_weights_into_model(
             if executor is None:
                 online_quant_streamer.run(fn, args)
             else:
-                futures.append(
-                    _submit_to_executor(online_quant_streamer.run, fn, args)
-                )
+                futures.append(_submit_to_executor(online_quant_streamer.run, fn, args))
         elif executor is not None:
             futures.append(_submit_to_executor(fn, *args))
         else:
