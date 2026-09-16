@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
+import logging
+
 import pytest
 
 # All ATOM_* env vars that could affect default-value tests
@@ -23,6 +25,8 @@ _ATOM_ENV_VARS = [
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
     "ATOM_TORCH_PROFILER_DIR",
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER",
+    "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
@@ -85,6 +89,13 @@ class TestEnvsDefaults:
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
 
+    def test_metrics_device_timer_default_disabled(self):
+        assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
+
+    def test_metrics_update_interval_default(self, caplog):
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
+        assert not caplog.records
+
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
 
@@ -146,6 +157,28 @@ class TestEnvsOverrides:
     def test_profiler_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
+
+    def test_metrics_device_timer_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
+        assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is True
+
+    @pytest.mark.parametrize("value", ["0.25", "5"])
+    def test_metrics_update_interval_override(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", value)
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == float(value)
+        assert not caplog.records
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "", "bad"])
+    def test_metrics_update_interval_warns_and_defaults(
+        self, monkeypatch, caplog, value
+    ):
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", value)
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
+        assert len(caplog.records) == 1
+        record = caplog.records[0]
+        assert record.levelno == logging.WARNING
+        assert f"ATOM_METRICS_UPDATE_INTERVAL_S={value!r}" in record.getMessage()
+        assert "using default 1.0" in record.getMessage()
 
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")

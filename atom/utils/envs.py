@@ -18,9 +18,31 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import logging
+import math
 import os
 from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger("atom")
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    raw_value = os.getenv(name, default)
+    try:
+        value = float(raw_value)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r: expected a finite positive number; using default %s",
+        name,
+        raw_value,
+        default,
+    )
+    return float(default)
+
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
@@ -344,6 +366,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
     ),
     # --- Profiling & Logging ---
+    "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
+        "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
+    ),
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
+        "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
+    )
+    == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
