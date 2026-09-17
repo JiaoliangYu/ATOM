@@ -46,6 +46,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     StateStoreOperationId,
 )
+from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
@@ -174,6 +175,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._sidecar_hash_cache = {}
     sched._load_inflight_tokens = {}
     sched._save_inflight_tokens = {}
+    sched._load_failed_seqs = {}
+    sched.total_suppressed_load_retries = 0
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -425,6 +428,10 @@ def _dense_registration_connector() -> DenseOffloadConnector:
     connector._engine = None
     connector._codec = None
     connector._lookup_server = None
+    # `register_kv_caches` logs the pool widths, which a real worker sets in
+    # `__init__`; this connector is built through `__new__`.
+    connector.save_workers = 1
+    connector.load_workers = 1
     return connector
 
 
@@ -1309,6 +1316,88 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
     assert ("run", "b", second_stream_name) in trace
 
 
+@pytest.mark.parametrize("shared_stream", [True, False])
+def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
+    """One stream orders the stages itself, so it must issue no event calls.
+
+    Not a cosmetic saving: every one of those calls enters the GPU runtime and
+    releases the GIL, and it is charged once per staging group.
+    """
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    calls = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", event.name))
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name))
+
+    class _FakeState:
+        def __init__(self):
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    state = _FakeState()
+    pack = _FakeStream("pack")
+    copy = pack if shared_stream else _FakeStream("copy")
+    ran = []
+
+    # Three groups: the free-event wait only appears from the second onwards,
+    # so a single group would not distinguish the two modes.
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8) for _ in range(3)],
+        stage_a=_PipelineStage(pack, lambda group, buf: ran.append("a")),
+        stage_b=_PipelineStage(copy, lambda group, buf: ran.append("b")),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert ran == ["a", "b"] * 3
+    if shared_stream:
+        assert calls == []
+        # A recorded-event flag that outlived its event would gate a later
+        # transfer on something that was never recorded.
+        assert state.staging_buffer.free_event_valid is False
+    else:
+        assert calls == [
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+        ]
+        assert state.staging_buffer.free_event_valid is True
+
+
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
     import torch
 
@@ -1692,14 +1781,10 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
     assert connector._thread_state().staging_buffer.tensor is None
 
 
-def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
+def _tiny_staging_codec():
+    """A codec with one block per LMCache chunk and a very small chunk."""
     import torch
 
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
@@ -1708,11 +1793,85 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
             v_scale=None,
         )
     }
-    codec = DenseKVByteCodec(kv_caches)
+    return DenseKVByteCodec(kv_caches)
+
+
+def _clear_staging_env(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+
+
+def test_default_staging_buffer_is_sized_in_bytes_not_chunks(monkeypatch):
+    """The default buys a fixed number of bytes, whatever a chunk happens to be.
+
+    This is the whole point of the byte-denominated default: two KV geometries
+    with different bytes-per-chunk must end up with the same buffer size, not
+    the same chunk count.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    chunk_bytes = codec.bytes_per_block  # block_size == chunk_size below
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 4 * chunk_bytes
+    )
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert connector.gpu_staging_chunk_bytes == chunk_bytes
+    assert connector.gpu_staging_buffer_chunks == 4
+    assert connector.gpu_staging_buffer_bytes == 4 * chunk_bytes
+
+
+def test_default_staging_buffer_never_drops_below_two_chunks(monkeypatch):
+    """A geometry whose single chunk already exceeds the target keeps two.
+
+    The byte target raises the floor for small-chunk models; it must not cut
+    large-chunk models down to a single chunk, which would be worse than the
+    chunk-denominated default they have today.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", codec.bytes_per_block // 2
+    )
+
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
-    assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
+
+
+def test_default_staging_buffer_chunk_count_is_capped(monkeypatch):
+    """A tiny chunk must not turn the byte target into an unbounded count.
+
+    The buffer is allocated at its full size, so the chunk count is what bounds
+    per-group work; without a cap a geometry with a very small chunk would ask
+    for millions of them.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(_block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 1 << 30)
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert (
+        connector.gpu_staging_buffer_chunks
+        == _block_gpu_connector._MAX_DEFAULT_GPU_STAGING_CHUNKS
+    )
 
 
 def test_codec_chunk_major_device_buffer_layout():
@@ -3791,7 +3950,14 @@ def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
     assert sched.adjust_prefill_chunk_after_alloc(seq, 16_000) == 4096
 
 
-def test_full_prompt_hit_is_clamped_before_load_spec():
+def test_full_prompt_hit_is_clamped_and_floored_before_load_spec():
+    # A full-prompt hit is decremented so something is left to compute, and
+    # then floored back onto a chunk boundary. Both steps are load-bearing:
+    # LMCache resolves at chunk granularity, so the bare decrement (7 here,
+    # 32767 on GLM-5.2 with chunk 64) names tokens the tier does not hold and
+    # the load can only ever fail -- which parks the request in
+    # WAITING_FOR_REMOTE_KVS and, since a failed load used to leave no record,
+    # forever. chunk_size is 4, so 8 -> 7 -> 4.
     sched = _scheduler()
     sched._lookup_client = _LookupClient(hit=8)
     seq = SimpleNamespace(
@@ -3803,9 +3969,39 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
 
     need, should_park = sched.get_num_new_matched_tokens(seq)
 
-    assert need == 7
+    assert need == 4
     assert should_park is True
-    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 4
+
+
+def test_dsv4_failed_load_is_not_retried_for_the_same_request():
+    # Same one-attempt rule as the dense layout: without it, `load_failed`
+    # clears the pending load and the lookup memo, so the next scheduler pass
+    # hits, parks, and fails again -- holding the request's KV blocks and its
+    # concurrency slot for the life of the benchmark.
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=6)
+    seq = SimpleNamespace(
+        id=125,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert sched.load_failed("125") is True
+    assert sched._load_failed_seqs == {"125": seq}
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+    # Reported, not just counted: a suppressed retry is a silent hit-rate loss
+    # -- the request serves correctly, from HBM, having skipped the tier -- so
+    # the only way to see it in a running server is through the statistics dict.
+    assert sched.get_statistics()["suppressed_load_retries"] == 1
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}
 
 
 def test_lookup_miss_is_forwarded_for_worker_unpin():
@@ -4895,6 +5091,7 @@ def test_scheduler_offload_statistics_are_cumulative():
         "saved_tokens": 4096,
         "loads_pending": 0,
         "saves_pending": 0,
+        "suppressed_load_retries": 0,
     }
 
 
