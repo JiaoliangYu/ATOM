@@ -640,7 +640,24 @@ class Scheduler:
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
-        if kv_events_cfg is not None and kv_events_cfg.enable:
+        # Under pipeline parallelism every stage builds a Scheduler, but only
+        # the head stage schedules and hashes blocks; the others never produce
+        # events. Give them the null publisher so they neither bind the
+        # per-DP-rank endpoints (a downstream stage on the same host would
+        # collide with the head) nor emit duplicate streams.
+        pp_rank = (
+            getattr(parallel_cfg, "pipeline_parallel_rank", 0)
+            if parallel_cfg is not None
+            else 0
+        )
+        kv_events_on = kv_events_cfg is not None and kv_events_cfg.enable
+        if kv_events_on and pp_rank:
+            logger.info(
+                "KV event publisher disabled on PP stage %s: only the head "
+                "stage publishes",
+                pp_rank,
+            )
+        if kv_events_on and not pp_rank:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
                 enabled=True,
                 publisher_kind=kv_events_cfg.publisher,
@@ -648,12 +665,22 @@ class Scheduler:
                 topic=kv_events_cfg.topic,
                 hwm=kv_events_cfg.hwm,
                 buffer_steps=kv_events_cfg.buffer_steps,
+                replay_endpoint=kv_events_cfg.replay_endpoint,
+                replay_buffer_steps=kv_events_cfg.replay_buffer_steps,
                 data_parallel_rank=dp_rank,
             )
             logger.info(
-                "KV event publisher enabled: kind=%s endpoint=%s dp_rank=%s",
+                "KV event publisher enabled: kind=%s endpoint=%s "
+                "replay_endpoint=%s dp_rank=%s",
                 kv_events_cfg.publisher,
-                kv_events_cfg.endpoint,
+                # The zmq publisher offsets its bind addresses per DP rank;
+                # log what was actually bound, not the shared config value.
+                getattr(self.kv_event_publisher, "endpoint", kv_events_cfg.endpoint),
+                getattr(
+                    self.kv_event_publisher,
+                    "replay_endpoint",
+                    kv_events_cfg.replay_endpoint,
+                ),
                 dp_rank,
             )
         else:
@@ -3299,6 +3326,7 @@ class Scheduler:
             remote_tokens: list[int] = []
             parent_block_hash: int | None = None
             prev_hash: int | None = None
+            first_remote_index: int | None = None
             for i, block_id in enumerate(seq.block_table):
                 blk = bm.kv.block(block_id)
                 if blk.hash == -1:
@@ -3308,14 +3336,27 @@ class Scheduler:
                     continue
                 if not remote_hashes:
                     parent_block_hash = prev_hash
+                    # Derive the token offset from the first remote block's
+                    # actual block-table index, not num_cached_blocks: an
+                    # unhashed block skipped above can push the first remote
+                    # block past num_cached_blocks, which would otherwise
+                    # undercount the offset by whole blocks.
+                    first_remote_index = i
                 remote_hashes.append(blk.hash)
                 remote_tokens.extend(blk.token_ids)
                 prev_hash = blk.hash
             if remote_hashes:
+                # first_remote_index is always set when remote_hashes is
+                # non-empty; assert it so a future refactor can't silently
+                # regress into `None * hash_block_size`.
+                assert first_remote_index is not None
                 bm.record_remote_store(
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,
                     parent_block_hash=parent_block_hash,
+                    # Block-table index -> global token position: under DCP
+                    # each entry spans hash_block_size tokens, not block_size.
+                    token_offset=first_remote_index * bm.hash_block_size,
                 )
         return True
 
