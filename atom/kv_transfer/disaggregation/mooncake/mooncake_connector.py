@@ -13,11 +13,13 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import msgpack
@@ -33,6 +35,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
 )
@@ -56,7 +59,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence
 from atom.models.utils import get_pp_indices
-from atom.utils import get_open_port, make_zmq_path, zmq_socket_ctx
+from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
 
 logger = logging.getLogger("atom")
@@ -86,6 +89,7 @@ except ImportError:
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
+_IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
 def _swa_ring_ids(seq) -> list[int]:
@@ -108,7 +112,7 @@ def _swa_ring_ids(seq) -> list[int]:
 
 
 def _ib_device_exists(device_name: str) -> bool:
-    return os.path.exists(f"/sys/class/infiniband/{device_name}")
+    return (_IB_SYSFS_ROOT / device_name).exists()
 
 
 def _auto_select_ib_device(phys_idx: int) -> str:
@@ -158,6 +162,90 @@ def _select_ib_devices(
             if device not in devices and _ib_device_exists(device):
                 devices.append(device)
     return devices
+
+
+def _discover_active_matched_rails(primary_device: str) -> list[str]:
+    """Discover active HCAs in the primary's numbered device-name family."""
+    family = re.fullmatch(r"(.*\D)(\d+)", primary_device)
+    if family is None:
+        raise ValueError(
+            f"Cannot auto-discover matched rails for HCA {primary_device!r}; "
+            "set ATOM_MOONCAKE_MATCHED_RAILS to an explicit HCA list"
+        )
+    pattern = re.compile(re.escape(family[1]) + r"(\d+)")
+    try:
+        devices = list(_IB_SYSFS_ROOT.iterdir())
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot discover RDMA HCAs in {_IB_SYSFS_ROOT}; "
+            "set ATOM_MOONCAKE_MATCHED_RAILS to an explicit HCA list"
+        ) from exc
+
+    active = []
+    for device in devices:
+        match = pattern.fullmatch(device.name)
+        if match is None:
+            continue
+        for state_file in device.glob("ports/*/state"):
+            try:
+                state = state_file.read_text().partition(":")[0].strip()
+            except OSError:
+                continue
+            if state == "4":  # IB_PORT_ACTIVE, also used by RoCE HCAs.
+                active.append((int(match[1]), device.name))
+                break
+    rails = [name for _, name in sorted(active)]
+    if primary_device not in rails:
+        raise ValueError(
+            f"Primary HCA {primary_device!r} has no readable ACTIVE RDMA port; "
+            "check the link and sysfs visibility before using matched rails"
+        )
+    logger.info(
+        "Auto-discovered Mooncake matched rails: primary=%s rails=%s",
+        primary_device,
+        rails,
+    )
+    return rails
+
+
+def _resolve_matched_rails(
+    protocol: str, ib_devices: list[str], configured_rails: str
+) -> list[str]:
+    value = configured_rails.strip()
+    if value.lower() == "auto":
+        # Check transport and primary shape before reading RDMA sysfs.
+        if protocol.strip().lower() != "rdma":
+            raise ValueError("ATOM_MOONCAKE_MATCHED_RAILS requires protocol=rdma")
+        if len(ib_devices) != 1:
+            raise ValueError(
+                "Matched rails require a single primary HCA per engine; "
+                "disable ib_enable_alternate_hca and use at most one ib_device"
+            )
+        rails = _discover_active_matched_rails(ib_devices[0])
+    else:
+        rails = _parse_ib_devices(value)
+    _validate_matched_rails(protocol, ib_devices, rails)
+    return rails
+
+
+def _validate_matched_rails(
+    protocol: str, ib_devices: list[str], matched_rails: list[str]
+) -> None:
+    if not matched_rails:
+        return
+    if protocol.strip().lower() != "rdma":
+        raise ValueError("ATOM_MOONCAKE_MATCHED_RAILS requires protocol=rdma")
+    if len(ib_devices) != 1:
+        raise ValueError(
+            "Matched rails require a single primary HCA per engine; "
+            "disable ib_enable_alternate_hca and use at most one ib_device"
+        )
+    if ib_devices[0] not in matched_rails or any(
+        not _ib_device_exists(device) for device in matched_rails
+    ):
+        raise ValueError(
+            "Matched rails must name existing local HCAs including the primary HCA"
+        )
 
 
 def _select_ib_device(
@@ -623,9 +711,9 @@ class MooncakeConnector(KVConnectorBase):
         # cannot activate an available HCA as an alternate path.
         # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
         # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Cross-rail PD may opt
-        # into registering on ionic_0..ionic_{N-1} so any remote rank can reach
-        # this GPU's buffers via a reachable HCA.
+        # By default, register only with the local NIC. Alternate-HCA mode
+        # registers a single engine on multiple NICs. On rail-isolated fabrics,
+        # matched-rail mode instead selects a single-HCA engine per request.
         _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
             "ib_device", ""
@@ -655,6 +743,13 @@ class MooncakeConnector(KVConnectorBase):
         ib_device = ",".join(ib_devices)
         primary_ib_device = ib_devices[0] if ib_devices else ""
         self.ib_devices = ib_devices
+        matched_rails = _resolve_matched_rails(
+            self.protocol, ib_devices, envs.ATOM_MOONCAKE_MATCHED_RAILS
+        )
+        # Advertise only an unambiguous, single-HCA destination. An engine
+        # registered on multiple NICs can still choose an unreachable rail.
+        self.ib_device = ib_devices[0] if len(ib_devices) == 1 else None
+        self._rail_pool = None
         if self.protocol.strip().lower() == "tcp":
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
         elif not configured_ib_device:
@@ -706,6 +801,25 @@ class MooncakeConnector(KVConnectorBase):
             ib_device,
             self.rpc_port,
         )
+
+        if matched_rails and self.is_producer:
+            self._rail_pool = RailEnginePool(
+                TransferEngine,
+                self.transfer_engine,
+                primary_ib_device,
+                matched_rails,
+                # This address is the P2P RPC endpoint, not the RDMA GID.
+                # IPv6-only rails may share a reachable host IPv4 for RPC;
+                # the engine's device filter still selects the matched HCA.
+                local_ip_for_device=lambda device: _ip_for_ib_device(
+                    device, default_local_ip
+                ),
+            )
+            logger.info(
+                "Mooncake matched rails enabled: primary=%s rails=%s",
+                primary_ib_device,
+                matched_rails,
+            )
 
         # --- KV cache state (populated in register_kv_caches) ---
         self.kv_caches: dict[str, Any] | None = None
@@ -1000,17 +1114,33 @@ class MooncakeConnector(KVConnectorBase):
                 "trying individual registration as fallback...",
                 ret,
             )
+            # A later chunk can fail after earlier ones registered. Leaving those
+            # behind strands Mooncake MRs for memory the caller is about to tear
+            # down, so a retry or a second connector in this process would leak
+            # registration resources. Roll back before propagating.
+            registered: list[int] = []
             for ptr, sz_bytes in zip(reg_ptrs, reg_sizes):
                 r = self.transfer_engine.register_memory(ptr, sz_bytes)
                 if r != 0:
-                    logger.error(
-                        "  register_memory FAILED ptr=0x%x size=%d ret=%d",
-                        ptr,
-                        sz_bytes,
-                        r,
+                    for done_ptr in reversed(registered):
+                        try:
+                            self.transfer_engine.unregister_memory(done_ptr)
+                        except Exception:
+                            logger.exception(
+                                "Rollback of Mooncake registration failed for "
+                                "ptr=%#x; continuing to unwind",
+                                done_ptr,
+                            )
+                    raise RuntimeError(
+                        f"Mooncake register_memory failed: "
+                        f"ptr={ptr:#x} size={sz_bytes} ret={r}"
                     )
+                registered.append(ptr)
         else:
             logger.info("batch_register_memory OK (%d chunks)", len(reg_ptrs))
+
+        if self._rail_pool is not None:
+            self._rail_pool.set_regions(reg_ptrs, reg_sizes)
 
         # Build metadata for bootstrap exchange
         if self._has_slot_regions:
@@ -1171,6 +1301,8 @@ class MooncakeConnector(KVConnectorBase):
                 "transfer_id": meta.transfer_id,
                 "consumer_host": self.local_ip,
                 "consumer_rpc_port": self.rpc_port,
+                "consumer_ib_device": self.ib_device,
+                "consumer_dp_rank": self.dp_rank,
                 # Consumer's layer count per group for producer stride validation.
                 "consumer_num_layers": self._num_local_layers,
                 # Role of each of this side's block regions, so the producer can
@@ -1622,8 +1754,21 @@ class MooncakeConnector(KVConnectorBase):
                 )
             target = f"{consumer_host}:{consumer_rpc_port}"
 
-            if hasattr(self.transfer_engine, "get_first_buffer_address"):
-                remote_buf = self.transfer_engine.get_first_buffer_address(target)
+            # Keep this engine local to the request: concurrent requests can
+            # target different decode rails, including during retries/staging.
+            engine = self.transfer_engine
+            if self._rail_pool is not None:
+                engine = self._rail_pool.get(request_data.get("consumer_ib_device"))
+                logger.debug(
+                    "Mooncake matched rail: req=%s p_dp=%d d_dp=%s device=%s",
+                    req_id,
+                    self.dp_rank,
+                    request_data.get("consumer_dp_rank"),
+                    request_data.get("consumer_ib_device"),
+                )
+
+            if hasattr(engine, "get_first_buffer_address"):
+                remote_buf = engine.get_first_buffer_address(target)
                 if remote_buf == 0:
                     logger.error(
                         "[PRODUCER] Consumer %s has NO registered buffers.",
@@ -1638,6 +1783,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     prefill_data,
                     req_id,
+                    engine=engine,
                 )
             else:
                 transfer_ok = self._execute_block_transfer(
@@ -1647,6 +1793,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     req_id,
                     kv_cache_ready_event,
+                    engine=engine,
                 )
 
             if not transfer_ok:
@@ -1773,6 +1920,8 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         req_id: str,
         kv_cache_ready_event: torch.cuda.Event | None = None,
+        *,
+        engine=None,
     ) -> bool:
         """Block-only RDMA transfer (MHA, MLA, and other block-indexed backends)."""
         consumer_base_addrs = request_data["consumer_base_addrs"]
@@ -1788,7 +1937,7 @@ class MooncakeConnector(KVConnectorBase):
             if not src_addrs:
                 return True
             if not self._rdma_write_with_retry(
-                target, src_addrs, dst_addrs, sizes, req_id, "block"
+                target, src_addrs, dst_addrs, sizes, req_id, "block", engine=engine
             ):
                 return False
             src_addrs.clear()
@@ -1973,6 +2122,7 @@ class MooncakeConnector(KVConnectorBase):
                         dst_chunk,
                         req_id,
                         gather_indices,
+                        engine=engine,
                     ):
                         return False
         return True
@@ -1986,6 +2136,8 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         req_id: str,
         gather_indices,
+        *,
+        engine=None,
     ) -> bool:
         """GPU-repack one index layer/chunk, then RDMA its local pages."""
 
@@ -2034,6 +2186,7 @@ class MooncakeConnector(KVConnectorBase):
                 sizes.tolist(),
                 req_id,
                 "staged-index",
+                engine=engine,
             ):
                 logger.error(
                     "[PRODUCER] staged index transfer failed for req %s region %d",
@@ -2053,6 +2206,8 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
+        *,
+        engine=None,
     ) -> bool:
         """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
         consumer_is_fp4 = "consumer_block_base_addrs_fp4" in request_data
@@ -2199,7 +2354,7 @@ class MooncakeConnector(KVConnectorBase):
         )
 
         if not self._rdma_write_with_retry(
-            target, block_src, block_dst, block_sizes, req_id, "block"
+            target, block_src, block_dst, block_sizes, req_id, "block", engine=engine
         ):
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
             return False
@@ -2266,7 +2421,7 @@ class MooncakeConnector(KVConnectorBase):
         )
 
         slot_ok = self._rdma_write_with_retry(
-            target, slot_src, slot_dst, slot_sizes, req_id, "slot"
+            target, slot_src, slot_dst, slot_sizes, req_id, "slot", engine=engine
         )
         if not slot_ok:
             logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
@@ -2297,8 +2452,12 @@ class MooncakeConnector(KVConnectorBase):
         sizes: list[int],
         req_id: str,
         label: str,
+        *,
+        engine=None,
     ) -> bool:
-        """Chunked RDMA write with retry. Returns True on success."""
+        """Chunked writes and retries on the same request-local engine."""
+        if engine is None:
+            engine = self.transfer_engine
         max_entries_per_batch = self._MAX_RDMA_ENTRIES_PER_BATCH
         total_entries = len(src_addrs)
         max_retries = 3
@@ -2312,7 +2471,7 @@ class MooncakeConnector(KVConnectorBase):
             retry_delay = 2.0
             for attempt in range(max_retries):
                 try:
-                    ret = self.transfer_engine.batch_transfer_sync_write(
+                    ret = engine.batch_transfer_sync_write(
                         target, chunk_src, chunk_dst, chunk_sizes
                     )
                     if ret == 0:
