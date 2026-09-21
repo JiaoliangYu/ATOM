@@ -98,15 +98,17 @@ combine knob as a quality/throughput tradeoff.
 
 ### MoonEP planning policy
 
-The MoonEP policy is an opt-in planning layer over MoRI v2. Prefill builds a
+The MoonEP policy is an opt-in planning layer over the existing MoRI transport.
+It uses MoRI v1 by default for the initial gfx950 closure and follows
+`ATOM_MORI_V2=1` when bringing the same policy to gfx1250. Prefill builds a
 global expert histogram, assigns a bounded set of remote experts to local cache
-slots, and dispatches virtual physical IDs through the normal MoRI transport.
+slots, and dispatches virtual physical IDs through the selected transport.
 Decode remains owner-only and does not build or synchronize a histogram. Both
 phases run the standard fused MoE experts and use the normal MoRI combine.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_EP_BACKEND** | str | `mori` | Set to `moonep` to enable the MoonEP prefill/decode policies. Requires the matching AITER MoonEP planner kernels. `mori` preserves the existing backend. |
+| **ATOM_EP_BACKEND** | str | `mori` | Set to `moonep` to enable the MoonEP prefill/decode policies. Requires the matching AITER MoonEP planner kernels. `mori` preserves the existing backend. MoonEP uses standard `fused_moe` and is incompatible with `ATOM_MORI_V2_FUSED=1`. |
 | **MOONEP_PREFETCH_SLOTS** | int | `8` | Number of remote-expert cache slots per rank used by the MoonEP prefill policy. |
 
 ## Fusion passes

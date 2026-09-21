@@ -157,9 +157,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
-    # Optional MoonEP planning layer over MoRI v2 dispatch/combine. The default
+    # Optional MoonEP planning layer over MoRI dispatch/combine. The default
     # keeps the existing MoRI backend unchanged; set to "moonep" only when the
-    # matching AITER planning kernels are installed.
+    # matching AITER planning kernels are installed. It follows ATOM_MORI_V2,
+    # so gfx950 uses the production v1 transport unless v2 is explicitly set.
     "ATOM_EP_BACKEND": lambda: os.getenv("ATOM_EP_BACKEND", "mori").lower(),
     # Number of remote-expert cache slots per rank used by MoonEP prefill.
     "MOONEP_PREFETCH_SLOTS": lambda: int(os.getenv("MOONEP_PREFETCH_SLOTS", "8")),

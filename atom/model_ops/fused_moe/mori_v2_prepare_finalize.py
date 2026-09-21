@@ -32,17 +32,18 @@ Shared experts are NOT fused in the mori EP+DP path (ATOM disables fusion there,
 see topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config), so
 topk_ids carry only routed expert ids and mori routes them cleanly.
 
-``ATOM_EP_BACKEND=moonep`` adds a policy layer without replacing this transport:
+``ATOM_EP_BACKEND=moonep`` adds a policy layer without replacing the transport:
 prefill remaps logical ids into ``EPR+B`` virtual slots and runs the resident and
 prefetched subsets through standard fused_moe, while decode keeps the owner-only
-``EPR`` geometry.  Both phases still use this module's ordinary MoRI dispatch
-and combine operations.
+``EPR`` geometry. The policy factory uses the existing MoRI v1 transport by
+default for gfx950 and selects v2 when ``ATOM_MORI_V2=1``.
 """
 
 import logging
 import os
 import sys
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -558,6 +559,61 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return out[:num_token]
 
 
+class _MoriV1PolicyTransport:
+    """Normalize the production MoRI v1 API to the v2 routing-handle contract."""
+
+    def __init__(self, prepare_finalize: Any, num_experts_per_rank: int) -> None:
+        self._prepare_finalize = prepare_finalize
+        native_cfg = getattr(prepare_finalize._sync_mori_op, "cfg", None)
+        self.cfg = SimpleNamespace(
+            num_experts_per_rank=num_experts_per_rank,
+            dispatch_block_num=getattr(native_cfg, "block_num", 1024),
+        )
+
+    def dispatch(
+        self,
+        hidden: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor | None,
+        indices: torch.Tensor,
+        *,
+        return_routing: bool,
+    ):
+        if scales is not None:
+            raise ValueError("MoonEP's gfx950 closure expects BF16 MoRI dispatch")
+        if not return_routing:
+            raise ValueError("MoonEP requires a routing handle for combine")
+        block_num, warp_per_block = self._prepare_finalize._get_dispatch_config(
+            hidden.shape[0]
+        )
+        recv_x, recv_w, recv_s, recv_idx, total_recv = (
+            self._prepare_finalize._sync_mori_op.dispatch(
+                hidden,
+                weights,
+                None,
+                indices,
+                block_num,
+                warp_per_block,
+            )
+        )
+        # MoRI v1 reconstructs combine routing from the dispatched physical IDs
+        # rather than returning an opaque handle as v2 does.
+        return recv_x, recv_w, recv_s, recv_idx, total_recv, indices
+
+    def combine(self, output: torch.Tensor, *, routing: torch.Tensor):
+        block_num, warp_per_block = self._prepare_finalize._get_dispatch_config(
+            routing.shape[0]
+        )
+        result = self._prepare_finalize._sync_mori_op.combine(
+            output,
+            None,
+            routing,
+            block_num,
+            warp_per_block,
+        )
+        return result[0], None
+
+
 def _make_virtual_expert_masks(
     *,
     rank: int,
@@ -578,7 +634,7 @@ def _make_virtual_expert_masks(
     return home, prefetched
 
 
-class MoonEPPolicyMoriV2PrepareAndFinalize(MoriV2PrepareAndFinalize):
+class MoonEPPolicyMoriPrepareAndFinalize(MoriV2PrepareAndFinalize):
     """MoonEP planning in front of normal MoRI dispatch + standard fused_moe.
 
     Prefill uses ``EPR + B`` virtual slots per rank. Resident experts occupy
@@ -1228,7 +1284,8 @@ def make_moonep_policy_prepare_finalize(
     all2all_manager,
     *,
     prefetch_slots: int,
-) -> MoonEPPolicyMoriV2PrepareAndFinalize:
+    quant_config: FusedMoEQuantConfig | None,
+) -> MoonEPPolicyMoriPrepareAndFinalize:
     """Build the two MoRI geometries used by the disaggregated MoonEP policy."""
 
     from aiter.dist.parallel_state import get_ep_group
@@ -1238,27 +1295,50 @@ def make_moonep_policy_prepare_finalize(
     ep_size = all2all_manager.world_size
     experts_per_rank = moe.num_experts // ep_size
 
-    common = {
-        "ep_rank": all2all_manager.rank,
-        "ep_size": ep_size,
-        "ep_src_global_rank": ep_src_global_rank,
-        "hidden_dim": moe.hidden_dim,
-        "max_num_inp_token_per_rank": moe.max_num_tokens,
-        "num_experts_per_token": moe.experts_per_token,
-        "data_type_itemsize": moe.in_dtype.itemsize,
-        "combine_mode": "gather",
-    }
-    decode_op = init_mori_v2_op(
-        num_local_experts=experts_per_rank,
-        **common,
-    )
-    prefill_op = init_mori_v2_op(
-        num_local_experts=experts_per_rank + prefetch_slots,
-        **common,
-    )
+    if envs.ATOM_MORI_V2_FUSED:
+        raise ValueError(
+            "ATOM_EP_BACKEND=moonep uses standard fused_moe and cannot be "
+            "combined with ATOM_MORI_V2_FUSED=1"
+        )
+
+    if envs.ATOM_MORI_V2:
+        common = {
+            "ep_rank": all2all_manager.rank,
+            "ep_size": ep_size,
+            "ep_src_global_rank": ep_src_global_rank,
+            "hidden_dim": moe.hidden_dim,
+            "max_num_inp_token_per_rank": moe.max_num_tokens,
+            "num_experts_per_token": moe.experts_per_token,
+            "data_type_itemsize": moe.in_dtype.itemsize,
+            "combine_mode": "gather",
+        }
+        decode_op = init_mori_v2_op(
+            num_local_experts=experts_per_rank,
+            **common,
+        )
+        prefill_op = init_mori_v2_op(
+            num_local_experts=experts_per_rank + prefetch_slots,
+            **common,
+        )
+        transport = "v2"
+    else:
+        decode_op = _make_mori_v1_policy_transport(
+            moe,
+            all2all_manager,
+            num_local_experts=experts_per_rank,
+            quant_config=quant_config,
+        )
+        prefill_op = _make_mori_v1_policy_transport(
+            moe,
+            all2all_manager,
+            num_local_experts=experts_per_rank + prefetch_slots,
+            quant_config=quant_config,
+        )
+        transport = "v1"
     logger.info(
-        "MoonEP policy over MoRI v2: rank=%d world=%d home=%d prefetch=%d "
+        "MoonEP policy over MoRI %s: rank=%d world=%d home=%d prefetch=%d "
         "decode_epr=%d prefill_epr=%d",
+        transport,
         all2all_manager.rank,
         ep_size,
         experts_per_rank,
@@ -1266,7 +1346,7 @@ def make_moonep_policy_prepare_finalize(
         experts_per_rank,
         experts_per_rank + prefetch_slots,
     )
-    return MoonEPPolicyMoriV2PrepareAndFinalize(
+    return MoonEPPolicyMoriPrepareAndFinalize(
         prefill_op=prefill_op,
         decode_op=decode_op,
         rank=all2all_manager.rank,
@@ -1276,3 +1356,55 @@ def make_moonep_policy_prepare_finalize(
         max_tokens_per_rank=moe.max_num_tokens,
         num_dispatchers=ep_size,
     )
+
+
+def _make_mori_v1_policy_transport(
+    moe,
+    all2all_manager,
+    *,
+    num_local_experts: int,
+    quant_config: FusedMoEQuantConfig | None,
+) -> _MoriV1PolicyTransport:
+    """Create the existing gfx950 MoRI transport with a policy-specific EPR."""
+
+    from atom.model_ops.fused_moe.mori_prepare_finalize import (
+        MoriPrepareAndFinalize,
+        resolve_mori_dispatch,
+    )
+
+    dispatch_format = resolve_mori_dispatch(
+        in_dtype=moe.in_dtype,
+        hidden_dim=moe.hidden_dim,
+        quant_config=quant_config,
+    )
+    if dispatch_format.is_fp4 or dispatch_format.is_fp8:
+        raise ValueError(
+            "ATOM_EP_BACKEND=moonep currently requires BF16 MoRI dispatch; "
+            "disable ATOM_MORI_FP4_DISPATCH for the gfx950 closure"
+        )
+
+    all_to_all_args = {
+        "rank": all2all_manager.rank,
+        "num_ep_ranks": all2all_manager.world_size,
+        "quant_dtype": dispatch_format.dtype,
+        "token_hidden_size": moe.hidden_dim,
+        "scale_dim": dispatch_format.scale_dim,
+        "scale_type_size": dispatch_format.scale_type_size,
+        "max_num_tokens_per_dp_rank": moe.max_num_tokens,
+        "input_dtype": moe.in_dtype,
+        "num_local_experts": num_local_experts,
+        "num_experts_per_token": moe.experts_per_token,
+        "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+    }
+    if envs.ATOM_MORI_COMBINE_QUANT != "none":
+        all_to_all_args["quant_type"] = envs.ATOM_MORI_COMBINE_QUANT
+
+    handle = all2all_manager.get_handle(all_to_all_args)
+    prepare_finalize = MoriPrepareAndFinalize(
+        handle,
+        max_tokens_per_rank=moe.max_num_tokens,
+        num_dispatchers=all2all_manager.world_size,
+        dispatch_format=dispatch_format,
+        is_async=False,
+    )
+    return _MoriV1PolicyTransport(prepare_finalize, num_local_experts)

@@ -676,7 +676,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # falling back, and "no error" is not evidence the path was taken.
             # Grep the server log for this line before trusting any number.
             logger.info(
-                "MoonEP policy backend active: MoRI v2 + fused_moe, rank=%d "
+                "MoonEP policy backend active: MoRI + fused_moe, rank=%d "
                 "world=%d hidden=%d local_experts=%d topk=%d max_tokens=%d "
                 "dtype=%s slots=%d",
                 all2all_manager.rank,
@@ -692,6 +692,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 moe,
                 all2all_manager,
                 prefetch_slots=prefetch_slots,
+                quant_config=quant_config,
             )
 
         # TODO: could allow this now

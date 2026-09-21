@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Contract tests for MoonEP planning layered over MoRI v2 dispatch."""
+"""Contract tests for MoonEP planning layered over MoRI dispatch."""
 
 import importlib
 from types import SimpleNamespace
@@ -34,9 +34,35 @@ class _FakePolicy:
         return self.result
 
 
+class _FakeV1NativeOp:
+    def __init__(self):
+        self.cfg = SimpleNamespace(block_num=37)
+        self.dispatch_calls = []
+        self.combine_calls = []
+
+    def dispatch(self, hidden, weights, scales, indices, block_num, warp_per_block):
+        self.dispatch_calls.append(
+            (hidden, weights, scales, indices, block_num, warp_per_block)
+        )
+        return hidden, weights, scales, indices, torch.tensor(3)
+
+    def combine(self, output, scales, indices, block_num, warp_per_block):
+        self.combine_calls.append((output, scales, indices, block_num, warp_per_block))
+        return (output,)
+
+
+class _FakeV1PrepareFinalize:
+    def __init__(self):
+        self._sync_mori_op = _FakeV1NativeOp()
+
+    @staticmethod
+    def _get_dispatch_config(num_tokens):
+        return num_tokens + 10, 4
+
+
 def _policy_prepare_finalize(*, prefill: bool):
-    obj = mpf.MoonEPPolicyMoriV2PrepareAndFinalize.__new__(
-        mpf.MoonEPPolicyMoriV2PrepareAndFinalize
+    obj = mpf.MoonEPPolicyMoriPrepareAndFinalize.__new__(
+        mpf.MoonEPPolicyMoriPrepareAndFinalize
     )
     obj._num_experts = 8
     obj._experts_per_rank = 4
@@ -65,6 +91,32 @@ def test_virtual_masks_map_each_region_to_its_own_weight_rows():
     assert prefetched.tolist() == [0] * 10 + [1, 1]
     assert (home.cumsum(0) - 1)[6:10].tolist() == [0, 1, 2, 3]
     assert (prefetched.cumsum(0) - 1)[10:12].tolist() == [0, 1]
+
+
+def test_mori_v1_adapter_preserves_planned_ids_for_combine():
+    prepare_finalize = _FakeV1PrepareFinalize()
+    transport = mpf._MoriV1PolicyTransport(prepare_finalize, 5)
+    hidden = torch.randn(2, 8)
+    weights = torch.tensor([[0.75, 0.25], [0.6, 0.4]])
+    planned = torch.tensor([[0, 9], [2, 3]], dtype=torch.int32)
+
+    recv = transport.dispatch(
+        hidden,
+        weights,
+        None,
+        planned,
+        return_routing=True,
+    )
+    assert recv[-1] is planned
+    assert transport.cfg.num_experts_per_rank == 5
+    assert transport.cfg.dispatch_block_num == 37
+    assert prepare_finalize._sync_mori_op.dispatch_calls[0][-2:] == (12, 4)
+
+    combined, token_scales = transport.combine(hidden, routing=planned)
+    assert combined is hidden
+    assert token_scales is None
+    assert prepare_finalize._sync_mori_op.combine_calls[0][2] is planned
+    assert prepare_finalize._sync_mori_op.combine_calls[0][-2:] == (12, 4)
 
 
 def test_prefill_dispatch_uses_planned_ids_and_preserves_router_weights():
