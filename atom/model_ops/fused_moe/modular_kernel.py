@@ -1,16 +1,18 @@
 from abc import ABC, abstractmethod
-
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
+from typing import final
+
+import torch
+from aiter import ActivationType, QuantType
+from aiter.dist.parallel_state import get_dp_group
+from aiter.fused_moe import fused_moe
+
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils.tbo.ubatching import tbo_overlap_enabled
 from atom.utils.forward_context import get_forward_context
-import torch
-from typing import Callable, Optional, final
-from enum import Enum
-from aiter import ActivationType, QuantType
-from aiter.fused_moe import fused_moe
-from aiter.dist.parallel_state import get_dp_group
+from atom.utils.tbo.ubatching import tbo_overlap_enabled
 
 
 class FusedMoEActivationFormat(Enum):
@@ -341,15 +343,15 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None = None,
         expert_mask: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
-        w1_scale: Optional[torch.Tensor] = None,
-        w2_scale: Optional[torch.Tensor] = None,
-        a1_scale: Optional[torch.Tensor] = None,
-        a2_scale: Optional[torch.Tensor] = None,
-        bias1: Optional[torch.Tensor] = None,
-        bias2: Optional[torch.Tensor] = None,
-        hidden_pad: Optional[int] = 0,
-        intermediate_pad: Optional[int] = 0,
-        moe_extra_args: Optional[dict] = None,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        a1_scale: torch.Tensor | None = None,
+        a2_scale: torch.Tensor | None = None,
+        bias1: torch.Tensor | None = None,
+        bias2: torch.Tensor | None = None,
+        hidden_pad: int | None = 0,
+        intermediate_pad: int | None = 0,
+        moe_extra_args: dict | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         if inplace and self.shared_experts is None and not disable_inplace():
@@ -406,6 +408,45 @@ class FusedMoEModularKernel(torch.nn.Module):
         # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
         # quant method's apply() via `moe_extra_args`.
         extra_kwargs = dict(moe_extra_args or {})
+
+        # A route policy layered on top of a normal dispatch may need to expose
+        # a different local weight layout to fused_moe (for example resident
+        # and prefetched expert slots).  Unlike the legacy MoonEP hook below,
+        # this path keeps the dispatcher's ordinary token/top-k layout and must
+        # therefore receive the dispatched ids and route weights unchanged.
+        run_dispatched_experts = getattr(
+            self.prepare_finalize, "run_dispatched_experts", None
+        )
+        if run_dispatched_experts is not None:
+            fused_out = run_dispatched_experts(
+                dispatch_a1,
+                w1,
+                w2,
+                topk_weights=dispatch_weights,
+                topk_ids=dispatch_ids,
+                expert_mask=expert_mask,
+                num_local_tokens=expert_tokens_meta.expert_num_tokens,
+                activation=activation,
+                quant_type=quant_type,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
+                a2_scale=a2_scale,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                dtype=hidden_states.dtype,
+                extra_kwargs=extra_kwargs,
+            )
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
 
         # MoonEP runs its own experts step. Its dispatched rows are already
         # grouped by expert (boundaries in the planner's cu_seqlens), and some

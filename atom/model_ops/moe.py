@@ -492,10 +492,6 @@ def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
 
 
-# MoonEP transports, shared across MoE layers; see _maybe_make_prepare_finalize.
-_MOONEP_OP_CACHE: dict = {}
-
-
 class FusedMoEMethodBase(QuantizeMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -603,106 +599,57 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
 
-        # MoonEP EP backend (ATOM_EP_BACKEND=moonep).
+        # MoonEP policy backend (ATOM_EP_BACKEND=moonep).
         #
-        # Deliberately does NOT go through all2all_manager: MoonEP is
-        # plan-driven rather than routing-driven, and registering it in
-        # aiter's all2all/communicator factory would mean editing files the
-        # mori and flydsl backends share.  Constructing the op here keeps the
-        # MoonEP path additive on the aiter side.
+        # Planning is additive: it remaps logical ids to an EPLB-style virtual
+        # physical space, then reuses MoRI v2 dispatch/combine and the standard
+        # fused_moe implementation.  The older grouped-row MoonEP transport is
+        # intentionally not used here.
         #
-        # MoonEP owns expert placement itself (it migrates weights via
-        # experts_to_copy), so EPLB must be off -- the two would fight over
-        # where experts live.
+        # MoonEP owns the dynamic B-slot placement, so EPLB must be off -- the
+        # two policies would otherwise fight over where experts live.
         # This branch defaults to MoonEP rather than requiring the env var: it
         # is a dedicated experiment branch, and a MoonEP run that silently fell
         # back to mori would look like a working baseline instead of a
         # misconfiguration.  Set ATOM_EP_BACKEND=mori to get the old path back.
         #
         # The gate above (use_all2all_kernels = dp_size > 1 and use_ep and
-        # _has_module("mori")) is already satisfied whenever EP is on, since
-        # MoonEP uses mori's shmem heap too, so nothing else needs relaxing.
+        # _has_module("mori")) is already satisfied whenever EP is on.
         import os as _os
 
         if _os.environ.get("ATOM_EP_BACKEND", "moonep").lower() == "moonep":
-            from aiter.ops.flydsl.kernels.moonep_dispatch_combine_op import (
-                MoonEPDispatchCombineConfig,
-                MoonEPDispatchCombineIntraNodeOp,
-            )
-
-            from atom.model_ops.fused_moe.moonep_prepare_finalize import (
-                MoonEPPrepareAndFinalize,
+            if moe.expert_layout.num_redundant:
+                raise ValueError(
+                    "ATOM_EP_BACKEND=moonep cannot be combined with EPLB "
+                    "redundant experts; MoonEP already owns the physical-id "
+                    "placement for this layer."
+                )
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_moonep_policy_prepare_finalize,
             )
 
             num_local_experts = moe.num_experts // all2all_manager.world_size
-            moonep_cfg = MoonEPDispatchCombineConfig(
-                rank=all2all_manager.rank,
-                world_size=all2all_manager.world_size,
-                hidden_dim=moe.hidden_dim,
-                # The plan and every symmetric buffer are sized here and cannot
-                # grow later; a batch above this is rejected, not reallocated.
-                # It also sets the *cost*: the plan is fixed-shape, so every
-                # step -- including a one-token decode -- runs the experts over
-                # max_num_tokens * topk rows. moe.max_num_tokens is 16384, which
-                # makes each decode step as expensive as a 16k prefill. Override
-                # it down to whatever --max-num-batched-tokens actually allows;
-                # exceeding it raises rather than corrupts.
-                max_num_inp_token_per_rank=int(
-                    _os.environ.get("MOONEP_MAX_TOKENS", 0)
-                )
-                or moe.max_num_tokens,
-                num_experts_per_rank=num_local_experts,
-                num_experts_per_token=moe.experts_per_token,
-                # Matches what this function already passes mori:
-                # quant_dtype=moe.in_dtype ("We now use bfloat16 for mori").
-                data_type=moe.in_dtype,
-                # Migration slots. Each one costs a full expert's weights in
-                # the symmetric heap, so this is the knob that decides how much
-                # memory MoonEP adds; the planner's default is one per local
-                # expert, which doubles the MoE weights. Too few is loud, not
-                # silent -- local_group_sizes() raises when a destination is
-                # given a remote expert it has no slot for.
-                prefetch_slots=int(
-                    _os.environ.get("MOONEP_PREFETCH_SLOTS", "8")
-                ),
-                # Decode gets its own small, unbalanced plan; 0 disables it.
-                max_decode_token_per_rank=int(
-                    _os.environ.get("MOONEP_DECODE_TOKENS", "256")
-                ),
-            )
+            prefetch_slots = int(_os.environ.get("MOONEP_PREFETCH_SLOTS", "8"))
             # Log unconditionally: ATOM has a history of EP backends silently
             # falling back, and "no error" is not evidence the path was taken.
             # Grep the server log for this line before trusting any number.
             logger.info(
-                "MoonEP EP backend active: rank=%d world=%d hidden=%d "
-                "local_experts=%d topk=%d max_tokens=%d dtype=%s slots=%d",
-                moonep_cfg.rank,
-                moonep_cfg.world_size,
-                moonep_cfg.hidden_dim,
+                "MoonEP policy backend active: MoRI v2 + fused_moe, rank=%d "
+                "world=%d hidden=%d local_experts=%d topk=%d max_tokens=%d "
+                "dtype=%s slots=%d",
+                all2all_manager.rank,
+                all2all_manager.world_size,
+                moe.hidden_dim,
                 num_local_experts,
-                moonep_cfg.num_experts_per_token,
-                moonep_cfg.max_num_inp_token_per_rank,
-                moonep_cfg.data_type,
-                moonep_cfg.prefetch_slots,
+                moe.experts_per_token,
+                moe.max_num_tokens,
+                moe.in_dtype,
+                prefetch_slots,
             )
-            # One op for the whole model, not one per layer. Its symmetric
-            # buffers are sized by max_num_tokens * topk and are reused within
-            # a layer (dispatch -> experts -> combine completes before the next
-            # layer starts), so a per-layer op would multiply tens of GB by the
-            # layer count for no benefit. This mirrors mori, whose op comes
-            # from the shared all2all_manager.
-            global _MOONEP_OP_CACHE
-            key = tuple(sorted(vars(moonep_cfg).items(), key=lambda kv: kv[0]))
-            op = _MOONEP_OP_CACHE.get(key)
-            if op is None:
-                op = MoonEPDispatchCombineIntraNodeOp(moonep_cfg)
-                _MOONEP_OP_CACHE[key] = op
-            return MoonEPPrepareAndFinalize(
-                op,
-                max_tokens_per_rank=moe.max_num_tokens,
-                num_dispatchers=all2all_manager.world_size,
-                num_local_experts=num_local_experts,
-                ep_group=get_ep_group(),
+            return make_moonep_policy_prepare_finalize(
+                moe,
+                all2all_manager,
+                prefetch_slots=prefetch_slots,
             )
 
         # TODO: could allow this now
@@ -1597,7 +1544,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape
+                _num_tokens, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
