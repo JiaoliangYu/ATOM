@@ -2,7 +2,7 @@
 name: validate-model-pr
 description: Validate an AITER or ATOM PR in a Docker environment against the supported four-GPU DeepSeek V4 Pro and DeepSeek R1 scenarios. Use when a user asks for five-scenario applicability, CI-parity accuracy, baseline and candidate E2E throughput, or a short validation trace.
 metadata:
-  version: 1.0.0
+  version: 1.0.1
   scope: ATOM and AITER on four-GPU gfx1250 systems using /app/scripts launchers
   last_updated: 2026-09-21
 ---
@@ -42,7 +42,8 @@ Concurrency is maximum in-flight requests, not total request count. Record both 
   Do not replace it with `scripts/run_benchmark.sh`, an inline benchmark command, or another client.
 
 - For DSV4 Pro and DeepSeek R1 accuracy, explicitly start the matching server with `FAKE_EPLB=0`.
-- For performance and tracing, leave `FAKE_EPLB` unset and confirm that the matching server script defaults it to `1`. A default of `0` is a script defect that must be corrected and recorded; do not hide it with a command-line override.
+- For DeepSeek R1 TP4 at concurrency 16 performance and tracing, explicitly start the matching server with `FAKE_EPLB=0` and verify the effective runtime value is `false`.
+- For performance and tracing in every other supported scenario, leave `FAKE_EPLB` unset and confirm that the matching server script defaults it to `1`. A default of `0` is a script defect that must be corrected and recorded; do not hide it with a command-line override.
 - Never reuse an accuracy server for performance or tracing. Stop it and launch a fresh server for the next purpose.
 - Use only total token throughput in tok/s for the E2E comparison. Do not substitute output throughput or requests per second.
 - Store commands, identities, raw logs, structured outputs, and the final report in a persistent run-specific directory. Keep every scenario and baseline/candidate phase separate.

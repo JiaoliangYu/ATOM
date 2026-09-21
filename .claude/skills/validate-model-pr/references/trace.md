@@ -4,9 +4,14 @@ Use this procedure only when the user requests a trace. It does not replace the 
 
 ## Launch
 
-Stop the current server, then start the matching scenario server with tracing enabled. Leave `FAKE_EPLB` unset so the script default of `1` applies:
+Stop the current server, then start the matching scenario server with tracing enabled. For DeepSeek R1 TP4 concurrency 16, set `FAKE_EPLB=0` explicitly. For every other supported scenario, leave it unset so the script default of `1` applies:
 
 ```bash
+# DeepSeek R1 TP4 concurrency 16
+FAKE_EPLB=0 TRACE_DIR=/app/traces/<run-name> TRACE=1 \
+  bash <matching-server-script> <model-path>
+
+# All other supported scenarios
 TRACE_DIR=/app/traces/<run-name> TRACE=1 \
   bash <matching-server-script> <model-path>
 ```

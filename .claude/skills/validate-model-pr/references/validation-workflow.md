@@ -39,7 +39,7 @@ The headline GSM8K metric used by Atom CI is normally `exact_match,flexible-extr
 For every selected scenario:
 
 1. Preserve the original source/runtime state and record model weights or revision, GPU allocation, server command, workload, seed, warmup settings, concurrency, ISL, OSL, and total requests.
-2. Start the original performance server with `FAKE_EPLB` unset. Verify from the script and startup log that the effective value is `1` and that the intended MoE topology is active.
+2. Start the original performance server with the scenario-specific setting: for DeepSeek R1 TP4 concurrency 16, set `FAKE_EPLB=0` explicitly and verify `fake_eplb=False`; for every other supported scenario, leave `FAKE_EPLB` unset and verify that the script default produces `fake_eplb=True`. In every case, also verify that the intended MoE topology is active.
 3. Verify every required model runner/rank is initialized. Port readiness alone is insufficient.
 4. Run the required benchmark twice consecutively against the same server without restarting it.
 5. Save both raw outputs. Treat run 1 as JIT/warmup only and retain only run 2's explicit total token throughput as the baseline result.
@@ -78,7 +78,7 @@ If accuracy does not pass, save the evidence and skip candidate performance.
 
 After accuracy passes:
 
-1. Start a fresh performance server with `FAKE_EPLB` unset and verify the script default is `1`.
+1. Start a fresh performance server with the same scenario-specific `FAKE_EPLB` setting used for the baseline: explicit `FAKE_EPLB=0` for DeepSeek R1 TP4 concurrency 16, and the verified script default of `1` for every other supported scenario.
 2. Use the same model, GPU allocation, server settings, workload, and measurement procedure as baseline.
 3. Run the benchmark twice consecutively without restarting the server.
 4. Save run 1 as JIT/warmup only and retain run 2's explicit total token throughput.
