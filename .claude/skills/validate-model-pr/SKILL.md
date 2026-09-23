@@ -21,6 +21,7 @@ Do not silently substitute another model, concurrency, token length, or MoE mode
 | --- | ---: | ---: | ---: | --- |
 | DSV4_PRO | 2048 | 1024 | 1024 | EP4 |
 | DSV4_PRO | 16 | 1024 | 1024 | TP4 |
+| DSV4_PRO | 64 | 1024 | 1024 | TP4 |
 | DS_r1 | 512 | 1024 | 1024 | EP4 |
 | DS_r1 | 16 | 1024 | 1024 | TP4 |
 
