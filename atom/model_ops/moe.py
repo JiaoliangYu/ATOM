@@ -653,62 +653,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
-        # MoonEP policy backend (ATOM_EP_BACKEND=moonep).
-        #
-        # Planning is additive: it remaps logical ids to an EPLB-style virtual
-        # physical space, then reuses MoRI v2 dispatch/combine and the standard
-        # fused_moe implementation.  The older grouped-row MoonEP transport is
-        # intentionally not used here.
-        #
-        # MoonEP owns the dynamic B-slot placement, so EPLB must be off -- the
-        # two policies would otherwise fight over where experts live.
-        # The policy is opt-in so the ordinary MoRI backend remains unchanged
-        # for deployments that do not carry the matching AITER planner kernels.
-        #
-        # The gate above (use_all2all_kernels = dp_size > 1 and use_ep and
-        # _has_module("mori")) is already satisfied whenever EP is on.
         ep_backend = envs.ATOM_EP_BACKEND
         if ep_backend not in {"mori", "moonep"}:
             raise ValueError(
                 "ATOM_EP_BACKEND must be either 'mori' or 'moonep', "
                 f"got {ep_backend!r}"
             )
-
         if ep_backend == "moonep":
+            # MoonEP owns the dynamic B-slot placement, so it cannot share the
+            # physical-id space with EPLB, and it plans over production MoRI.
             if moe.expert_layout.num_redundant:
                 raise ValueError(
                     "ATOM_EP_BACKEND=moonep cannot be combined with EPLB "
-                    "redundant experts; MoonEP already owns the physical-id "
-                    "placement for this layer."
+                    "redundant experts"
                 )
-            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                make_moonep_policy_prepare_finalize,
-            )
-
-            num_local_experts = moe.num_experts // all2all_manager.world_size
-            prefetch_slots = envs.MOONEP_PREFETCH_SLOTS
-            # Log unconditionally: ATOM has a history of EP backends silently
-            # falling back, and "no error" is not evidence the path was taken.
-            # Grep the server log for this line before trusting any number.
-            logger.info(
-                "MoonEP policy backend active: MoRI + fused_moe, rank=%d "
-                "world=%d hidden=%d local_experts=%d topk=%d max_tokens=%d "
-                "dtype=%s slots=%d",
-                all2all_manager.rank,
-                all2all_manager.world_size,
-                moe.hidden_dim,
-                num_local_experts,
-                moe.experts_per_token,
-                moe.max_num_tokens,
-                moe.in_dtype,
-                prefetch_slots,
-            )
-            return make_moonep_policy_prepare_finalize(
-                moe,
-                all2all_manager,
-                prefetch_slots=prefetch_slots,
-                quant_config=quant_config,
-            )
+            if not moe.use_mori_kernels or envs.ATOM_MORI_V2:
+                raise ValueError(
+                    "ATOM_EP_BACKEND=moonep requires the production MoRI "
+                    "transport (ATOM_MORI_V2=0)"
+                )
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
@@ -792,10 +755,23 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
             num_mori_ops = _NUM_TBO_UBATCHES if tbo_is_enabled else 1
-            mori_ops = [
-                all2all_manager.get_handle(all_to_all_args, index=slot)
-                for slot in range(num_mori_ops)
-            ]
+
+            def make_mori(num_local_experts: int):
+                args = {**all_to_all_args, "num_local_experts": num_local_experts}
+                ops = [
+                    all2all_manager.get_handle(args, index=slot)
+                    for slot in range(num_mori_ops)
+                ]
+                return ops, MoriPrepareAndFinalize(
+                    ops,
+                    max_tokens_per_rank=moe.max_num_tokens,
+                    num_dispatchers=all2all_manager.world_size,
+                    dispatch_format=dispatch_format,
+                    low_latency=low_latency,
+                    internode=all2all_manager.internode,
+                )
+
+            mori_ops, prepare_finalize = make_mori(moe.num_local_experts)
 
             # Off the op, not re-derived: the mapping is aiter's.
             kernel_name = mori_ops[0].config.kernel_type.name
@@ -808,14 +784,37 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 len(mori_ops) if tbo_is_enabled else 0,
             )
 
-            prepare_finalize = MoriPrepareAndFinalize(
-                mori_ops,
-                max_tokens_per_rank=moe.max_num_tokens,
-                num_dispatchers=all2all_manager.world_size,
-                dispatch_format=dispatch_format,
-                low_latency=low_latency,
-                internode=all2all_manager.internode,
-            )
+            if ep_backend == "moonep":
+                from atom.model_ops.fused_moe.moonep_prepare_finalize import (
+                    MoonEPPrepareAndFinalize,
+                )
+
+                if dispatch_format.is_fp4 or dispatch_format.is_fp8:
+                    raise ValueError(
+                        "ATOM_EP_BACKEND=moonep requires BF16 MoRI dispatch"
+                    )
+                prefetch_slots = envs.MOONEP_PREFETCH_SLOTS
+                _, prefill_transport = make_mori(
+                    moe.num_local_experts + prefetch_slots
+                )
+                # Log unconditionally: a silent fallback to plain MoRI would
+                # look like a working MoonEP baseline.
+                logger.info(
+                    "MoonEP active over MoRI: rank=%d world=%d local_experts=%d "
+                    "prefetch_slots=%d",
+                    all2all_manager.rank,
+                    all2all_manager.world_size,
+                    moe.num_local_experts,
+                    prefetch_slots,
+                )
+                prepare_finalize = MoonEPPrepareAndFinalize(
+                    prefill_transport=prefill_transport,
+                    decode_transport=prepare_finalize,
+                    rank=all2all_manager.rank,
+                    world_size=all2all_manager.world_size,
+                    num_experts=moe.num_experts,
+                    prefetch_slots=prefetch_slots,
+                )
 
         return prepare_finalize
 
@@ -843,9 +842,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
         if prepare_finalize is not None:
             # MoonEP migrates expert weights between ranks, so peers must be
-            # able to P2P-read them -- only possible from mori's symmetric
-            # heap. This rebinds the layer's expert parameters onto that heap
-            # in place (no second copy) and adds B migration slots, the way
+            # able to P2P-read them. This rebinds the layer's expert parameters
+            # onto a peer-mapped VMM pool and adds B prefetch slots, the way
             # EPLB sizes its redundant replicas. It has to run here, after
             # process_weights_after_loading has produced the final shuffled,
             # quantised tensors.
