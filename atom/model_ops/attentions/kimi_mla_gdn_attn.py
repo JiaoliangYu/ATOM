@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
@@ -189,10 +190,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"index_kpool={kpool}; Config sets the block size for exactly this"
             )
         rows = runner.block_size // kpool
-        if rows % _MQA_LOGITS_PRESHUFFLE_ROWS:
+        if rows % MQA_LOGITS_PRESHUFFLE_ROWS:
             raise ValueError(
                 f"{rows} pooled rows per block is not a multiple of "
-                f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+                f"{MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
                 "cannot stay in the preshuffled layout -- the only one it computes "
                 "correctly. Raise kv_cache_block_size."
             )
@@ -426,14 +427,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         return attn_metadata, positions
 
-    def build_for_cudagraph_capture(self, bs: int):
-        if self.block_size == 1:
-            var = self.model_runner.forward_vars
-            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-            var["kv_indptr"].copy_to_gpu(bs + 1)
-            var["kv_indices"].gpu[:bs].zero_()
-            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
+        # Kimi's dense MLA warmup needs a page even with page_size=1.
+        # The parent owns the single upload, including DCP + MTP capture.
+        return True
 
+    def build_for_cudagraph_capture(self, bs: int):
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context
