@@ -53,12 +53,9 @@ def _policy_prepare_finalize(*, prefill: bool):
     obj._prefetch_slots = 1
     obj._rank = 0
     obj._world_size = 2
-    obj._active_transport = None
     obj._active_ids = None
     obj._active_plan = None
-    obj._active_is_prefill = False
-    obj._prefill_transport = _FakeTransport()
-    obj._decode_transport = _FakeTransport()
+    obj._transport = _FakeTransport()
     obj._is_prefill = lambda: prefill
     return obj
 
@@ -104,32 +101,30 @@ def test_prefill_dispatches_and_combines_with_the_same_planned_ids():
     fused = torch.randn(2, 8)
     out = obj.finalize(torch.empty(2, 8), fused, weights, logical, False)
 
-    transport = obj._prefill_transport
+    transport = obj._transport
     assert policy.calls == 1
-    assert not obj._decode_transport.prepared
     _, sent_weights, sent_ids = transport.prepared[0]
     assert sent_ids is planned and sent_weights is weights
     assert result[3] is planned
     assert transport.finalized == [planned]
     assert out is fused
-    assert obj._active_transport is None
+    assert obj._active_ids is None and obj._active_plan is None
 
 
-def test_decode_is_owner_only_and_never_constructs_prefill_policy():
+def test_decode_sends_every_expert_to_its_owner_resident_slot():
     obj = _policy_prepare_finalize(prefill=False)
     logical = torch.tensor([[0, 7], [3, 4]], dtype=torch.int64)
     weights = torch.tensor([[0.8, 0.2], [0.55, 0.45]], dtype=torch.float32)
-    decode = _FakePolicy(SimpleNamespace(planned_topk_ids=logical.to(torch.int32)))
-    obj._decode_policy = decode
     obj._prefill_policy = lambda ids: pytest.fail("decode entered PrefillPolicy")
 
     obj.prepare(torch.randn(2, 8), weights, logical, 8, None, False, None)
+    assert obj._active_plan is None
     obj.finalize(torch.empty(2, 8), torch.randn(2, 8), weights, logical, False)
 
-    assert decode.calls == 1
-    assert not obj._prefill_transport.prepared
-    assert torch.equal(obj._decode_transport.prepared[0][2], logical.to(torch.int32))
-    assert torch.equal(obj._decode_transport.finalized[0], logical.to(torch.int32))
+    # EPR=4, B=1: expert e -> owner * 5 + e % 4.
+    virtual = torch.tensor([[0, 8], [3, 5]], dtype=torch.int32)
+    assert torch.equal(obj._transport.prepared[0][2], virtual)
+    assert torch.equal(obj._transport.finalized[0], virtual)
 
 
 class _FakePool:
@@ -144,9 +139,11 @@ class _FakePool:
 
 def _experts_prepare_finalize(monkeypatch, *, prefill: bool):
     obj = _policy_prepare_finalize(prefill=prefill)
-    obj._active_is_prefill = prefill
-    obj._active_plan = SimpleNamespace(
-        experts_to_copy=torch.tensor([[6], [-1]], dtype=torch.int32)
+    obj._active_ids = torch.zeros(1, 2, dtype=torch.int32)
+    obj._active_plan = (
+        SimpleNamespace(experts_to_copy=torch.tensor([[6], [-1]], dtype=torch.int32))
+        if prefill
+        else None
     )
     obj._virtual_masks = {}
 
@@ -197,25 +194,23 @@ def test_prefill_experts_run_once_over_the_home_plus_prefetch_window(monkeypatch
     assert torch.equal(out, torch.full_like(rows, 1, dtype=torch.float32))
 
 
-def test_decode_experts_use_home_prefix_and_skip_prefetch(monkeypatch):
+def test_decode_experts_use_the_same_window_and_skip_prefetch(monkeypatch):
     obj, p1, p2, calls = _experts_prepare_finalize(monkeypatch, prefill=False)
     rows = torch.randn(2, 8)
     weights = torch.tensor([[0.8, 0.2], [0.55, 0.45]], dtype=torch.float32)
-    ids = torch.tensor([[0, 7], [3, 4]], dtype=torch.int32)
-    owner_mask = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0], dtype=torch.int32)
+    ids = torch.tensor([[0, 8], [3, 5]], dtype=torch.int32)
     obj.run_dispatched_experts(
         rows,
         p1.home,
         p2.home,
         topk_weights=weights,
         topk_ids=ids,
-        expert_mask=owner_mask,
+        expert_mask=None,
         num_local_tokens=None,
     )
 
     assert len(calls) == 1
     w1, w2, _, _, mask, _ = calls[0]
-    assert w1.data_ptr() == p1.home.data_ptr() and w1.shape[0] == 4
-    assert w2.data_ptr() == p2.home.data_ptr() and w2.shape[0] == 4
-    assert mask is owner_mask
+    assert w1 is p1.local and w2 is p2.local
+    assert mask.tolist() == [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]
     assert p1.selected is None and p2.selected is None

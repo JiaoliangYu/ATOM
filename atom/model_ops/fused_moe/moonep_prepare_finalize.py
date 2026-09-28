@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """MoonEP planning in front of the production MoRI transport.
 
-Prefill remaps logical expert ids into ``EPR + B`` virtual slots per rank,
-dispatches them through a MoRI handle configured for that width, and runs one
-fused_moe over the rank's resident-plus-prefetched weight window.  Decode keeps
-the owner-only ``EPR`` geometry and never plans.
-
-The virtual-id contract is the EPLB one::
+Both phases dispatch virtual ids through one MoRI handle configured with
+``EPR + B`` local experts, using the EPLB contract::
 
     physical_id = destination_rank * (EPR + B) + destination_slot
 
-with slots ``[0, EPR)`` resident and ``[EPR, EPR + B)`` prefetched.
+with slots ``[0, EPR)`` resident and ``[EPR, EPR + B)`` prefetched.  Prefill
+plans which remote experts each rank prefetches; decode never plans and sends
+every expert to its owner's resident slot.  Each rank then runs one fused_moe
+over its ``[EPR + B]`` weight window.
 """
 
 import logging
@@ -53,12 +52,11 @@ def _make_virtual_expert_mask(
 
 
 class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
-    """Route MoRI dispatch/combine through MoonEP's prefill and decode policies.
+    """Route MoRI dispatch/combine through MoonEP's virtual expert ids.
 
-    ``prefill_transport`` is configured with ``EPR + B`` local experts and
-    ``decode_transport`` with ``EPR``.  Both are ordinary
-    ``MoriPrepareAndFinalize`` instances; this class only chooses one per
-    forward and hands it the planned ids for dispatch and again for combine.
+    ``transport`` is an ordinary ``MoriPrepareAndFinalize`` configured with
+    ``EPR + B`` local experts; this class hands it the virtual ids for
+    dispatch and again for combine.
     """
 
     ADOPTED = (
@@ -73,46 +71,37 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def __init__(
         self,
         *,
-        prefill_transport: MoriPrepareAndFinalize,
-        decode_transport: MoriPrepareAndFinalize,
+        transport: MoriPrepareAndFinalize,
         rank: int,
         world_size: int,
         num_experts: int,
         prefetch_slots: int,
     ) -> None:
         super().__init__()
-        from aiter.ops.flydsl.moonep import MoonEPDecodePolicy
-
         if num_experts % world_size:
             raise ValueError("MoonEP requires num_experts divisible by world_size")
         if prefetch_slots <= 0:
             raise ValueError("MoonEP prefetch_slots must be positive")
 
-        self._prefill_transport = prefill_transport
-        self._decode_transport = decode_transport
+        self._transport = transport
         self._rank = rank
         self._world_size = world_size
         self._num_experts = num_experts
         self._experts_per_rank = num_experts // world_size
         self._prefetch_slots = prefetch_slots
-        self._decode_policy = MoonEPDecodePolicy(
-            world_size=world_size, num_experts=num_experts
-        )
         self._pools = None
         self._virtual_masks: dict[str, torch.Tensor] = {}
-        self._active_transport = None
         self._active_ids = None
         self._active_plan = None
-        self._active_is_prefill = False
 
     def output_is_reduced(self) -> bool:
         return True
 
     def num_dispatchers(self) -> int:
-        return self._decode_transport.num_dispatchers()
+        return self._transport.num_dispatchers()
 
     def max_num_tokens_per_rank(self) -> int | None:
-        return self._decode_transport.max_num_tokens_per_rank()
+        return self._transport.max_num_tokens_per_rank()
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int32
@@ -189,28 +178,27 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         quant_config: FusedMoEQuantConfig,
         quant_type: QuantType = QuantType.No,
     ) -> mk.PrepareResultType:
-        if self._active_transport is not None:
+        if self._active_ids is not None:
             raise RuntimeError("prepare() called before the previous finalize()")
         if num_experts != self._num_experts:
             raise ValueError(
                 f"routing width changed from {self._num_experts} to {num_experts}"
             )
 
-        self._active_is_prefill = self._is_prefill()
-        if self._active_is_prefill:
-            plan = self._prefill_policy(topk_ids).plan(topk_ids)
-            transport = self._prefill_transport
+        if self._is_prefill():
+            self._active_plan = self._prefill_policy(topk_ids).plan(topk_ids)
+            self._active_ids = self._active_plan.planned_topk_ids
         else:
-            plan = self._decode_policy.plan(topk_ids)
-            transport = self._decode_transport
-
-        self._active_transport = transport
-        self._active_ids = plan.planned_topk_ids
-        self._active_plan = plan
-        return transport.prepare(
+            # owner * (EPR + B) + e % EPR: every expert on its owner's
+            # resident slot, with no histogram or planning.
+            ids = topk_ids.to(torch.int32)
+            self._active_ids = ids + (ids // self._experts_per_rank) * (
+                self._prefetch_slots
+            )
+        return self._transport.prepare(
             a1,
             topk_weights,
-            plan.planned_topk_ids,
+            self._active_ids,
             num_experts,
             expert_map,
             apply_router_weight_on_input,
@@ -226,12 +214,12 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
     ) -> torch.Tensor:
-        if self._active_transport is None:
+        if self._active_ids is None:
             raise RuntimeError("finalize() called before prepare()")
-        transport, planned_ids = self._active_transport, self._active_ids
-        self._active_transport = self._active_ids = self._active_plan = None
+        planned_ids = self._active_ids
+        self._active_ids = self._active_plan = None
         # MoRI v1 rebuilds the combine routing from the ids it dispatched.
-        return transport.finalize(
+        return self._transport.finalize(
             output,
             fused_expert_output,
             topk_weights,
@@ -289,11 +277,11 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return pool, flat
 
     @staticmethod
-    def _pool_view(entry, *, window: bool):
+    def _pool_view(entry):
         pool, flat, shuffled = entry
         if pool is None:
             return None
-        tensor = pool.local if window else pool.home
+        tensor = pool.local
         if flat:
             tensor = tensor.reshape(-1, *tensor.shape[2:])
         if shuffled:
@@ -344,40 +332,39 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             raise RuntimeError("adopt_weights() must run before the first MoE call")
         if w1.data_ptr() != self._pools[0][0].home.data_ptr():
             raise RuntimeError("the layer weights no longer alias the MoonEP pool")
-        if self._active_plan is None:
-            raise RuntimeError("experts called before policy planning")
+        if self._active_ids is None:
+            raise RuntimeError("experts called before prepare()")
 
-        window = self._active_is_prefill
-        if window:
+        # Decode ids never name a prefetch slot, so only prefill refreshes them.
+        if self._active_plan is not None:
             selected = self._active_plan.experts_to_copy[self._rank].contiguous()
             for pool, _flat, _shuffled in self._pools:
                 if pool is not None:
                     pool.prefetch(selected)
-            expert_mask = self._mask(rows.device)
 
         return fused_moe(
             rows,
-            self._pool_view(self._pools[0], window=window),
-            self._pool_view(self._pools[1], window=window),
+            self._pool_view(self._pools[0]),
+            self._pool_view(self._pools[1]),
             topk_weights,
             topk_ids,
-            expert_mask,
+            self._mask(rows.device),
             activation=activation if activation is not None else ActivationType.Silu,
             quant_type=quant_type if quant_type is not None else QuantType.No,
             num_local_tokens=num_local_tokens,
-            w1_scale=self._pool_view(self._pools[2], window=window),
-            w2_scale=self._pool_view(self._pools[3], window=window),
+            w1_scale=self._pool_view(self._pools[2]),
+            w2_scale=self._pool_view(self._pools[3]),
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
             bias1=(
-                self._pool_view(self._pools[4], window=window)
+                self._pool_view(self._pools[4])
                 if self._pools[4][0] is not None
                 else bias1
             ),
             bias2=(
-                self._pool_view(self._pools[5], window=window)
+                self._pool_view(self._pools[5])
                 if self._pools[5][0] is not None
                 else bias2
             ),

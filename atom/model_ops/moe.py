@@ -751,27 +751,23 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # an unexpected "quant_type" kwarg.
                 all_to_all_args["quant_type"] = mori_combine_quant_type
 
+            if ep_backend == "moonep":
+                if dispatch_format.is_fp4 or dispatch_format.is_fp8:
+                    raise ValueError(
+                        "ATOM_EP_BACKEND=moonep requires BF16 MoRI dispatch"
+                    )
+                # MoonEP dispatches to EPR + B virtual slots per rank in both
+                # prefill and decode, so this is the only handle it needs.
+                all_to_all_args["num_local_experts"] += envs.MOONEP_PREFETCH_SLOTS
+
             # TBO and regular forwards are mutually exclusive. Slot 0 serves
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
             num_mori_ops = _NUM_TBO_UBATCHES if tbo_is_enabled else 1
-
-            def make_mori(num_local_experts: int):
-                args = {**all_to_all_args, "num_local_experts": num_local_experts}
-                ops = [
-                    all2all_manager.get_handle(args, index=slot)
-                    for slot in range(num_mori_ops)
-                ]
-                return ops, MoriPrepareAndFinalize(
-                    ops,
-                    max_tokens_per_rank=moe.max_num_tokens,
-                    num_dispatchers=all2all_manager.world_size,
-                    dispatch_format=dispatch_format,
-                    low_latency=low_latency,
-                    internode=all2all_manager.internode,
-                )
-
-            mori_ops, prepare_finalize = make_mori(moe.num_local_experts)
+            mori_ops = [
+                all2all_manager.get_handle(all_to_all_args, index=slot)
+                for slot in range(num_mori_ops)
+            ]
 
             # Off the op, not re-derived: the mapping is aiter's.
             kernel_name = mori_ops[0].config.kernel_type.name
@@ -784,19 +780,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 len(mori_ops) if tbo_is_enabled else 0,
             )
 
+            prepare_finalize = MoriPrepareAndFinalize(
+                mori_ops,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager.world_size,
+                dispatch_format=dispatch_format,
+                low_latency=low_latency,
+                internode=all2all_manager.internode,
+            )
+
             if ep_backend == "moonep":
                 from atom.model_ops.fused_moe.moonep_prepare_finalize import (
                     MoonEPPrepareAndFinalize,
                 )
 
-                if dispatch_format.is_fp4 or dispatch_format.is_fp8:
-                    raise ValueError(
-                        "ATOM_EP_BACKEND=moonep requires BF16 MoRI dispatch"
-                    )
-                prefetch_slots = envs.MOONEP_PREFETCH_SLOTS
-                _, prefill_transport = make_mori(
-                    moe.num_local_experts + prefetch_slots
-                )
                 # Log unconditionally: a silent fallback to plain MoRI would
                 # look like a working MoonEP baseline.
                 logger.info(
@@ -805,15 +802,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                     all2all_manager.rank,
                     all2all_manager.world_size,
                     moe.num_local_experts,
-                    prefetch_slots,
+                    envs.MOONEP_PREFETCH_SLOTS,
                 )
                 prepare_finalize = MoonEPPrepareAndFinalize(
-                    prefill_transport=prefill_transport,
-                    decode_transport=prepare_finalize,
+                    transport=prepare_finalize,
                     rank=all2all_manager.rank,
                     world_size=all2all_manager.world_size,
                     num_experts=moe.num_experts,
-                    prefetch_slots=prefetch_slots,
+                    prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
                 )
 
         return prepare_finalize
