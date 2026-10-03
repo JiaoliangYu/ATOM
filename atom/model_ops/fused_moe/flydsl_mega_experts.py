@@ -50,7 +50,16 @@ logger = logging.getLogger("atom")
 _MEGA_CACHE: dict = {}
 _MEGA_ROUTE_ROWS: dict[tuple[torch.device, int], torch.Tensor] = {}
 _MEGA_BUILD_DBG = False
-_MEGA_DECODE_MTPR = 128
+_MEGA_DECODE_MTPR = envs.ATOM_MEGA_DECODE_MTPR
+# 256, 512 and 1024 stay on aiter's fixed-slot path only when
+# AITER_MEGA_FIXED_SLOT_MAX_MTPR admits them (511 / 1023 / 2047); otherwise the
+# decode instance runs compact. 512 keeps DP-padded C256 decode graphs (bs 48 x
+# q7 = 336 rows per rank) off the prefill-sized instance; 1024 does the same for
+# C512 (bs 128 x q7 = 896 rows).
+if _MEGA_DECODE_MTPR not in (128, 256, 512, 1024):
+    raise ValueError(
+        f"ATOM_MEGA_DECODE_MTPR must be 128, 256, 512 or 1024, got {_MEGA_DECODE_MTPR}"
+    )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
 
 
