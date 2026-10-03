@@ -699,6 +699,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
+    # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
+    # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
+    "ATOM_MORI_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MORI_MASK_PAD_ROWS", "0") == "1",
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
