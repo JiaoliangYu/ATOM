@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import atom.utils.forward_context as fc  # noqa: E402
+import atom.utils.forward_context as fc
 
 
 @pytest.fixture
