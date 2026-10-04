@@ -1135,8 +1135,10 @@ class DeepseekV2MoE(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        layer_id: int | None = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -1177,6 +1179,11 @@ class DeepseekV2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            # EPLB indexes ExpertLocationMetadata and the load monitor by this
+            # id. It has to be the checkpoint layer index (MTP included:
+            # num_hidden_layers + spec step). A draft-local 0 collides with the
+            # target's first MoE row and remaps the draft onto the wrong weights.
+            layer_id=layer_id,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
@@ -3109,6 +3116,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
+                layer_id=layer_idx,
             )
         else:
             self.mlp = DeepseekV2MLP(

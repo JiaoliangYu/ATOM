@@ -412,9 +412,6 @@ def rebalance_experts(
     num_layers, num_logical = weight.shape
     assert num_layers > 0 and num_logical > 0
     assert num_groups > 0 and num_nodes > 0 and num_gpus > 0
-    assert num_logical % num_groups == 0, "num_logical must be divisible by num_groups"
-    assert num_groups % num_nodes == 0, "num_groups must be divisible by num_nodes"
-    assert num_gpus % num_nodes == 0, "num_gpus must be divisible by num_nodes"
     assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
     assert num_physical >= num_logical
 
@@ -445,6 +442,13 @@ def rebalance_experts(
         return p2l, l2p, logcnt
 
     # Hierarchical path: group->node assignment, then node-local rebalance.
+    # Router groups constrain only hierarchical placement. Flat, single-node
+    # placement never reshapes logical experts by group, so it must also accept
+    # a fused shared-expert tail (DSR1: 256 routed + 1 shared = 257 logical,
+    # while n_group=8).
+    assert num_logical % num_groups == 0, "num_logical must be divisible by num_groups"
+    assert num_groups % num_nodes == 0, "num_groups must be divisible by num_nodes"
+    assert num_gpus % num_nodes == 0, "num_gpus must be divisible by num_nodes"
     group_size = num_logical // num_groups
     groups_per_node = num_groups // num_nodes
     gpus_per_node = num_gpus // num_nodes
@@ -1607,6 +1611,63 @@ def get_live_expert_location_metadata() -> ExpertLocationMetadata | None:
     return _MANAGER.live_metadata if _MANAGER is not None else None
 
 
+def eplb_model_roots(owner: Any) -> list[Any]:
+    """Models whose EP MoE layers EPLB must own.
+
+    The target is ``owner.model``. A speculative drafter is a sibling, not a
+    child of that module, so ``model.modules()`` never sees MTP experts. Those
+    still dispatch through the same EPLB metadata and have to be registered or
+    their checkpoint layer ids index off the end of the table.
+    """
+    roots: list[Any] = []
+    model = getattr(owner, "model", None)
+    if model is not None and hasattr(model, "modules"):
+        roots.append(model)
+    drafter = getattr(owner, "drafter", None)
+    draft_model = getattr(drafter, "model", None) if drafter is not None else None
+    if (
+        draft_model is not None
+        and hasattr(draft_model, "modules")
+        and all(draft_model is not root for root in roots)
+    ):
+        roots.append(draft_model)
+    return roots
+
+
+def collect_ep_moe_layers(roots: list[Any]) -> dict[int, Any]:
+    """Map checkpoint layer id -> EP MoE module (the one that owns expert weights).
+
+    ``layer_id`` must be the checkpoint index. DeepSeek-R1's first layers are
+    dense, so MoE ids start at ``first_k_dense_replace``; MTP continues at
+    ``num_hidden_layers``. A draft-local id of 0 would alias the target row.
+    """
+    layers: dict[int, Any] = {}
+    for root in roots:
+        if root is None or not hasattr(root, "modules"):
+            continue
+        for module in root.modules():
+            layer_id = getattr(module, "layer_id", None)
+            # bool is a subclass of int; it is not a layer index.
+            if isinstance(layer_id, bool) or not isinstance(layer_id, int):
+                continue
+            if not bool(getattr(module, "use_ep", False)):
+                continue
+            if not all(hasattr(module, name) for name in ("w13_weight", "w2_weight")):
+                continue
+            previous = layers.get(layer_id)
+            if previous is module:
+                continue
+            if previous is not None:
+                raise RuntimeError(
+                    "EPLB found two EP MoE layers with the same layer_id="
+                    f"{layer_id}. Use the checkpoint layer index (DeepSeek-R1 "
+                    "MTP is num_hidden_layers + spec step). A draft-local id "
+                    "collides with the target and would remap the wrong experts."
+                )
+            layers[layer_id] = module
+    return layers
+
+
 class EPLBManager:
     """Module-B scheduler/trigger manager.
 
@@ -1683,23 +1744,14 @@ class EPLBManager:
     def _maybe_initialize_runtime(self, owner: Any) -> None:
         if self.live_metadata is not None:
             return
-        model = getattr(owner, "model", None)
-        if model is None or not hasattr(model, "modules"):
+        roots = eplb_model_roots(owner)
+        if not roots:
             raise RuntimeError(
                 "EPLB is enabled but the runtime owner has no model.modules(); "
                 "cannot initialize manager-owned ExpertLocationMetadata"
             )
 
-        layers: dict[int, Any] = {}
-        for module in model.modules():
-            layer_id = getattr(module, "layer_id", None)
-            if not isinstance(layer_id, int):
-                continue
-            if not bool(getattr(module, "use_ep", False)):
-                continue
-            if not all(hasattr(module, name) for name in ("w13_weight", "w2_weight")):
-                continue
-            layers[layer_id] = module
+        layers = collect_ep_moe_layers(roots)
         if not layers:
             raise RuntimeError(
                 "EPLB is enabled but no EP MoE layers with expert weights "
