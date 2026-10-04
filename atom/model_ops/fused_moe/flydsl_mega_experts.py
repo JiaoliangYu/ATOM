@@ -36,7 +36,6 @@ not baked into the kernel).
 
 from __future__ import annotations
 
-import functools
 import logging
 import os
 
@@ -50,15 +49,12 @@ logger = logging.getLogger("atom")
 _MEGA_CACHE: dict = {}
 _MEGA_ROUTE_ROWS: dict[tuple[torch.device, int], torch.Tensor] = {}
 _MEGA_BUILD_DBG = False
+_MEGA_DECODE_MTPRS = (128, 256, 512, 1024)
 _MEGA_DECODE_MTPR = envs.ATOM_MEGA_DECODE_MTPR
-# 256, 512 and 1024 stay on aiter's fixed-slot path only when
-# AITER_MEGA_FIXED_SLOT_MAX_MTPR admits them (511 / 1023 / 2047); otherwise the
-# decode instance runs compact. 512 keeps DP-padded C256 decode graphs (bs 48 x
-# q7 = 336 rows per rank) off the prefill-sized instance; 1024 does the same for
-# C512 (bs 128 x q7 = 896 rows).
-if _MEGA_DECODE_MTPR not in (128, 256, 512, 1024):
+if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
     raise ValueError(
-        f"ATOM_MEGA_DECODE_MTPR must be 128, 256, 512 or 1024, got {_MEGA_DECODE_MTPR}"
+        f"ATOM_MEGA_DECODE_MTPR must be one of {_MEGA_DECODE_MTPRS}, "
+        f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
 
@@ -233,9 +229,8 @@ def run_mega_moe(
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
     [tokens, model_dim] bf16.
 
-    mask_pad_rows: route this pass's DP pad rows (rows at or past
-    `scheduled_tokens`) to expert -1 and return them as zeros. See
-    _mask_pad_rows_for_mega for why the zeros need care."""
+    mask_pad_rows: return this pass's DP pad rows as zeros without dispatching
+    them (see _enable_mega_pad_row_mask)."""
     from aiter.dist.parallel_state import get_ep_group
 
     # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
@@ -326,72 +321,41 @@ def run_mega_moe(
     if mask_pad_rows:
         from atom.utils.forward_context import step_pad_rows
 
-        # None unless these rows are the step's padded `running_tokens`;
-        # while capturing, the device mask published before each replay.
         pad_rows = step_pad_rows(run_tokens)
-        if pad_rows is not None:
-            # Whole rows only (every top-k slot, the fused shared expert slot
-            # included); see _mask_pad_rows_for_mega.
-            ids = torch.where(pad_rows, -1, ids)
-    # An aiter whose combine can skip -1 top-k slots (MegaMoEV2.supports_combine_mask)
-    # returns exact zeros for masked rows itself; ask for it only when this pass
-    # masks rows, since the check costs ~10% of a prefill MoE layer.
-    combine_masks = getattr(mega, "supports_combine_mask", False)
+    if pad_rows is not None:
+        # Whole rows: every top-k slot, the fused shared-expert slot included.
+        ids = torch.where(pad_rows, -1, ids)
+    # An aiter whose combine skips -1 slots returns the pad rows as zeros itself.
+    # The check is not free, so ask for it only on passes that mask rows.
+    combine_can_mask = getattr(mega, "supports_combine_mask", False)
     forward_kwargs = (
-        {"mask_invalid_slots": pad_rows is not None} if combine_masks else {}
+        {"mask_invalid_slots": pad_rows is not None} if combine_can_mask else {}
     )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above).
         out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
-    if pad_rows is not None and not combine_masks:
-        # Older aiter: MegaMoEV2's fused combine (combine_no_stage1) sums all
-        # top-k slots of every token unconditionally. A slot whose id was -1 is
-        # never written by Stage2, so a masked row reads whatever an earlier
-        # call (any layer sharing this instance, any p2p wire format) left
-        # there: stale and, across fp8/bf16 formats, possibly non-finite.
-        # Select zeros so pad rows come back as zeros.
+    if pad_rows is not None and not combine_can_mask:
+        # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
+        # an earlier call left there (possibly non-finite). Select zeros.
         out = torch.where(pad_rows, 0, out)
     return out
 
 
-def _mask_pad_rows_for_mega(mtpr: int) -> bool:
-    """Whether Mega routes DP pad rows to expert -1 (ATOM_MORI_MASK_PAD_ROWS).
+def _enable_mega_pad_row_mask(mtpr: int) -> bool:
+    """Whether Mega masks DP pad rows (ATOM_MEGA_MASK_PAD_ROWS).
 
-    A padded DEP step runs `running_tokens` rows per rank, of which only the
-    leading `scheduled_tokens` carry a request. Unmasked, the pad rows pay
-    dispatch, expert GEMM and combine like real tokens, and since they are
-    identical rows they all land on the same experts. Allocates the device
-    mask here, at layer init, i.e. before any graph capture records its
-    address.
-
-    In aiter MegaMoEV2 (fixed-slot and compact paths) an id < 0 is never
-    counted, sent or computed -- dispatch, Stage1 work counts and Stage2
-    scatter all key off the valid-route histograms, and the rank handshakes
-    do not depend on route counts, so a row, or a whole rank, of -1 cannot
-    hang. The one gap is combine: unless the op skips -1 slots
-    (`supports_combine_mask`, asked for per pass), its fused-Stage2 variant
-    reads every top-k slot, so a -1 slot contributes a stale value. Hence
-    only whole rows are masked, and without combine masking run_mega_moe
-    selects zeros for them afterwards; a partially masked row would be wrong.
-
-    Plugin frontends own their step shapes and never publish the mask.
+    MegaMoEV2 never counts, sends or computes a top-k id < 0, so whole pad rows
+    routed to -1 cost nothing; only combine needs care (see run_mega_moe).
+    Allocates the device mask now, at layer init, before any graph capture
+    records its address. Plugin frontends never publish it.
     """
-    if not envs.ATOM_MORI_MASK_PAD_ROWS or is_plugin_mode():
+    if not envs.ATOM_MEGA_MASK_PAD_ROWS or is_plugin_mode():
         return False
     from atom.utils.forward_context import enable_pad_rows_device
 
-    enable_pad_rows_device(mtpr, torch.device("cuda", torch.cuda.current_device()))
-    _log_mega_pad_masking()
+    enable_pad_rows_device(mtpr, torch.device("cuda"))
     return True
-
-
-@functools.cache
-def _log_mega_pad_masking() -> None:
-    logger.info(
-        "[MEGA] DP pad rows are routed to expert -1 and returned as zeros "
-        "(ATOM_MORI_MASK_PAD_ROWS=1)"
-    )
 
 
 class MegaFusedExperts:
@@ -429,7 +393,7 @@ class MegaFusedExperts:
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
-        self._mask_pad_rows = _mask_pad_rows_for_mega(mtpr)
+        self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
 
     def __call__(
         self,

@@ -1,21 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""DP pad rows on the MegaMoE backend: routed to -1, returned as zeros.
-
-Behind ATOM_MORI_MASK_PAD_ROWS. Without combine masking in aiter the rows must
-also be zeroed on the way out: MegaMoEV2's fused combine then sums every top-k
-slot unconditionally, so a -1 row reads stale slots. The MegaMoEV2 op is
-replaced by a fake that records the ids it was handed and returns NaN, so a
-row that is not zeroed fails loudly. CPU only.
+"""DP pad rows on the MegaMoE backend (ATOM_MEGA_MASK_PAD_ROWS): routed to -1,
+returned as zeros. The MegaMoEV2 op is a fake that records the ids it was handed
+and returns NaN, so a row that is not zeroed fails loudly. CPU only.
 """
 
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
-
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
 import torch
 
 import atom.utils.forward_context as fc
@@ -71,39 +64,27 @@ def run(monkeypatch):
         )
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
         fc.publish_scheduled_tokens(scheduled)
-        # Warmup builds the instance; a capture may only reuse it.
-        mega.get_or_build_mega_moe(
-            rank=0,
-            world_size=8,
-            model_dim=DIM,
-            inter_dim=8,
-            experts=384,
-            topk=TOPK,
-            quant="a8w4",
-            mtpr=256,
-            swiglu_limit=0.0,
-            w1=layer._mega_w1,
-            w1_scale=layer._mega_w1_scale,
-            w2=layer._mega_w2,
-            w2_scale=layer._mega_w2_scale,
-        )
-        monkeypatch.setattr(
-            torch.cuda, "is_current_stream_capturing", lambda: capturing
-        )
         ids = (torch.arange(rows * TOPK) % 384).reshape(rows, TOPK)
-        out = mega.run_mega_moe(
-            layer,
-            torch.ones(rows, DIM, dtype=torch.bfloat16),
-            torch.ones(rows, TOPK),
-            ids,
-            model_dim=DIM,
-            inter_dim=8,
-            experts=384,
-            topk=TOPK,
-            mtpr=256,
-            swiglu_limit=0.0,
-            mask_pad_rows=mask,
-        )
+
+        def call():
+            return mega.run_mega_moe(
+                layer,
+                torch.ones(rows, DIM, dtype=torch.bfloat16),
+                torch.ones(rows, TOPK),
+                ids,
+                model_dim=DIM,
+                inter_dim=8,
+                experts=384,
+                topk=TOPK,
+                mtpr=256,
+                swiglu_limit=0.0,
+                mask_pad_rows=mask,
+            )
+
+        if capturing:
+            call()  # eager warmup builds the instance; a capture may only reuse it
+            monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        out = call()
         return ids.to(torch.int32), seen["ids"], out
 
     _run.mega_cls = FakeMegaMoEV2
@@ -140,22 +121,15 @@ def test_disabled_is_identity(run):
 
 
 def test_switch_follows_the_env(monkeypatch):
-    monkeypatch.setattr(fc, "_pad_rows_device", None)
-    monkeypatch.setattr(fc, "_row_index_device", None)
-    monkeypatch.setenv("ATOM_MORI_MASK_PAD_ROWS", "0")
-    assert mega._mask_pad_rows_for_mega(128) is False
-    assert fc.get_pad_rows_device() is None
-    monkeypatch.setenv("ATOM_MORI_MASK_PAD_ROWS", "1")
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    enabled = []
     monkeypatch.setattr(
-        fc,
-        "enable_pad_rows_device",
-        lambda rows, device: fc.__dict__.__setitem__(
-            "_pad_rows_device", torch.zeros(rows, 1, dtype=torch.bool)
-        ),
+        fc, "enable_pad_rows_device", lambda rows, device: enabled.append(rows)
     )
-    assert mega._mask_pad_rows_for_mega(128) is True
-    assert fc.get_pad_rows_device().shape == (128, 1)
+    monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
+    assert mega._enable_mega_pad_row_mask(128) is False
+    monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "1")
+    assert mega._enable_mega_pad_row_mask(128) is True
+    assert enabled == [128]
 
 
 def test_masking_combine_output_is_not_reselected(run, monkeypatch):

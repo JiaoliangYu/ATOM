@@ -826,48 +826,31 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
 
-# Device form of `Context.scheduled_tokens`, for a consumer recorded into a
-# CUDA graph: a replay runs none of the Python that reads the host field, so the
-# recording reads this step's count from here instead. Kept as the per-row mask
-# `row >= scheduled_tokens` rather than the count, so each consumer applies it
-# with one kernel and the compare is paid once per pass, not once per layer.
-# Nothing is allocated, and nothing written per step, until a consumer asks for
-# it. Starts all False, i.e. "every row is real", so a replay before the first
-# publish masks nothing. Every graph replay must be preceded by a publish for
-# its own pass -- `set_forward_context` and `_publish_draft_shape` do it -- or it
-# reads the last.
+# Device-side DP pad-row mask, `row >= scheduled_tokens`, for consumers recorded
+# into CUDA graphs, which cannot read the host count on replay. Allocated on
+# first request and all False (no padding) until published; every pass publishes
+# it before its forward or replay (`set_forward_context`, the drafters'
+# `_publish_draft_shape`). Consumers read it per call and keep no reference.
 _pad_rows_device: torch.Tensor | None = None
 _row_index_device: torch.Tensor | None = None
 
 
 def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
-    """Allocate the `[rows, 1]` bool "is a pad row" mask, or grow it.
-
-    Call before any capture: a recording holds the buffer's address, so it
-    must not be replaced once a graph has read it. Consumers look it up per
-    call (`get_pad_rows_device`) rather than keep a reference, so a later,
-    larger request cannot leave one of them reading a buffer nobody publishes.
-    """
+    """Allocate or grow the `[rows, 1]` mask. Call before any capture: a graph
+    records the buffer's address."""
     global _pad_rows_device, _row_index_device
     if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
         _row_index_device = torch.arange(
             num_rows, dtype=torch.int32, device=device
         ).unsqueeze(1)
         _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
-
-
-def get_pad_rows_device() -> torch.Tensor | None:
-    """The mask `publish_scheduled_tokens` writes; None until enabled."""
-    return _pad_rows_device
+        _logger.info("DP pad-row mask enabled for %d rows", num_rows)
 
 
 def publish_scheduled_tokens(scheduled_tokens: int) -> None:
-    """Mark the rows at or past this pass's `scheduled_tokens` as padding.
-
-    One compare on the current stream, so it is ordered before the forward (or
-    the replay) enqueued after it, with no host sync. Skipped while capturing:
-    a compare recorded into a graph would replay the capture's count every step.
-    """
+    """Mark rows at or past `scheduled_tokens` as padding: one compare on the
+    current stream, no host sync. Skipped while capturing, where it would freeze
+    the capture's count into the graph."""
     pad = _pad_rows_device
     if pad is None or torch.cuda.is_current_stream_capturing():
         return
@@ -875,15 +858,10 @@ def publish_scheduled_tokens(scheduled_tokens: int) -> None:
 
 
 def step_pad_rows(num_rows: int) -> torch.Tensor | None:
-    """The `[num_rows, 1]` "is a DP pad row" mask for this pass, or None.
-
-    None when nothing can be padded: the rows are not the step's
-    `running_tokens` (a TBO ubatch, a PCP shard, a sub-slice), an eager step
-    whose host count says every row is real, or the mask was never enabled /
-    is too short. While capturing it always returns the device mask, so the
-    recording follows whatever `publish_scheduled_tokens` wrote before each
-    replay. No host sync: only host fields and a device view are read.
-    """
+    """The `[num_rows, 1]` pad-row mask for this pass, or None when no row can be
+    padding: the rows are not the pass's `running_tokens` (a PCP shard, a
+    sub-slice), an eager pass has no padding, or the mask is not enabled. While
+    capturing it always returns the mask, so each replay follows its publish."""
     context = get_forward_context().context
     if context is None or num_rows != context.running_tokens:
         return None
@@ -892,7 +870,7 @@ def step_pad_rows(num_rows: int) -> torch.Tensor | None:
         and context.scheduled_tokens >= num_rows
     ):
         return None
-    pad_rows = get_pad_rows_device()
+    pad_rows = _pad_rows_device
     if pad_rows is None or pad_rows.shape[0] < num_rows:
         return None
     return pad_rows[:num_rows]
