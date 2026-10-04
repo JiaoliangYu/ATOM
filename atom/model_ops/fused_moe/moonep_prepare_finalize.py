@@ -16,6 +16,8 @@ import logging
 from typing import Any
 
 import torch
+import triton
+import triton.language as tl
 from aiter import QuantType
 
 import atom.model_ops.fused_moe.modular_kernel as mk
@@ -49,6 +51,49 @@ def _make_virtual_expert_mask(
     begin = rank * physical_per_rank
     mask[begin : begin + physical_per_rank] = 1
     return mask
+
+
+@triton.jit
+def _owner_virtual_ids_kernel(
+    ids_ptr,
+    out_ptr,
+    numel,
+    EXPERTS_PER_RANK: tl.constexpr,
+    PREFETCH_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    ids = tl.load(ids_ptr + offs, mask=mask, other=-1).to(tl.int32)
+    virtual = ids + (ids // EXPERTS_PER_RANK) * PREFETCH_SLOTS
+    tl.store(out_ptr + offs, tl.where(ids >= 0, virtual, ids), mask=mask)
+
+
+def _owner_virtual_ids(
+    topk_ids: torch.Tensor, experts_per_rank: int, prefetch_slots: int
+) -> torch.Tensor:
+    """Map expert ``e`` to its owner's resident slot ``owner * (EPR + B) + e % EPR``.
+
+    Negative (invalid) ids pass through unchanged.
+    """
+
+    if not topk_ids.is_cuda:
+        ids = topk_ids.to(torch.int32)
+        virtual = ids + (ids // experts_per_rank) * prefetch_slots
+        return torch.where(ids >= 0, virtual, ids)
+    ids = topk_ids.contiguous()
+    out = torch.empty(ids.shape, dtype=torch.int32, device=ids.device)
+    numel = ids.numel()
+    block = 1024
+    _owner_virtual_ids_kernel[(triton.cdiv(numel, block),)](
+        ids,
+        out,
+        numel,
+        EXPERTS_PER_RANK=experts_per_rank,
+        PREFETCH_SLOTS=prefetch_slots,
+        BLOCK=block,
+    )
+    return out
 
 
 class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
@@ -189,11 +234,10 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self._active_plan = self._prefill_policy(topk_ids).plan(topk_ids)
             self._active_ids = self._active_plan.planned_topk_ids
         else:
-            # owner * (EPR + B) + e % EPR: every expert on its owner's
-            # resident slot, with no histogram or planning.
-            ids = topk_ids.to(torch.int32)
-            self._active_ids = ids + (ids // self._experts_per_rank) * (
-                self._prefetch_slots
+            # Every expert on its owner's resident slot, with no histogram or
+            # planning; one launch per layer on the decode critical path.
+            self._active_ids = _owner_virtual_ids(
+                topk_ids, self._experts_per_rank, self._prefetch_slots
             )
         return self._transport.prepare(
             a1,

@@ -127,6 +127,20 @@ def test_decode_sends_every_expert_to_its_owner_resident_slot():
     assert torch.equal(obj._transport.finalized[0], virtual)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_decode_owner_ids_kernel_matches_reference(dtype):
+    # DSV4-Pro EP8 geometry: 384 experts, EPR=48, B=8, top-6, plus invalid ids.
+    ids = torch.randint(0, 384, (1000, 6), dtype=dtype)
+    ids[::97, 2] = -1
+    expected = mpf._owner_virtual_ids(ids, 48, 8)
+    got = mpf._owner_virtual_ids(ids.cuda(), 48, 8)
+    assert got.dtype == torch.int32
+    assert torch.equal(got.cpu(), expected)
+    assert torch.equal(expected[5, :], (ids[5] + ids[5] // 48 * 8).to(torch.int32))
+    assert int(expected[0, 2]) == -1
+
+
 class _FakePool:
     def __init__(self, local, experts_per_rank):
         self.local = local
