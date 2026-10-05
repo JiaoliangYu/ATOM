@@ -266,12 +266,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
     # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
-    # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
+    # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
+    # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
+    "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
+    # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
+    # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
+    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
