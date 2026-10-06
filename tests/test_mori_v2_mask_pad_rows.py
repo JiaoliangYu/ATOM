@@ -34,6 +34,7 @@ def run(monkeypatch):
 
     monkeypatch.setattr(fc, "_pad_rows_device", None)
     monkeypatch.setattr(fc, "_row_index_device", None)
+    monkeypatch.setattr(fc, "_real_requests_device", None)
     fc.enable_pad_rows_device(256, torch.device("cpu"))
     monkeypatch.setattr(
         mv2.MoriV2ModularKernel, "_assert_recipe_matches", lambda *a: None
@@ -51,12 +52,20 @@ def run(monkeypatch):
     def _run(*, scheduled, running, rows=None, capturing=False, mask=True):
         rows = running if rows is None else rows
         pf.mask_pad_rows = mask
-        context = SimpleNamespace(scheduled_tokens=scheduled, running_tokens=running)
-        monkeypatch.setattr(
-            fc, "get_forward_context", lambda: SimpleNamespace(context=context)
+        # A target pass of one-token requests: `running` slots, `scheduled` real.
+        cu = torch.arange(running + 1, dtype=torch.int32).clamp(max=scheduled)
+        context = SimpleNamespace(
+            is_draft=False,
+            scheduled_tokens=scheduled,
+            running_tokens=running,
+            running_bs=running,
         )
-        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-        fc.publish_scheduled_tokens(scheduled)
+        fwd = SimpleNamespace(
+            context=context,
+            attn_metadata=SimpleNamespace(cu_seqlens_q=cu),
+            pad_rows_done=set(),
+        )
+        monkeypatch.setattr(fc, "get_forward_context", lambda: fwd)
         monkeypatch.setattr(
             torch.cuda, "is_current_stream_capturing", lambda: capturing
         )

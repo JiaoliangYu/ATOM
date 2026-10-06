@@ -53,6 +53,13 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _profiler_detail_env(name: str) -> bool:
+    # Unset or empty falls back to ATOM_PROFILER_MORE, so the per-option flag
+    # always wins when given and ATOM_PROFILER_MORE=1 alone still enables all.
+    raw = os.getenv(name) or os.getenv("ATOM_PROFILER_MORE", "0")
+    return raw == "1"
+
+
 def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     """Unset or empty reads as None; anything else must be an integer."""
     raw = os.getenv(name)
@@ -494,6 +501,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
     ),
+    # --- Shutdown ---
+    # How long a shutting-down process waits for its children (EngineCore,
+    # ModelRunner workers) to exit before it terminates them.
+    "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
@@ -537,6 +550,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DETOKENIZER_AUDIT_EVERY", ""
     ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    "ATOM_PROFILER_RECORD_SHAPES": lambda: _profiler_detail_env(
+        "ATOM_PROFILER_RECORD_SHAPES"
+    ),
+    "ATOM_PROFILER_WITH_STACK": lambda: _profiler_detail_env(
+        "ATOM_PROFILER_WITH_STACK"
+    ),
+    "ATOM_PROFILER_PROFILE_MEMORY": lambda: _profiler_detail_env(
+        "ATOM_PROFILER_PROFILE_MEMORY"
+    ),
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
@@ -630,6 +652,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode. Ineligible shapes keep the dedicated decode ASM path.
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
+    ),
+    # DeepSeek-V4 HCA (compress_ratio 128) fp8 decode through aiter's
+    # persistent V4-NM kernel (one launch, in-kernel split + merge) instead of
+    # the decode ASM + split plan. gfx950, 128 local heads only; quietly off
+    # when aiter lacks mla_decode_fwd_v4_nm_ps.
+    "ATOM_V4_HCA_PERSIST": lambda: os.getenv("ATOM_V4_HCA_PERSIST", "1") == "1",
+    # Calls with fewer q rows stay on the ASM path, which is faster there.
+    "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
     # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
