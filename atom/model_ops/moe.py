@@ -2395,7 +2395,8 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             )
         # Reading all2all_manager initializes the mori symmetric heap that the
         # weight pools are mapped from.
-        am = get_ep_group().device_communicator.all2all_manager
+        ep = get_ep_group()
+        am = ep.device_communicator.all2all_manager
         logger.info(
             "MoonEP active over MegaMoE: rank=%d world=%d prefetch_slots=%d",
             am.rank,
@@ -2411,6 +2412,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             world_size=int(am.world_size),
             num_experts=self.moe.num_experts,
             prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
+            group=ep.cpu_group,
         )
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:

@@ -49,8 +49,11 @@ class MoonEPMegaExperts:
         world_size: int,
         num_experts: int,
         prefetch_slots: int,
+        group=None,
         quant: str = "a8w4",
     ) -> None:
+        """``rank``/``world_size`` are positions in ``group``, the EP CPU process
+        group the weight pools bootstrap over."""
         if num_experts % world_size:
             raise ValueError("MoonEP requires num_experts divisible by world_size")
         if prefetch_slots <= 0:
@@ -64,6 +67,7 @@ class MoonEPMegaExperts:
         self._experts_per_rank = num_experts // world_size
         self._prefetch_slots = prefetch_slots
         self._quant = quant
+        self._group = group
         self._slot_state = None
         self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
         self._pools = tuple(self._adopt(layer, name) for name in _ADOPTED)
@@ -93,6 +97,7 @@ class MoonEPMegaExperts:
             prefetch_slots=self._prefetch_slots,
             weight_shape=tuple(view.shape[1:]),
             dtype=tensor.dtype,
+            group=self._group,
         )
         pool.stage_home(view.contiguous())
         param.data = pool.home.reshape(tensor.shape)
