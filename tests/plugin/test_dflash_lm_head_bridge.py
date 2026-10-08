@@ -51,10 +51,10 @@ class _AtomHead:
         self._full_weight = full_weight
         self.calls = 0
 
-    def compute_argmax_token(self, x: torch.Tensor) -> torch.Tensor:
+    def compute_argmax_token(self, x: torch.Tensor, *, out: torch.Tensor):
         # Emulate the all-gathered global reduction ATOM performs across ranks.
         self.calls += 1
-        return torch.argmax(torch.matmul(x, self._full_weight.T), dim=-1).to(torch.long)
+        return out.copy_(torch.argmax(torch.matmul(x, self._full_weight.T), dim=-1))
 
 
 class _PlainHead:
@@ -178,18 +178,18 @@ def test_patch_handles_empty_input(dflash_module):
     assert out.dtype == torch.long
 
 
-def test_patch_rejects_bad_shape_from_head(dflash_module):
-    """A head returning the wrong shape must fail loudly, not silently corrupt
-    the draft block."""
+def test_patch_rejects_a_head_that_ignores_the_output_storage(dflash_module):
+    """A head answering somewhere other than ``out`` must fail loudly, not hand
+    the draft block a buffer nobody wrote."""
     weight, hidden = _inputs(seed=11)
 
     class _BadHead(_AtomHead):
-        def compute_argmax_token(self, x):
-            return torch.zeros(x.shape[0] + 1, dtype=torch.long)
+        def compute_argmax_token(self, x, *, out):
+            return torch.zeros(x.shape[0], dtype=torch.int32)
 
     install_dflash_lm_head_patch()
     worker = dflash_module.DFlashWorkerV2()
-    with pytest.raises(ValueError, match="invalid shape"):
+    with pytest.raises(ValueError, match="did not answer into"):
         worker._greedy_sample_from_vocab_parallel_head(
             hidden_states=hidden, lm_head=_BadHead(weight, tp_rank=0)
         )
@@ -217,12 +217,14 @@ def test_install_warns_when_target_method_is_gone(dflash_module, caplog):
 
 
 def _fake_server_args(monkeypatch, *, algorithm, tp_size):
-    """Make ``sglang.srt.server_args.get_global_server_args`` importable."""
-    module = types.ModuleType("sglang.srt.server_args")
-    module.get_global_server_args = lambda: types.SimpleNamespace(
-        speculative_algorithm=algorithm, tp_size=tp_size
-    )
-    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", module)
+    """Make SGLang ServerArgs readable via the 0.5.20 runtime_context getter."""
+    args = types.SimpleNamespace(speculative_algorithm=algorithm, tp_size=tp_size)
+    runtime_ctx = types.ModuleType("sglang.srt.runtime_context")
+    runtime_ctx.get_server_args = lambda: args
+    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", runtime_ctx)
+    server_args_mod = types.ModuleType("sglang.srt.server_args")
+    server_args_mod.get_global_server_args = lambda: args
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args_mod)
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "SpeculativeAlgorithm.DFLASH"])

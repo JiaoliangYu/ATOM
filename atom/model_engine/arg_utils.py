@@ -13,9 +13,11 @@ from atom.config import (
     DCPConfig,
     DSparkConfig,
     EPLBConfig,
+    ParallelConfig,
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -30,6 +32,78 @@ def parse_size_list(size_str: str) -> list[int]:
         raise ValueError(f"Error parsing size list: {size_str}") from e
 
 
+# Offload connector names and aliases (atom/kv_transfer/offload/__init__.py),
+# casefolded like KVConnectorFactory.canonical_name.
+_OFFLOAD_CONNECTORS = frozenset(
+    {
+        "lmcache_offload",
+        "lmcacheoffloadconnector",
+        "lmcacheconnectorv1",
+        "lmcache_mp",
+        "lmcachempconnector",
+    }
+)
+
+
+# ATOM_KV_OFFLOAD value -> the offload connector it selects.
+_KV_OFFLOAD_MODES = {"lmcache": "lmcache_offload", "lmcache_mp": "lmcache_mp"}
+
+
+def kv_offload_connector_config(mode: str, extra_config: str) -> dict | None:
+    """The offload connector ATOM_KV_OFFLOAD selects, or None when it is off.
+
+    ``lmcache`` is the in-process backend and ``lmcache_mp`` the standalone
+    ``lmcache server`` one. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes
+    the connector's ``kv_connector_extra_config``, which both backends read.
+    """
+    mode = mode.strip().lower()
+    if mode in ("", "0", "off", "none"):
+        if extra_config.strip():
+            raise ValueError(
+                "ATOM_KV_OFFLOAD_EXTRA_CONFIG is set but ATOM_KV_OFFLOAD is off"
+            )
+        return None
+    if mode not in _KV_OFFLOAD_MODES:
+        raise ValueError(
+            f"ATOM_KV_OFFLOAD={mode!r}: expected one of {sorted(_KV_OFFLOAD_MODES)}"
+        )
+    offload = {"kv_connector": _KV_OFFLOAD_MODES[mode], "kv_role": "offload"}
+    if extra_config.strip():
+        extra = json.loads(extra_config)
+        if not isinstance(extra, dict):
+            raise TypeError("ATOM_KV_OFFLOAD_EXTRA_CONFIG must be a JSON object")
+        offload["kv_connector_extra_config"] = extra
+    return offload
+
+
+def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> str:
+    """Fold the ATOM_KV_OFFLOAD connector into the --kv-transfer-config JSON string.
+
+    Without a transfer connector the offload connector stands alone; with one,
+    both become subs of a ``multi`` connector (appended if it already is one).
+    """
+    if offload is None:
+        return kv_transfer_config
+    transfer = json.loads(kv_transfer_config or "{}")
+    if not transfer:
+        return json.dumps(offload)
+    is_multi = _connector_name(transfer) == "multi"
+    subs = transfer.get("connectors", []) if is_multi else [transfer]
+    if any(_connector_name(sub) in _OFFLOAD_CONNECTORS for sub in subs):
+        raise ValueError(
+            "ATOM_KV_OFFLOAD conflicts with an offload connector already set in "
+            "--kv-transfer-config; use only one of them"
+        )
+    if is_multi:
+        return json.dumps({**transfer, "connectors": [*subs, offload]})
+    return json.dumps({"kv_connector": "multi", "connectors": [transfer, offload]})
+
+
+def _connector_name(cfg: object) -> str:
+    name = cfg.get("kv_connector", "") if isinstance(cfg, dict) else ""
+    return str(name).strip().casefold()
+
+
 @dataclass
 class EngineArgs:
     """Arguments for configuring the LLM Engine."""
@@ -41,6 +115,11 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
+    data_parallel_size_local: int | None = None
+    data_parallel_rank: int = 0
+    data_parallel_master_ip: str = "127.0.0.1"
+    data_parallel_master_port: int = 29500
+    data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
@@ -52,15 +131,20 @@ class EngineArgs:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
+    state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
+    enable_log_stats: bool = True
+    throughput_log_interval: float = 10.0
+    cache_hit_rate_window: int = 1000
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
+    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
@@ -135,6 +219,49 @@ class EngineArgs:
             help="Data parallel size.",
         )
         parser.add_argument(
+            "--data-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of data-parallel ranks to run on THIS node. Defaults "
+                "to --data-parallel-size (single-node). Set it lower to give "
+                "this node one slice of a multi-node run."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First GLOBAL data-parallel rank owned by this node. Node 0 "
+                "uses 0; the second node of a 2x4 run uses 4."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-master-ip",
+            type=str,
+            default="127.0.0.1",
+            help="IP of the coordinator node (global DP rank 0).",
+        )
+        parser.add_argument(
+            "--data-parallel-master-port",
+            type=int,
+            default=29500,
+            help=(
+                "Rendezvous port for the DP process group. Engine sockets are "
+                "derived from it (base = port + 100, 3 ports per DP rank)."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-base-port",
+            type=int,
+            default=None,
+            help=(
+                "Rendezvous port for model-runner distributed init. Set "
+                "explicitly for multi-node launches."
+            ),
+        )
+        parser.add_argument(
             "--decode-context-parallel-size",
             "-dcp",
             type=int,
@@ -188,7 +315,7 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default="[1,2,4,8,16,32,48,64,128,256,512]",
+            default=EngineArgs.cudagraph_capture_sizes,
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
         parser.add_argument(
@@ -221,6 +348,13 @@ class EngineArgs:
             "--enable-expert-parallel",
             action="store_true",
             help="Enable expert parallel(EP MoE).",
+        )
+        parser.add_argument(
+            "--fake-eplb",
+            action="store_true",
+            help="Replace MoE router logits with a synthetic uniform "
+            "distribution so every expert is selected equally. For "
+            "benchmarking the balanced-load upper bound only.",
         )
         parser.add_argument(
             "--torch-profiler-dir",
@@ -262,10 +396,11 @@ class EngineArgs:
             nargs="?",
             const="high-throughput",
             default=None,
-            choices=["high-throughput", "low-latency"],
-            help="All2all backend mode for MORI. "
-            "Default is 'high-throughput'. "
-            "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
+            choices=["high-throughput", "low-latency", "rccl", "none"],
+            help="Routed MoE transport. 'high-throughput' and 'low-latency' "
+            "select MORI modes, 'rccl' selects ATOM's native RCCL MoE "
+            "transport, and 'none' forces the DP "
+            "AllGather/ReduceScatter fallback. Default is auto-detect MORI.",
         )
         parser.add_argument(
             "--moe-backend",
@@ -357,9 +492,29 @@ class EngineArgs:
                 "can resume there. "
                 "A prompt shorter than N publishes nothing, which is what keeps "
                 "the feature free on workloads that never reuse a prefix. Must "
-                "be a multiple of the prefix-cache hash block size; 0 disables "
-                "checkpoints entirely. Prefill chunks are aligned to these "
-                "positions, so this also quantizes chunk boundaries."
+                "be a multiple of the prefix-cache hash block size. Prefill "
+                "chunks are aligned to these positions, so this also quantizes "
+                "chunk boundaries. "
+                "0 disables state checkpointing entirely. -1 keeps it on but "
+                "places no interval rungs: checkpoints are then taken only "
+                "where a request is seen to want one and at each prompt's own "
+                "end, which is where agentic traffic actually resumes — every "
+                "rung costs the prompt that keeps it an extra prefill chunk, "
+                "and on measured traces the interval ladder is ~30x the writes "
+                "for reuse the other two placements already reach."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-demand",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Let a hit that was refused for want of a checkpoint place a "
+                "rung of its own. --no-state-checkpoint-demand leaves the "
+                "prompt-end anchor as the only placement. On measured traces a "
+                "demand is 47% of all checkpoint writes but reads back 2.8% of "
+                "the time, against 85.2% for an anchor, so the rung's write "
+                "traffic may cost more in evictions than its reuse is worth."
             ),
         )
         parser.add_argument(
@@ -368,6 +523,34 @@ class EngineArgs:
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable-log-stats",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Log the periodic engine-status line (running/waiting reqs, "
+            "KV cache usage, prefix cache hit rate, prompt/generation "
+            "throughput; default: enabled). Use --no-enable-log-stats to "
+            "disable. Applies to offline LLM(...) as well as to the server. "
+            "Scoped to that line only: the [MTP Stats] and "
+            "[Cache Stats] lines have their own gates (--method mtp and "
+            "--enable-prefix-caching) and keep their own cadences.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval",
+            type=float,
+            default=10.0,
+            help="Seconds between engine-status lines (default: 10, matching "
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+        )
+        parser.add_argument(
+            "--cache-hit-rate-window",
+            type=int,
+            default=1000,
+            help="Requests in the sliding window behind the engine-status "
+            "line's prefix cache hit rate (default: 1000, matching vLLM). "
+            "Must be > 0. Only the status line is windowed; /metrics and "
+            "[Cache Stats] stay cumulative.",
         )
         parser.add_argument(
             "--max-num-seqs",
@@ -483,14 +666,24 @@ class EngineArgs:
             type=json.loads,
             default=None,
             help=(
-                "DCP (Decode Context Parallel) config as a JSON dict, parsed "
-                "straight into a DCPConfig object (no per-field flags). "
-                "Supported keys:\n"
-                '  - "interleave_size": int, KV-cache interleave granularity S: '
-                "token i is stored on DCP rank (i // S) %% W. Default 1 = "
-                "token-level round-robin.\n"
-                "Example:\n"
-                """  '{"interleave_size": 16}'"""
+                "DCP (Decode Context Parallel) knobs as one JSON dict, parsed "
+                "straight into DCPConfig (no per-field flags); unknown keys "
+                "raise. Details and constraints: "
+                "docs/context_parallel_guide.md.\n"
+                '  "interleave_size" (int, 1): KV interleave granularity S -- '
+                "token i lives on rank (i // S) %% W; 1 = round-robin.\n"
+                '  "enable_query_replication" (bool, TRUE): drop the per-step '
+                "decode AllGather Q by replicating q_proj at load time.\n"
+                '  "enable_project_before_merge" (bool, TRUE): project V '
+                "before the output merge, shrinking it by "
+                "kv_lora_rank/v_head_dim.\n"
+                "  \"comm_backend\" (str, a2a): 'a2a' = one all-to-all; "
+                "'ag_rs' = AllGather LSE + ReduceScatter output.\n"
+                "The last three default to the NEW behaviour (and the middle "
+                "two auto-disable where unsupported), so a control run must "
+                "pass the old values explicitly -- passing nothing re-runs the "
+                "new path.\n"
+                'Example: \'{"interleave_size": 16, "enable_query_replication": true}\''
             ),
         )
         eplb_group = parser.add_argument_group("EPLB options")
@@ -598,6 +791,26 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+        kwargs["moe_all2all_backend"] = {
+            None: "auto",
+            "high-throughput": "mori",
+            "low-latency": "mori",
+            "rccl": "rccl",
+            "none": "none",
+        }[all2all_backend]
+
+        # ATOM_KV_OFFLOAD → folded into kv_transfer_config, so offload does not
+        # compete with a P/D connector (or a launcher owning that flag) for it.
+        offload = kv_offload_connector_config(
+            envs.ATOM_KV_OFFLOAD, envs.ATOM_KV_OFFLOAD_EXTRA_CONFIG
+        )
+        kwargs["kv_transfer_config"] = compose_kv_offload_config(
+            kwargs["kv_transfer_config"], offload
+        )
+        if offload is not None:
+            logger.info(
+                "ATOM_KV_OFFLOAD: kv_transfer_config=%s", kwargs["kv_transfer_config"]
+            )
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
@@ -608,6 +821,20 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+
+        # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
+        # too: LLMEngine still reads the loose kwarg on the legacy path.
+        parallel_config_kwargs = {
+            "data_parallel_size": kwargs["data_parallel_size"],
+            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
+            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
+            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
+            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
+        }
+        base_port = kwargs.pop("data_parallel_base_port")
+        if base_port is not None:
+            parallel_config_kwargs["data_parallel_base_port"] = base_port
+        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
 
         logger.info(f"Engine kwargs: {kwargs}")
 

@@ -5,8 +5,11 @@ import ast
 from pathlib import Path
 
 ATOM_ROOT = Path(__file__).resolve().parents[1] / "atom"
+# Prefill scores through the varqlen (`_prefill`) family by module; decode
+# takes its ragged rows through `aiter.ops.flydsl`'s exports
+# (`Fp4MqaRaggedMetadata`), not a kernel module. Widen this only alongside a
+# caller.
 CURRENT_MODULES = {
-    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4",
     "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
 }
 

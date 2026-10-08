@@ -10,16 +10,18 @@ lives in :mod:`.codec`, while LMCache and scheduler orchestration live in
 
 from __future__ import annotations
 
+import array
 import hashlib
 import heapq
 import json
-import os
 import threading
 from collections import OrderedDict
 from collections.abc import Iterator, MutableSet
 from dataclasses import dataclass
 from math import lcm
 from numbers import Integral
+
+from atom.utils import envs
 
 
 @dataclass(frozen=True)
@@ -141,17 +143,32 @@ def build_dsv4_profile(config, *, chunk_size: int) -> DSV4OffloadProfile:
         "state_checkpoint_interval_tokens",
         0,
     )
-    checkpoint_interval = max(
-        0,
-        _integer(
-            "DSV4 checkpoint interval",
-            0 if raw_checkpoint_interval is None else raw_checkpoint_interval,
-        ),
+    # Three policies, and the sign carries the distinction -- see
+    # `BlockManager.__init__`, which clamps the same field to `max(-1, ...)`:
+    #
+    #   >0  a rung every N tokens, and the sidecar aligns to it
+    #    0  checkpointing off entirely
+    #   -1  the grid is off but checkpointing is ON: the prompt-end anchor and
+    #       the demand rung still place checkpoints, off any grid
+    #
+    # Clamping to `max(0, ...)` here folded -1 into 0, which for this consumer
+    # means no sidecar checkpoints at all -- so a run launched with
+    # `--state-checkpoint-interval-tokens -1` kept placing checkpoints in the
+    # engine while offload resume silently degraded to zero reuse. There is no
+    # grid to align to under -1, so the sidecar takes `resume_alignment` on its
+    # own: aligned boundaries, no interval multiple imposed on top.
+    checkpoint_interval = _integer(
+        "DSV4 checkpoint interval",
+        0 if raw_checkpoint_interval is None else raw_checkpoint_interval,
     )
-    checkpoint_interval -= checkpoint_interval % hash_block_size
-    sidecar_interval = (
-        lcm(checkpoint_interval, resume_alignment) if checkpoint_interval else 0
-    )
+    if checkpoint_interval < 0:
+        checkpoint_interval = -1
+        sidecar_interval = resume_alignment
+    else:
+        checkpoint_interval -= checkpoint_interval % hash_block_size
+        sidecar_interval = (
+            lcm(checkpoint_interval, resume_alignment) if checkpoint_interval else 0
+        )
 
     hf_config = getattr(config, "hf_config", None)
     raw_kv_head_dim = getattr(hf_config, "kv_head_dim", 512)
@@ -271,13 +288,9 @@ def _committed_sidecar_capacity(kvc) -> int:
     extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
     configured = extra.get("committed_sidecar_index_capacity")
     if configured is None:
-        raw = os.environ.get("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", "65536")
-        try:
-            capacity = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "committed sidecar index capacity must be a positive integer"
-            ) from exc
+        capacity = envs.OFFLOAD_COMMITTED_SIDECAR_CAPACITY
+        if capacity is None:
+            capacity = 65536
     else:
         if isinstance(configured, bool) or not isinstance(configured, int):
             raise ValueError(
@@ -290,7 +303,7 @@ def _committed_sidecar_capacity(kvc) -> int:
 
 
 def _chained_prefix_hashes(
-    token_ids: list[int],
+    token_ids: array.array,
     hash_block_size: int,
 ) -> dict[int, int]:
     """Return each full-block prefix hash using BlockManager's exact chain."""

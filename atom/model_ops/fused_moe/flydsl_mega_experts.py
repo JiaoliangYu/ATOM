@@ -11,9 +11,13 @@ lives inside aiter, so there is no ``ATOM_FLYDSL_KERNELS_PATH`` and no
 MegaMoEV2 auto-selects its execution config from the runtime token count and
 ``max_tok_per_rank`` (MTPR): MTPR<=255 -> low-latency fixed-slot path,
 MTPR>=256 -> compact path (``FIXED_SLOT_MAX_MTPR``). MTPR must be a positive
-power of two. It is passed in as ``max_num_tokens`` (ATOM's
-``max_num_batched_tokens``) so that every rank uses the same value: MTPR also
-selects the p2p wire format, and a rank-dependent MTPR desynchronises it.
+power of two. The configured ``max_num_tokens`` remains the fallback capacity.
+For native ATOM EP8 with 48 experts per rank, DP-unified forwards with at most 128
+padded token rows can use a second, 128-token instance. Target verification
+and draft passes use their own token counts, including MTP and graph padding.
+MTPR also selects the p2p wire format, so the choice must use group-agreed
+metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
+to retain the configured capacity for all forwards.
 
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
@@ -23,8 +27,9 @@ Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
 Shuffled tensors stay expert-major + contiguous, so EPLB can migrate their
 expert-major views in place.
 
-Memory: ONE MegaMoEV2 is shared across all MoE layers (process-level cache keyed
-by shape/quant/mtpr); per-layer weights are swapped in before forward
+Memory: MegaMoEV2 instances are shared across all MoE layers (process-level
+cache keyed by shape/quant/mtpr); both capacities are built in the same order
+on all ranks before capture. Per-layer weights are swapped in before forward
 (``_s1_w1`` / ``_s1_w1_scale`` / ``w2`` / ``w2_scale`` are runtime pointer args,
 not baked into the kernel).
 """
@@ -36,15 +41,42 @@ import os
 
 import torch
 
+from atom.plugin import is_plugin_mode
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
 
 _MEGA_CACHE: dict = {}
 _MEGA_ROUTE_ROWS: dict[tuple[torch.device, int], torch.Tensor] = {}
 _MEGA_BUILD_DBG = False
+_MEGA_DECODE_MTPRS = (128, 256, 512, 1024)
+_MEGA_DECODE_MTPR = envs.ATOM_MEGA_DECODE_MTPR
+if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
+    raise ValueError(
+        f"ATOM_MEGA_DECODE_MTPR must be one of {_MEGA_DECODE_MTPRS}, "
+        f"got {_MEGA_DECODE_MTPR}"
+    )
+_MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
 
 
 def _os_env(k):
     return os.environ.get(k, "<unset>")
+
+
+def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
+    """Select from already allocated capacities using the pass's shared shape.
+
+    A decode rank can have a prefilling peer. Only ``running_tokens_are_unified``
+    proves that every DP rank agreed on this shape. Do not gate on is_prefill or
+    is_dummy_run: a draft pass also runs on idle peers whose parent batch flags
+    can differ. TBO contexts keep the existing capacity. ``running_bs`` counts
+    requests and underestimates MTP verification rows.
+    """
+    if context is None or not context.running_tokens_are_unified or tbo_active:
+        return mtpr
+    if 0 < context.running_tokens <= _MEGA_DECODE_MTPR:
+        return _MEGA_DECODE_MTPR
+    return mtpr
 
 
 def build_mega_weights(layer) -> None:
@@ -127,6 +159,11 @@ def get_or_build_mega_moe(
     )
     m = _MEGA_CACHE.get(key)
     if m is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"MegaMoE capacity {mtpr} was not warmed before graph capture; "
+                "its symmetric workspace must be allocated on every rank first"
+            )
         from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 
         # MegaMoEV2 auto-selects fixed-slot vs compact and its GEMM tiles from
@@ -148,6 +185,13 @@ def get_or_build_mega_moe(
                 swiglu_limit=swiglu_limit,
             )
         _MEGA_CACHE[key] = m
+        if rank == 0:
+            logger.info(
+                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d",
+                mtpr,
+                world_size,
+                experts // world_size,
+            )
 
     # Bind this layer's weights on EVERY call, not only on build: the cache key
     # has no weight component, so ONE instance is shared by all MoE layers (they
@@ -179,10 +223,14 @@ def run_mega_moe(
     mtpr: int,
     swiglu_limit: float,
     quant: str = "a8w4",
+    mask_pad_rows: bool = False,
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
-    [tokens, model_dim] bf16."""
+    [tokens, model_dim] bf16.
+
+    mask_pad_rows: return this pass's DP pad rows as zeros without dispatching
+    them (see _enable_mega_pad_row_mask)."""
     from aiter.dist.parallel_state import get_ep_group
 
     # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
@@ -202,30 +250,112 @@ def run_mega_moe(
     if not hasattr(layer, "_mega_w1"):
         raise RuntimeError("MegaMoE weights were not prepared")
 
-    # Returns the shared MegaMoEV2 already bound to this layer's weights.
-    mega = get_or_build_mega_moe(
-        rank=rank,
-        world_size=world,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        quant=quant,
-        mtpr=mtpr,
-        swiglu_limit=float(swiglu_limit),
-        w1=layer._mega_w1,
-        w1_scale=layer._mega_w1_scale,
-        w2=layer._mega_w2,
-        w2_scale=layer._mega_w2_scale,
+    build_args = {
+        "rank": rank,
+        "world_size": world,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "quant": quant,
+        "swiglu_limit": float(swiglu_limit),
+        "w1": layer._mega_w1,
+        "w1_scale": layer._mega_w1_scale,
+        "w2": layer._mega_w2,
+        "w2_scale": layer._mega_w2_scale,
+    }
+    # Allocate in a fixed order even when the first pass is prefill/profiling.
+    # Mega construction has symmetric allocations and barriers; lazily building
+    # only the locally selected capacity could leave peers in different calls.
+    mega = get_or_build_mega_moe(mtpr=mtpr, **build_args)
+    use_decode_capacity = (
+        envs.ATOM_MEGA_DECODE_FAST_PATH
+        # Plugin bridges do not all publish native ForwardMode's group-agreed
+        # token rows. Some still report request counts for prefill.
+        and not is_plugin_mode()
+        and mtpr > _MEGA_DECODE_MTPR
+        and world == 8
+        and experts == world * 48
     )
+    if use_decode_capacity:
+        from atom.utils.tbo.ubatching import tbo_active
+
+        # Do not introduce symmetric workspace allocation from a TBO worker.
+        # The first ordinary forward's warmup will allocate the small instance.
+        use_decode_capacity = not tbo_active()
+    if use_decode_capacity:
+        decode_mega = get_or_build_mega_moe(mtpr=_MEGA_DECODE_MTPR, **build_args)
+        from atom.utils.forward_context import get_forward_context
+
+        context = get_forward_context().context
+        selected_mtpr = _select_decode_mtpr(mtpr, context, tbo_active=False)
+        if selected_mtpr != mtpr:
+            # The local tensor is a bound check, not an independent protocol
+            # selector. All peers must choose using the same context metadata.
+            if run_tokens > selected_mtpr:
+                raise ValueError(
+                    f"[mega] run_tokens={run_tokens} exceeds the DP-agreed "
+                    f"decode capacity={selected_mtpr}; "
+                    f"context.running_tokens={context.running_tokens}"
+                )
+            mega = decode_mega
+        if (
+            rank == 0
+            and context is not None
+            and context.running_tokens_are_unified
+            and context.running_tokens > 0
+        ):
+            key = (context.is_draft, context.running_tokens, selected_mtpr)
+            if key not in _MEGA_CAPACITY_LOGGED:
+                _MEGA_CAPACITY_LOGGED.add(key)
+                logger.info(
+                    "[MEGA-CAPACITY] phase=%s tokens=%d capacity=%d",
+                    "draft" if context.is_draft else "target",
+                    context.running_tokens,
+                    selected_mtpr,
+                )
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
+    pad_rows = None
+    if mask_pad_rows:
+        from atom.utils.forward_context import step_pad_rows
+
+        pad_rows = step_pad_rows(run_tokens)
+    if pad_rows is not None:
+        # Whole rows: every top-k slot, the fused shared-expert slot included.
+        ids = torch.where(pad_rows, -1, ids)
+    # An aiter whose combine skips -1 slots returns the pad rows as zeros itself.
+    # The check is not free, so ask for it only on passes that mask rows.
+    combine_can_mask = getattr(mega, "supports_combine_mask", False)
+    forward_kwargs = (
+        {"mask_invalid_slots": pad_rows is not None} if combine_can_mask else {}
+    )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above).
-        out = mega.forward(x.contiguous(), wts, ids)
+        out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
+    if pad_rows is not None and not combine_can_mask:
+        # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
+        # an earlier call left there (possibly non-finite). Select zeros.
+        out = torch.where(pad_rows, 0, out)
     return out
+
+
+def _enable_mega_pad_row_mask(mtpr: int) -> bool:
+    """Whether Mega masks DP pad rows (ATOM_MEGA_MASK_PAD_ROWS).
+
+    MegaMoEV2 never counts, sends or computes a top-k id < 0, so whole pad rows
+    routed to -1 cost nothing; only combine needs care (see run_mega_moe).
+    Allocates the device mask now, at layer init, before any graph capture
+    records its address. Plugin frontends never publish it.
+    """
+    if not envs.ATOM_MEGA_MASK_PAD_ROWS or is_plugin_mode():
+        return False
+    from atom.utils.forward_context import enable_pad_rows_device
+
+    enable_pad_rows_device(mtpr, torch.device("cuda"))
+    return True
 
 
 class MegaFusedExperts:
@@ -263,6 +393,7 @@ class MegaFusedExperts:
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
+        self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
 
     def __call__(
         self,
@@ -311,8 +442,10 @@ class MegaFusedExperts:
             experts=global_num_experts,
             # Infer top-k from the routing tensors, same as the standard kernels.
             topk=int(topk_ids.shape[1]),
-            # todo decode use graph_bs for perf
+            # run_mega_moe selects the small instance using this pass's padded
+            # token count; request count alone is insufficient under MTP.
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
+            mask_pad_rows=self._mask_pad_rows,
         )

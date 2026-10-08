@@ -12,6 +12,7 @@ from .protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionResponse,
+    openai_stop_reason,
 )
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
@@ -32,6 +33,12 @@ def create_completion_chunk(
 
     ``index`` selects ``choices[0].index``; fan-out siblings share one SSE
     stream and are distinguished by this field.
+
+    ``finish_reason`` belongs on the terminal chunk and nowhere else, already
+    translated by `openai_stop_reason`. Both streaming paths here used to pass
+    the engine's own word on every *content* chunk while hardcoding `"stop"`
+    on the terminal one, so a single response reported `max_tokens` in a place
+    clients do not read and `stop` in the place they do.
     """
     chunk = {
         "id": request_id,
@@ -76,11 +83,15 @@ async def stream_completion_response(
     # so the finally below aborts the still-running seq; on normal completion
     # we flip this to False and skip the (no-op) abort.
     aborted = True
+    # The engine's own word, kept for the terminal chunk. It arrives on the
+    # chunk that reports `finished`, which is not the frame it belongs on.
+    engine_reason: str | None = None
     try:
         while True:
             chunk_data = await stream_collector.get()
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
+            engine_reason = chunk_data.get("finish_reason") or engine_reason
 
             extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
@@ -90,7 +101,7 @@ async def stream_completion_response(
                 request_id,
                 model,
                 new_text,
-                finish_reason=chunk_data.get("finish_reason"),
+                finish_reason=None,  # the terminal chunk carries it
                 **extra_fields,
             )
 
@@ -114,7 +125,12 @@ async def stream_completion_response(
                 }
                 yield (
                     content_chunk
-                    + create_completion_chunk(request_id, model, "", "stop")
+                    + create_completion_chunk(
+                        request_id,
+                        model,
+                        "",
+                        openai_stop_reason(engine_reason) or "stop",
+                    )
                     + data_frame(usage_chunk)
                     + STREAM_DONE_MESSAGE
                 )
@@ -140,7 +156,7 @@ def build_completion_response(
             {
                 "index": 0,
                 "text": final_output["text"],
-                "finish_reason": final_output["finish_reason"],
+                "finish_reason": openai_stop_reason(final_output["finish_reason"]),
             }
         ],
         usage={
@@ -153,12 +169,13 @@ def build_completion_response(
             "latency_s": round(final_output.get("latency", 0.0), 4),
         },
     )
+    update: dict[str, Any] = {}
     if "kv_transfer_output_meta_info" in final_output:
-        response = response.model_copy(
-            update={
-                "kv_transfer_params": final_output["kv_transfer_output_meta_info"],
-            }
-        )
+        update["kv_transfer_params"] = final_output["kv_transfer_output_meta_info"]
+    if "prompt_token_ids" in final_output:
+        update["prompt_token_ids"] = final_output["prompt_token_ids"]
+    if update:
+        response = response.model_copy(update=update)
     return response
 
 
@@ -173,13 +190,13 @@ def build_completion_response_multi(
         {
             "index": i,
             "text": out["text"],
-            "finish_reason": out["finish_reason"],
+            "finish_reason": openai_stop_reason(out["finish_reason"]),
         }
         for i, out in enumerate(final_outputs)
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
     completion_tokens = sum(out["num_tokens_output"] for out in final_outputs)
-    return CompletionResponse(
+    response = CompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -200,6 +217,12 @@ def build_completion_response_multi(
             "num_choices": len(final_outputs),
         },
     )
+    # Sibling outputs share the first output's prompt IDs.
+    if "prompt_token_ids" in final_outputs[0]:
+        response = response.model_copy(
+            update={"prompt_token_ids": final_outputs[0]["prompt_token_ids"]}
+        )
+    return response
 
 
 async def stream_completion_response_fanout(
@@ -225,6 +248,7 @@ async def stream_completion_response_fanout(
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     finished = [False] * n
+    engine_reasons: list[str | None] = [None] * n
 
     # Assume abort until every sibling has reported finished; a client
     # disconnect closes the generator first, leaving this True so the finally
@@ -237,6 +261,7 @@ async def stream_completion_response_fanout(
                 continue
             new_text = chunk_data["text"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
+            engine_reasons[idx] = chunk_data.get("finish_reason") or engine_reasons[idx]
 
             extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
@@ -246,7 +271,7 @@ async def stream_completion_response_fanout(
                 request_id,
                 model,
                 new_text,
-                finish_reason=chunk_data.get("finish_reason"),
+                finish_reason=None,  # the terminal chunk carries it
                 index=idx,
                 **extra_fields,
             )
@@ -273,7 +298,13 @@ async def stream_completion_response_fanout(
         # Coalesce the per-sibling stop chunks + usage + [DONE] into one send.
         yield (
             "".join(
-                create_completion_chunk(request_id, model, "", "stop", index=i)
+                create_completion_chunk(
+                    request_id,
+                    model,
+                    "",
+                    openai_stop_reason(engine_reasons[i]) or "stop",
+                    index=i,
+                )
                 for i in range(n)
             )
             + data_frame(usage_chunk)

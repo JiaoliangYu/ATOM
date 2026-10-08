@@ -4,12 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
 try:
     # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
-except Exception as exc:  # noqa: BLE001
-    pytest.skip(f"requires full atom import env: {exc}", allow_module_level=True)
+except ImportError as exc:
+    skip_if_dependency_missing(exc, "requires full atom import env")
 
 
 def test_mega_method_is_mxfp4_specialization():
@@ -28,6 +29,30 @@ def test_mxfp4_method_selection(monkeypatch, backend_name):
     selected = moe_mod._make_mxfp4_moe_method(object(), object())
 
     assert selected is (mega_method if backend_name == "mega" else standard_method)
+
+
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activations):
+    # aiter's A8W4 kernels read interleaved gate/up rows only, so a layer that
+    # asks for MXFP8 activations must get that layout whatever the env says.
+    monkeypatch.setattr(
+        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+    )
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE", False)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_MOE_GU_ITLV", False)
+    quant_config = SimpleNamespace(
+        quant_type=object(), quant_dtype=object(), quant_method=None, is_dynamic=True
+    )
+    moe_config = SimpleNamespace(
+        a_quant_dtype=None, mxfp4_fp8_activations=fp8_activations, use_ep=False
+    )
+
+    method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
+
+    assert method.fp8_activations is fp8_activations
+    assert method.is_guinterleave is fp8_activations
 
 
 @pytest.mark.parametrize(
@@ -51,7 +76,11 @@ def test_eplb_controls_effective_triton_backend(
         quant_method=None,
         is_dynamic=True,
     )
-    moe_config = SimpleNamespace(a_quant_dtype=None)
+    # TP, not EP: `use_triton` is `use_triton_moe and not use_ep`, so the
+    # expectation below is about the TP half of that pair.
+    moe_config = SimpleNamespace(
+        a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=False
+    )
 
     method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
@@ -59,7 +88,8 @@ def test_eplb_controls_effective_triton_backend(
     assert method.use_triton_decode is expected_triton
 
 
-def test_standard_post_routing_arguments_are_preserved(monkeypatch):
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activations):
     calls = []
 
     def fake_fused_moe(*args, **kwargs):
@@ -71,12 +101,16 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
     method.fused_experts = None
     method.quant_type = "mxfp4"
     method.is_guinterleave = True
+    method.fp8_activations = fp8_activations
     method.hidden_pad = 0
     method.intermediate_pad = 0
     # Skip both pre-routing early returns so apply() reaches the post-routing
     # block. use_triton_decode=False also short-circuits get_forward_context().
+    # `use_triton_ep` is the EP half of the same pair and is read further down;
+    # False keeps this on the TP path the post-routing block belongs to.
     method.use_triton = False
     method.use_triton_decode = False
+    method.use_triton_ep = False
     method.select_experts_with_record = lambda **_kwargs: (
         "topk_weights",
         "topk_ids",
@@ -109,6 +143,11 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
     assert result == "output"
     args, kwargs = calls.pop()
     assert args == ("x", "w1", "w2", "topk_weights", "topk_ids")
+    # An A8W4 layer names its activation dtype rather than leaving it to
+    # aiter's per-arch default.
+    assert kwargs.pop("quant_dtype_a", None) == (
+        moe_mod.dtypes.fp8 if fp8_activations else None
+    )
     assert kwargs == {
         "expert_mask": "mask",
         "activation": "silu",
@@ -118,8 +157,6 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
         "a1_scale": "a1_scale",
         "a2_scale": "a2_scale",
         "doweight_stage1": False,
-        "hidden_pad": 0,
-        "intermediate_pad": 0,
         "bias1": "b1",
         "bias2": "b2",
         "gate_mode": moe_mod.GateMode.INTERLEAVE.value,

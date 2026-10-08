@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.kv_transfer.disaggregation.types import KVTransferRegion
+from atom.kv_transfer.disaggregation.types import KVTransferRegion, SaveOperationId
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
@@ -189,10 +189,12 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
     expected = _clone_segments(kv_caches)
     codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
     assert codec.has_fused_chunk_major_staging
+    source_safe = []
     gpu_connector = BlockGPUConnector(
         codec,
         block_size=block_size,
         chunk_size=chunk_size,
+        source_safe_callback=source_safe.append,
     )
 
     config = LMCacheEngineConfig.from_defaults(
@@ -236,8 +238,22 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
         assert engine.storage_manager is not None
         assert "LocalDiskBackend" in engine.storage_manager.list_backends()
 
-        _synchronize_producer_stream()
-        engine.store(tokens, block_ids=block_ids)
+        producer_event = torch.cuda.Event()
+        producer_event.record(torch.cuda.current_stream())
+        operation = SaveOperationId("gpu-e2e", 0)
+        with gpu_connector.track_save_source(operation):
+            engine.store(tokens, block_ids=block_ids, producer_event=producer_event)
+        deadline = time.monotonic() + 5
+        while len(source_safe) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert [identity.save_operation for identity in source_safe] == [
+            operation,
+            operation,
+        ]
+        assert [identity.ranges for identity in source_safe] == [
+            ((8, 16),),
+            ((0, 8),),
+        ]
         disk_files = _wait_for_disk_hit(engine, tokens, tmp_path)
 
         assert len(disk_files) == 2
@@ -263,6 +279,7 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
                     f"{layer_name}.{field}"
                 )
     finally:
+        gpu_connector.close()
         LMCacheEngineBuilder.destroy(instance_id)
 
 

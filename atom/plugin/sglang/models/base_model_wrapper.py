@@ -380,6 +380,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
+                save_kv_cache=model_kwargs.get("save_kv_cache"),
             ) as runtime:
                 if self.model_arch_spec.bind_cache_views is not None:
                     self.model_arch_spec.bind_cache_views(self.model, runtime)
@@ -500,9 +501,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
             draft_path = None
             try:
-                from sglang.srt.server_args import get_global_server_args
+                from atom.plugin.config import get_sglang_server_args
 
-                server_args = get_global_server_args()
+                server_args = get_sglang_server_args()
                 draft_path = getattr(server_args, "speculative_draft_model_path", None)
             except Exception:
                 logger.exception("Failed to resolve SGLang EAGLE3 draft model path")
