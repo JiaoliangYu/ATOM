@@ -120,32 +120,32 @@ class MoonEPMegaExperts:
         param = getattr(layer, name, None)
         if param is None or param.data is None:
             return None
-        weight = param.data
+        resident = param.data
         epn = self._experts_per_rank
         # Scales may be stored flat; the pool still needs them expert-major.
-        flat = weight.shape[0] != epn
-        if flat and weight.shape[0] % epn:
+        flat = resident.shape[0] != epn
+        if flat and resident.shape[0] % epn:
             raise ValueError(
-                f"cannot index {tuple(weight.shape)} by expert: leading dim "
+                f"cannot index {tuple(resident.shape)} by expert: leading dim "
                 f"is neither {epn} nor a multiple of it"
             )
-        view = weight.reshape(epn, -1, *weight.shape[1:]) if flat else weight
+        view = resident.reshape(epn, -1, *resident.shape[1:]) if flat else resident
         pool = MoonEPWeightPool(
             rank=self._rank,
             world_size=self._world_size,
             experts_per_rank=epn,
             prefetch_slots=self._prefetch_slots,
             weight_shape=tuple(view.shape[1:]),
-            dtype=weight.dtype,
+            dtype=resident.dtype,
             group=self._group,
         )
         pool.stage_home(view.contiguous())
-        param.data = pool.home.reshape(weight.shape)
+        param.data = pool.home.reshape(resident.shape)
         logger.info(
             "MoonEP adopted %s %s%s: %d resident + %d prefetch slots",
             name,
-            tuple(weight.shape),
-            weight.dtype,
+            tuple(resident.shape),
+            resident.dtype,
             epn,
             self._prefetch_slots,
         )
