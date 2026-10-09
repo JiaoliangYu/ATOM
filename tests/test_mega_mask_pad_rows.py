@@ -138,14 +138,6 @@ def test_disabled_is_identity(run):
     assert out.isnan().all()
 
 
-def test_zero_pad_rows_has_no_cpu_fallback():
-    out = torch.ones(2, 4)
-    pad_rows = torch.tensor([[False], [True]])
-
-    with pytest.raises(ValueError, match="requires CUDA tensors"):
-        mega.zero_pad_rows_(out, pad_rows)
-
-
 def test_switch_follows_the_env(monkeypatch):
     enabled = []
     monkeypatch.setattr(

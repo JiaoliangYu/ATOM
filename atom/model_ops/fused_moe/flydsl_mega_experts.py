@@ -348,33 +348,8 @@ def zero_pad_rows_(out: torch.Tensor, pad_rows: torch.Tensor) -> torch.Tensor:
 
     Only the pad rows are written; real rows are not read at all, where the
     elementwise select streams the whole output (~15 us/layer at 1536 x 7168).
-    This is a GPU-only internal contract; callers must not rely on a CPU or
-    non-contiguous fallback."""
-    if not out.is_cuda or not pad_rows.is_cuda:
-        raise ValueError("zero_pad_rows_ requires CUDA tensors")
-    if out.device != pad_rows.device:
-        raise ValueError(
-            "zero_pad_rows_ requires out and pad_rows on the same device; "
-            f"got {out.device} and {pad_rows.device}"
-        )
-    if out.dim() != 2 or out.stride(1) != 1:
-        raise ValueError(
-            "zero_pad_rows_ requires a 2D output with contiguous hidden rows; "
-            f"got shape={tuple(out.shape)}, stride={out.stride()}"
-        )
-    if (
-        pad_rows.dtype != torch.bool
-        or pad_rows.shape != (out.shape[0], 1)
-        or not pad_rows.is_contiguous()
-    ):
-        raise ValueError(
-            "zero_pad_rows_ requires a contiguous bool mask shaped [rows, 1]; "
-            f"got shape={tuple(pad_rows.shape)}, dtype={pad_rows.dtype}, "
-            f"stride={pad_rows.stride()}"
-        )
-    if out.numel() == 0:
-        return out
-
+    The internal callers provide same-device CUDA tensors, a row-contiguous
+    output, and a contiguous ``[rows, 1]`` bool mask."""
     global _ZERO_PAD_ROWS_IMPL
     if _ZERO_PAD_ROWS_IMPL is None:
         # Keep CPU-only imports and unit-test collection independent of Triton.
