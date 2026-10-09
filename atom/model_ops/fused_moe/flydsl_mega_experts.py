@@ -40,8 +40,6 @@ import logging
 import os
 
 import torch
-import triton
-import triton.language as tl
 
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -59,6 +57,7 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
+_ZERO_PAD_ROWS_IMPL = None
 
 
 def _os_env(k):
@@ -339,37 +338,51 @@ def run_mega_moe(
         out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
     if pad_rows is not None and not combine_can_mask:
         # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
-        # an earlier call left there (possibly non-finite). Select zeros.
+        # an earlier call left there (possibly non-finite). Zero those rows.
         out = zero_pad_rows_(out, pad_rows)
     return out
 
 
-@triton.jit
-def _zero_pad_rows_kernel(out_ptr, pad_ptr, stride_row, hidden, BLOCK: tl.constexpr):
-    row = tl.program_id(0)
-    if tl.load(pad_ptr + row) != 0:
-        offs = tl.arange(0, BLOCK)
-        zeros = tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty)
-        for start in range(0, hidden, BLOCK):
-            tl.store(out_ptr + row * stride_row + start + offs, zeros, mask=start + offs < hidden)
-
-
 def zero_pad_rows_(out: torch.Tensor, pad_rows: torch.Tensor) -> torch.Tensor:
-    """In place `torch.where(pad_rows, 0, out)` for a `[rows, hidden]` output.
+    """Zero selected rows of a CUDA ``[rows, hidden]`` output in place.
 
     Only the pad rows are written; real rows are not read at all, where the
-    elementwise select streams the whole output (~15 us/layer at 1536 x 7168)."""
+    elementwise select streams the whole output (~15 us/layer at 1536 x 7168).
+    This is a GPU-only internal contract; callers must not rely on a CPU or
+    non-contiguous fallback."""
+    if not out.is_cuda or not pad_rows.is_cuda:
+        raise ValueError("zero_pad_rows_ requires CUDA tensors")
+    if out.device != pad_rows.device:
+        raise ValueError(
+            "zero_pad_rows_ requires out and pad_rows on the same device; "
+            f"got {out.device} and {pad_rows.device}"
+        )
+    if out.dim() != 2 or out.stride(1) != 1:
+        raise ValueError(
+            "zero_pad_rows_ requires a 2D output with contiguous hidden rows; "
+            f"got shape={tuple(out.shape)}, stride={out.stride()}"
+        )
     if (
-        not out.is_cuda
-        or not pad_rows.is_cuda
-        or out.dim() != 2
-        or out.stride(1) != 1
+        pad_rows.dtype != torch.bool
+        or pad_rows.shape != (out.shape[0], 1)
+        or not pad_rows.is_contiguous()
     ):
-        return torch.where(pad_rows, 0, out)
-    _zero_pad_rows_kernel[(out.shape[0],)](
-        out, pad_rows.view(torch.uint8), out.stride(0), out.shape[1], BLOCK=1024
-    )
-    return out
+        raise ValueError(
+            "zero_pad_rows_ requires a contiguous bool mask shaped [rows, 1]; "
+            f"got shape={tuple(pad_rows.shape)}, dtype={pad_rows.dtype}, "
+            f"stride={pad_rows.stride()}"
+        )
+    if out.numel() == 0:
+        return out
+
+    global _ZERO_PAD_ROWS_IMPL
+    if _ZERO_PAD_ROWS_IMPL is None:
+        # Keep CPU-only imports and unit-test collection independent of Triton.
+        from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
+
+        _ZERO_PAD_ROWS_IMPL = zero_pad_rows_
+
+    return _ZERO_PAD_ROWS_IMPL(out, pad_rows)
 
 
 def _enable_mega_pad_row_mask(mtpr: int) -> bool:

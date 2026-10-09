@@ -14,6 +14,7 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 import torch
 
+import atom.model_ops.fused_moe.flydsl_mega_experts as fme
 import atom.model_ops.fused_moe.mori_v2_prepare_finalize as mv2
 import atom.utils.forward_context as fc
 
@@ -36,6 +37,12 @@ def run(monkeypatch):
     monkeypatch.setattr(fc, "_row_index_device", None)
     monkeypatch.setattr(fc, "_real_requests_device", None)
     fc.enable_pad_rows_device(256, torch.device("cpu"))
+
+    def zero_pad_rows_(out, pad_rows):
+        out.masked_fill_(pad_rows, 0)
+        return out
+
+    monkeypatch.setattr(fme, "zero_pad_rows_", zero_pad_rows_)
     monkeypatch.setattr(
         mv2.MoriV2ModularKernel, "_assert_recipe_matches", lambda *a: None
     )
