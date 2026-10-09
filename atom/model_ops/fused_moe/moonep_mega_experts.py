@@ -110,51 +110,55 @@ class MoonEPMegaExperts:
         self._group = group
         self._slot_state = None
         self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
-        self._pools = tuple(self._adopt(layer, name) for name in _ADOPTED)
+        self._pool, self._parts = self._adopt(layer)
 
-    def _adopt(self, layer: torch.nn.Module, name: str):
-        """Move one resident weight into a P2P-readable ``[EPR + B]`` pool."""
+    def _adopt(self, layer: torch.nn.Module):
+        """Move this layer's Mega weights and scales into one P2P-readable pool
+        with a ``[EPR + B]`` window per tensor."""
 
         from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
 
-        param = getattr(layer, name, None)
-        if param is None or param.data is None:
-            return None
-        resident = param.data
         epn = self._experts_per_rank
-        # Scales may be stored flat; the pool still needs them expert-major.
-        flat = resident.shape[0] != epn
-        if flat and resident.shape[0] % epn:
-            raise ValueError(
-                f"cannot index {tuple(resident.shape)} by expert: leading dim "
-                f"is neither {epn} nor a multiple of it"
-            )
-        view = resident.reshape(epn, -1, *resident.shape[1:]) if flat else resident
+        params, homes, parts, layouts = [], [], [], []
+        for name in _ADOPTED:
+            param = getattr(layer, name, None)
+            if param is None or param.data is None:
+                raise ValueError(f"MoonEP needs layer.{name}")
+            resident = param.data
+            # Scales may be stored flat; the pool still needs them expert-major.
+            flat = resident.shape[0] != epn
+            if flat and resident.shape[0] % epn:
+                raise ValueError(
+                    f"cannot index {name} {tuple(resident.shape)} by expert: "
+                    f"leading dim is neither {epn} nor a multiple of it"
+                )
+            home = resident.reshape(epn, -1, *resident.shape[1:]) if flat else resident
+            params.append(param)
+            homes.append(home)
+            parts.append((tuple(home.shape[1:]), resident.dtype))
+            layouts.append((flat, bool(getattr(param, "is_shuffled", False))))
         pool = MoonEPWeightPool(
             rank=self._rank,
             world_size=self._world_size,
             experts_per_rank=epn,
             prefetch_slots=self._prefetch_slots,
-            weight_shape=tuple(view.shape[1:]),
-            dtype=resident.dtype,
+            parts=parts,
             group=self._group,
         )
-        pool.stage_home(view.contiguous())
-        param.data = pool.home.reshape(resident.shape)
+        pool.stage_home(homes)
+        for param, home in zip(params, pool.home):
+            param.data = home.reshape(param.data.shape)
         logger.info(
-            "MoonEP adopted %s %s%s: %d resident + %d prefetch slots",
-            name,
-            tuple(resident.shape),
-            resident.dtype,
+            "MoonEP adopted %s: %d resident + %d prefetch slots",
+            ", ".join(f"{n}{list(s)} {d}" for n, (s, d) in zip(_ADOPTED, parts)),
             epn,
             self._prefetch_slots,
         )
-        return pool, flat, bool(getattr(param, "is_shuffled", False))
+        return pool, tuple(layouts)
 
-    @staticmethod
-    def _view(entry, *, home: bool):
-        pool, flat, shuffled = entry
-        window = pool.home if home else pool.local
+    def _view(self, index: int, *, home: bool):
+        flat, shuffled = self._parts[index]
+        window = (self._pool.home if home else self._pool.local)[index]
         if flat:
             window = window.reshape(-1, *window.shape[2:])
         if shuffled:
@@ -187,7 +191,7 @@ class MoonEPMegaExperts:
             self._prefetch_slots if wide else 0
         )
         w1, w1_scale, w2, w2_scale = (
-            self._view(entry, home=not wide) for entry in self._pools
+            self._view(i, home=not wide) for i in range(len(_ADOPTED))
         )
         return get_or_build_mega_moe(
             rank=self._rank,
@@ -239,9 +243,7 @@ class MoonEPMegaExperts:
         skipping those a slot already holds."""
 
         placed, prev = mega.moonep_slot_tables()
-        for entry in self._pools:
-            if entry is not None:
-                entry[0].prefetch(placed[self._rank], prev[self._rank])
+        self._pool.prefetch(placed[self._rank], prev[self._rank])
 
     def __call__(
         self,

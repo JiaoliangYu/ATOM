@@ -20,12 +20,13 @@ NARROW = (WORLD * EPR, mme._MEGA_DECODE_MTPR)
 
 class _FakePool:
     def __init__(self):
-        self.local = torch.arange((EPR + B) * 2, dtype=torch.float32).view(EPR + B, 2)
-        self.home = self.local[:EPR]
-        self.prefetched = []
+        window = torch.arange((EPR + B) * 2, dtype=torch.float32).view(EPR + B, 2)
+        self.local = [window.clone() for _ in mme._ADOPTED]
+        self.home = [w[:EPR] for w in self.local]
+        self.calls = []
 
     def prefetch(self, selected, resident):
-        self.prefetched.append((selected.clone(), resident.clone()))
+        self.calls.append((selected.clone(), resident.clone()))
 
 
 class _FakeMega:
@@ -81,7 +82,7 @@ def _experts(monkeypatch, *, balance, fast_path=True, unified=True, tokens=16):
     obj._model_dim, obj._inter_dim, obj._mtpr, obj._quant = 8, 8, 4096, "a8w4"
     obj._rank, obj._world_size, obj._experts_per_rank = 0, WORLD, EPR
     obj._prefetch_slots, obj._slot_state, obj._mask_pad_rows = B, None, False
-    obj._pools = tuple((_FakePool(), False, False) for _ in mme._ADOPTED)
+    obj._pool, obj._parts = _FakePool(), ((False, False),) * len(mme._ADOPTED)
     obj._should_balance = lambda rows: balance
     return obj, built
 
@@ -102,7 +103,7 @@ def test_balanced_prefill_sends_logical_ids_and_fills_the_slots(monkeypatch):
     assert torch.equal(ids, logical.to(torch.int32)) and balance is True
     assert wide.moonep_slots == B and wide.w1.shape[0] == EPR + B
     assert wide.bound is obj._slot_state
-    selected, resident = obj._pools[0][0].prefetched[0]
+    [(selected, resident)] = obj._pool.calls  # one launch fills every part
     assert selected.tolist()[2] == 100 and resident.tolist() == [-1] * B
     assert not built[NARROW].calls
 
@@ -131,7 +132,7 @@ def test_unified_decode_runs_the_resident_instance(monkeypatch):
     assert torch.equal(ids, logical) and balance is None
     assert built[NARROW].w1.shape[0] == EPR and built[NARROW].moonep_slots == 0
     assert not built[WIDE].calls
-    assert not obj._pools[0][0].prefetched
+    assert not obj._pool.calls
 
 
 @pytest.mark.parametrize("fast_path, unified", [(False, True), (True, False)])
@@ -147,7 +148,7 @@ def test_other_passes_keep_experts_home_in_the_wide_instance(
 
     ids, balance = built[WIDE].calls[0]
     assert torch.equal(ids, logical.to(torch.int32)) and balance is False
-    assert not obj._pools[0][0].prefetched
+    assert not obj._pool.calls
 
 
 @pytest.mark.parametrize(
