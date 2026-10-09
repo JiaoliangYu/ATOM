@@ -344,15 +344,9 @@ def run_mega_moe(
 
 
 def zero_pad_rows_(out: torch.Tensor, pad_rows: torch.Tensor) -> torch.Tensor:
-    """Zero selected rows of a CUDA ``[rows, hidden]`` output in place.
-
-    Only the pad rows are written; real rows are not read at all, where the
-    elementwise select streams the whole output (~15 us/layer at 1536 x 7168).
-    The internal callers provide same-device CUDA tensors, a row-contiguous
-    output, and a contiguous ``[rows, 1]`` bool mask."""
+    """Zero masked CUDA rows in place."""
     global _ZERO_PAD_ROWS_IMPL
     if _ZERO_PAD_ROWS_IMPL is None:
-        # Keep CPU-only imports and unit-test collection independent of Triton.
         from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
 
         _ZERO_PAD_ROWS_IMPL = zero_pad_rows_
