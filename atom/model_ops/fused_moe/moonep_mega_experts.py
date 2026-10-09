@@ -38,6 +38,37 @@ class MoonEPMegaExperts:
     the same reason: it holds the layer, which would make a module cycle.
     """
 
+    @classmethod
+    def for_layer(cls, layer: torch.nn.Module, moe, *, model_dim: int, inter_dim: int):
+        """Take over ``layer``'s Mega weights on this rank of the EP group."""
+        from aiter.dist.parallel_state import get_ep_group
+
+        if moe.expert_layout.num_redundant:
+            raise ValueError(
+                "ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB redundant experts"
+            )
+        # Reading all2all_manager initializes the mori symmetric heap that the
+        # weight pools are mapped from.
+        ep = get_ep_group()
+        am = ep.device_communicator.all2all_manager
+        logger.info(
+            "MoonEP active over MegaMoE: rank=%d world=%d prefetch_slots=%d",
+            am.rank,
+            am.world_size,
+            envs.MOONEP_PREFETCH_SLOTS,
+        )
+        return cls(
+            layer,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            mtpr=moe.max_num_tokens,
+            rank=int(am.rank),
+            world_size=int(am.world_size),
+            num_experts=moe.num_experts,
+            prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
+            group=ep.cpu_group,
+        )
+
     def __init__(
         self,
         layer: torch.nn.Module,
@@ -54,6 +85,14 @@ class MoonEPMegaExperts:
     ) -> None:
         """``rank``/``world_size`` are positions in ``group``, the EP CPU process
         group the weight pools bootstrap over."""
+        if world_size not in (4, 8):
+            raise ValueError(f"MoonEP supports EP4 and EP8, got EP{world_size}")
+        # Mega allocates on cuda:<rank>, so the EP rank must be the local device.
+        if torch.cuda.current_device() != rank:
+            raise ValueError(
+                f"MoonEP needs EP rank {rank} on cuda:{rank}, "
+                f"running on cuda:{torch.cuda.current_device()}"
+            )
         if num_experts % world_size:
             raise ValueError("MoonEP requires num_experts divisible by world_size")
         if prefetch_slots <= 0:
@@ -103,7 +142,11 @@ class MoonEPMegaExperts:
         param.data = pool.home.reshape(tensor.shape)
         logger.info(
             "MoonEP adopted %s %s%s: %d resident + %d prefetch slots",
-            name, tuple(tensor.shape), tensor.dtype, epn, self._prefetch_slots,
+            name,
+            tuple(tensor.shape),
+            tensor.dtype,
+            epn,
+            self._prefetch_slots,
         )
         return pool, flat, bool(getattr(param, "is_shuffled", False))
 
@@ -139,7 +182,9 @@ class MoonEPMegaExperts:
     def _mega(self, *, wide: bool, mtpr: int, topk: int):
         """The instance for one window, with this layer's weights bound."""
 
-        experts_per_rank = self._experts_per_rank + (self._prefetch_slots if wide else 0)
+        experts_per_rank = self._experts_per_rank + (
+            self._prefetch_slots if wide else 0
+        )
         w1, w1_scale, w2, w2_scale = (
             self._view(entry, home=not wide) for entry in self._pools
         )
@@ -181,7 +226,10 @@ class MoonEPMegaExperts:
             return None
         narrow = self._mega(wide=False, mtpr=_MEGA_DECODE_MTPR, topk=topk)
         context = get_forward_context().context
-        if _select_decode_mtpr(self._mtpr, context, tbo_active=False) != _MEGA_DECODE_MTPR:
+        if (
+            _select_decode_mtpr(self._mtpr, context, tbo_active=False)
+            != _MEGA_DECODE_MTPR
+        ):
             return None
         return narrow
 
@@ -211,7 +259,9 @@ class MoonEPMegaExperts:
                 "mega does not support apply_router_weight_on_input=True"
             )
         if activation is not None and activation != ActivationType.Silu:
-            raise NotImplementedError(f"mega hardcodes SwiGLU; got activation={activation}")
+            raise NotImplementedError(
+                f"mega hardcodes SwiGLU; got activation={activation}"
+            )
         rows = int(hidden_states.shape[0])
         if rows > self._mtpr:
             raise ValueError(f"[moonep-mega] rows={rows} exceeds mtpr={self._mtpr}")

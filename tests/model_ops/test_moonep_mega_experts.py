@@ -135,8 +135,12 @@ def test_unified_decode_runs_the_resident_instance(monkeypatch):
 
 
 @pytest.mark.parametrize("fast_path, unified", [(False, True), (True, False)])
-def test_other_passes_keep_experts_home_in_the_wide_instance(monkeypatch, fast_path, unified):
-    obj, built = _experts(monkeypatch, balance=False, fast_path=fast_path, unified=unified)
+def test_other_passes_keep_experts_home_in_the_wide_instance(
+    monkeypatch, fast_path, unified
+):
+    obj, built = _experts(
+        monkeypatch, balance=False, fast_path=fast_path, unified=unified
+    )
     logical = torch.tensor([[0, 383], [50, 7]], dtype=torch.int64)
 
     _call(obj, logical)
@@ -168,3 +172,22 @@ def test_balance_gate_follows_the_dp_agreed_size(
     obj = mme.MoonEPMegaExperts.__new__(mme.MoonEPMegaExperts)
 
     assert obj._should_balance(rows) is expect
+
+
+@pytest.mark.parametrize(
+    "world, rank, device, match",
+    [(2, 0, 0, "EP4 and EP8"), (4, 1, 5, "cuda:1")],
+)
+def test_rejects_unsupported_ep_layouts(monkeypatch, world, rank, device, match):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: device)
+    with pytest.raises(ValueError, match=match):
+        mme.MoonEPMegaExperts(
+            None,
+            model_dim=8,
+            inter_dim=8,
+            mtpr=4096,
+            rank=rank,
+            world_size=world,
+            num_experts=384,
+            prefetch_slots=B,
+        )

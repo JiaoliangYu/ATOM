@@ -269,8 +269,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
-    # "moonep": balance MegaMoE prefill with MoonEP (--moe-backend mega).
-    "ATOM_EP_BACKEND": lambda: os.getenv("ATOM_EP_BACKEND", "mori").lower(),
+    # Balance MegaMoE prefill with MoonEP (--moe-backend mega, EP4/EP8).
+    "ATOM_ENABLE_MOONEP": lambda: os.getenv("ATOM_ENABLE_MOONEP", "0") == "1",
     # MoonEP prefetch slots per rank for other ranks' hot experts.
     "MOONEP_PREFETCH_SLOTS": lambda: int(os.getenv("MOONEP_PREFETCH_SLOTS", "8")),
     # MoonEP balances a prefill only when the largest DP rank has at least

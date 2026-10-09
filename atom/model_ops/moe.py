@@ -2371,8 +2371,15 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        if envs.ATOM_EP_BACKEND == "moonep":
-            self.fused_experts = self._moonep_experts(layer)
+        if envs.ATOM_ENABLE_MOONEP:
+            from atom.model_ops.fused_moe.moonep_mega_experts import MoonEPMegaExperts
+
+            self.fused_experts = MoonEPMegaExperts.for_layer(
+                layer,
+                self.moe,
+                model_dim=self.hidden_size,
+                inter_dim=self.intermediate_size,
+            )
             return
         self.fused_experts = MegaFusedExperts(
             layer,
@@ -2380,39 +2387,6 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
             quant="a8w4",
-        )
-
-    def _moonep_experts(self, layer: torch.nn.Module):
-        # MoonEP balances Mega's prefill: its prepare places hot experts' routes
-        # on other ranks, which prefetch the weights into B extra slots.
-        from aiter.dist.parallel_state import get_ep_group
-
-        from atom.model_ops.fused_moe.moonep_mega_experts import MoonEPMegaExperts
-
-        if self.moe.expert_layout.num_redundant:
-            raise ValueError(
-                "ATOM_EP_BACKEND=moonep cannot be combined with EPLB redundant experts"
-            )
-        # Reading all2all_manager initializes the mori symmetric heap that the
-        # weight pools are mapped from.
-        ep = get_ep_group()
-        am = ep.device_communicator.all2all_manager
-        logger.info(
-            "MoonEP active over MegaMoE: rank=%d world=%d prefetch_slots=%d",
-            am.rank,
-            am.world_size,
-            envs.MOONEP_PREFETCH_SLOTS,
-        )
-        return MoonEPMegaExperts(
-            layer,
-            model_dim=self.hidden_size,
-            inter_dim=self.intermediate_size,
-            mtpr=self.moe.max_num_tokens,
-            rank=int(am.rank),
-            world_size=int(am.world_size),
-            num_experts=self.moe.num_experts,
-            prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
-            group=ep.cpu_group,
         )
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
