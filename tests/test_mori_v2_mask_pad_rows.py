@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
 
 import torch
 

@@ -41,6 +41,7 @@ import os
 
 import torch
 
+from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
@@ -57,7 +58,6 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
-_ZERO_PAD_ROWS_IMPL = None
 
 
 def _os_env(k):
@@ -341,17 +341,6 @@ def run_mega_moe(
         # an earlier call left there (possibly non-finite). Zero those rows.
         out = zero_pad_rows_(out, pad_rows)
     return out
-
-
-def zero_pad_rows_(out: torch.Tensor, pad_rows: torch.Tensor) -> torch.Tensor:
-    """Zero masked CUDA rows in place."""
-    global _ZERO_PAD_ROWS_IMPL
-    if _ZERO_PAD_ROWS_IMPL is None:
-        from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
-
-        _ZERO_PAD_ROWS_IMPL = zero_pad_rows_
-
-    return _ZERO_PAD_ROWS_IMPL(out, pad_rows)
 
 
 def _enable_mega_pad_row_mask(mtpr: int) -> bool:
