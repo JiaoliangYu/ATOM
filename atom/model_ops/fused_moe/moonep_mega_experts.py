@@ -16,6 +16,7 @@ import logging
 
 import torch
 
+from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.flydsl_mega_experts import (
     _MEGA_DECODE_MTPR,
     _enable_mega_pad_row_mask,
@@ -43,10 +44,8 @@ class MoonEPMegaExperts:
         """Take over ``layer``'s Mega weights on this rank of the EP group."""
         from aiter.dist.parallel_state import get_ep_group
 
-        if moe.expert_layout.num_redundant:
-            raise ValueError(
-                "ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB redundant experts"
-            )
+        if getattr(get_current_atom_config(), "eplb_enable", False):
+            raise ValueError("ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB")
         # Reading all2all_manager initializes the mori symmetric heap that the
         # weight pools are mapped from.
         ep = get_ep_group()
@@ -95,8 +94,10 @@ class MoonEPMegaExperts:
             )
         if num_experts % world_size:
             raise ValueError("MoonEP requires num_experts divisible by world_size")
-        if prefetch_slots <= 0:
-            raise ValueError("MoonEP prefetch_slots must be positive")
+        if not 0 < prefetch_slots <= 64:
+            raise ValueError(
+                f"MoonEP prefetch_slots must be in [1, 64], got {prefetch_slots}"
+            )
         self._layer = layer
         self._model_dim = model_dim
         self._inter_dim = inter_dim
@@ -119,32 +120,32 @@ class MoonEPMegaExperts:
         param = getattr(layer, name, None)
         if param is None or param.data is None:
             return None
-        tensor = param.data
+        weight = param.data
         epn = self._experts_per_rank
         # Scales may be stored flat; the pool still needs them expert-major.
-        flat = tensor.shape[0] != epn
-        if flat and tensor.shape[0] % epn:
+        flat = weight.shape[0] != epn
+        if flat and weight.shape[0] % epn:
             raise ValueError(
-                f"cannot index {tuple(tensor.shape)} by expert: leading dim "
+                f"cannot index {tuple(weight.shape)} by expert: leading dim "
                 f"is neither {epn} nor a multiple of it"
             )
-        view = tensor.reshape(epn, -1, *tensor.shape[1:]) if flat else tensor
+        view = weight.reshape(epn, -1, *weight.shape[1:]) if flat else weight
         pool = MoonEPWeightPool(
             rank=self._rank,
             world_size=self._world_size,
             experts_per_rank=epn,
             prefetch_slots=self._prefetch_slots,
             weight_shape=tuple(view.shape[1:]),
-            dtype=tensor.dtype,
+            dtype=weight.dtype,
             group=self._group,
         )
         pool.stage_home(view.contiguous())
-        param.data = pool.home.reshape(tensor.shape)
+        param.data = pool.home.reshape(weight.shape)
         logger.info(
             "MoonEP adopted %s %s%s: %d resident + %d prefetch slots",
             name,
-            tuple(tensor.shape),
-            tensor.dtype,
+            tuple(weight.shape),
+            weight.dtype,
             epn,
             self._prefetch_slots,
         )
@@ -153,12 +154,12 @@ class MoonEPMegaExperts:
     @staticmethod
     def _view(entry, *, home: bool):
         pool, flat, shuffled = entry
-        tensor = pool.home if home else pool.local
+        window = pool.home if home else pool.local
         if flat:
-            tensor = tensor.reshape(-1, *tensor.shape[2:])
+            window = window.reshape(-1, *window.shape[2:])
         if shuffled:
-            tensor.is_shuffled = True
-        return tensor
+            window.is_shuffled = True
+        return window
 
     def _should_balance(self, rows: int) -> bool:
         """Balance prefills whose largest DP rank reaches MOONEP_MIN_PLAN_TOKENS.

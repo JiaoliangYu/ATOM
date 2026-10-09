@@ -175,10 +175,15 @@ def test_balance_gate_follows_the_dp_agreed_size(
 
 
 @pytest.mark.parametrize(
-    "world, rank, device, match",
-    [(2, 0, 0, "EP4 and EP8"), (4, 1, 5, "cuda:1")],
+    "world, rank, device, slots, match",
+    [
+        (2, 0, 0, B, "EP4 and EP8"),
+        (4, 1, 5, B, "cuda:1"),
+        (8, 0, 0, 0, "prefetch_slots"),
+        (8, 0, 0, 65, "prefetch_slots"),
+    ],
 )
-def test_rejects_unsupported_ep_layouts(monkeypatch, world, rank, device, match):
+def test_rejects_unsupported_layouts(monkeypatch, world, rank, device, slots, match):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: device)
     with pytest.raises(ValueError, match=match):
         mme.MoonEPMegaExperts(
@@ -189,5 +194,12 @@ def test_rejects_unsupported_ep_layouts(monkeypatch, world, rank, device, match)
             rank=rank,
             world_size=world,
             num_experts=384,
-            prefetch_slots=B,
+            prefetch_slots=slots,
         )
+
+
+def test_rejects_eplb(monkeypatch):
+    config = SimpleNamespace(eplb_enable=True)
+    monkeypatch.setattr(mme, "get_current_atom_config", lambda: config)
+    with pytest.raises(ValueError, match="EPLB"):
+        mme.MoonEPMegaExperts.for_layer(None, None, model_dim=8, inter_dim=8)
