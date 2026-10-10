@@ -273,9 +273,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_MOONEP": lambda: os.getenv("ATOM_ENABLE_MOONEP", "0") == "1",
     # MoonEP prefetch slots per rank for other ranks' hot experts.
     "MOONEP_PREFETCH_SLOTS": lambda: int(os.getenv("MOONEP_PREFETCH_SLOTS", "8")),
-    # MoonEP balances a prefill only when the largest DP rank has at least
-    # this many tokens; smaller ones keep every expert on its owner.
-    "MOONEP_MIN_PLAN_TOKENS": lambda: int(os.getenv("MOONEP_MIN_PLAN_TOKENS", "0")),
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),

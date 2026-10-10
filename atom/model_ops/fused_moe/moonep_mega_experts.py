@@ -2,14 +2,15 @@
 """MoonEP expert balancing inside MegaMoE v2.
 
 Each rank keeps its ``EPR`` resident experts plus ``B`` prefetch slots in one
-P2P-readable ``[EPR + B]`` weight window.  Large prefills run a MegaMoEV2
+P2P-readable ``[EPR + B]`` weight window.  Every prefill runs a MegaMoEV2
 instance over ``R * (EPR + B)`` virtual experts: its prepare kernel already
 exchanges the route histogram, so it places hot experts' routes on other
 ranks there (MoonEP) and those ranks pull the experts' weights into their
-slots before Stage1.  Smaller prefills keep every expert on its owner in the
-same instance.  Unified decode runs the plain ``R * EPR`` decode-capacity
-instance, which keeps Mega's fixed-slot decode path (exactly 48 experts per
-rank).
+slots before Stage1.  Unified decode does not balance: it runs the plain
+``R * EPR`` decode-capacity instance where Mega's fixed-slot decode path
+applies (exactly 48 experts per rank), else the same wide instance with every
+expert on its owner, which shares its symmetric workspace instead of
+allocating a second one.
 """
 
 import logging
@@ -165,24 +166,19 @@ class MoonEPMegaExperts:
             window.is_shuffled = True
         return window
 
-    def _should_balance(self, rows: int) -> bool:
-        """Balance prefills whose largest DP rank reaches MOONEP_MIN_PLAN_TOKENS.
+    def _should_balance(self) -> bool:
+        """Balance every pass but unified decode.
 
-        Every input is agreed across the DP group, so all ranks take the same
+        The flags are agreed across the DP group, so all ranks take the same
         instance and the same prepare variant.
         """
 
         context = get_forward_context().context
-        if context is not None and not (
-            context.is_prefill or not context.running_tokens_are_unified
-        ):
-            return False
-        threshold = envs.MOONEP_MIN_PLAN_TOKENS
-        if threshold <= 0:
-            return True
-        dp_metadata = getattr(get_forward_context(), "dp_metadata", None)
-        tokens = rows if dp_metadata is None else dp_metadata.max_tokens_across_dp
-        return tokens >= threshold
+        return (
+            context is None
+            or context.is_prefill
+            or not context.running_tokens_are_unified
+        )
 
     def _mega(self, *, wide: bool, mtpr: int, topk: int):
         """The instance for one window, with this layer's weights bound."""
@@ -272,7 +268,7 @@ class MoonEPMegaExperts:
         topk = int(topk_ids.shape[1])
         mega = self._mega(wide=True, mtpr=self._mtpr, topk=topk)
         decode = self._decode_mega(topk)
-        balance = self._should_balance(rows)
+        balance = self._should_balance()
         kwargs = {}
         if balance or decode is None:
             if self._slot_state is None:

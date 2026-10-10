@@ -83,7 +83,7 @@ def _experts(monkeypatch, *, balance, fast_path=True, unified=True, tokens=16):
     obj._rank, obj._world_size, obj._experts_per_rank = 0, WORLD, EPR
     obj._prefetch_slots, obj._slot_state, obj._mask_pad_rows = B, None, False
     obj._pool, obj._parts = _FakePool(), ((False, False),) * len(mme._ADOPTED)
-    obj._should_balance = lambda rows: balance
+    obj._should_balance = lambda: balance
     return obj, built
 
 
@@ -152,27 +152,20 @@ def test_other_passes_keep_experts_home_in_the_wide_instance(
 
 
 @pytest.mark.parametrize(
-    "is_prefill, unified, rows, max_rows, expect",
+    "is_prefill, unified, expect",
     [
-        (True, True, 8192, 8192, True),
-        (True, True, 100, 100, False),
-        (True, True, 100, 8192, True),  # a peer is large: all ranks balance
-        (False, True, 8192, 8192, False),  # unified decode never balances
-        (False, False, 100, 8192, True),  # mixed batch counts as prefill
+        (True, True, True),  # every prefill balances, however small
+        (False, True, False),  # unified decode never balances
+        (False, False, True),  # mixed batch counts as prefill
     ],
 )
-def test_balance_gate_follows_the_dp_agreed_size(
-    monkeypatch, is_prefill, unified, rows, max_rows, expect
-):
-    monkeypatch.setenv("MOONEP_MIN_PLAN_TOKENS", "4096")
+def test_only_unified_decode_skips_balancing(monkeypatch, is_prefill, unified, expect):
     context = SimpleNamespace(is_prefill=is_prefill, running_tokens_are_unified=unified)
-    forward = SimpleNamespace(
-        context=context, dp_metadata=SimpleNamespace(max_tokens_across_dp=max_rows)
-    )
+    forward = SimpleNamespace(context=context)
     monkeypatch.setattr(mme, "get_forward_context", lambda: forward)
     obj = mme.MoonEPMegaExperts.__new__(mme.MoonEPMegaExperts)
 
-    assert obj._should_balance(rows) is expect
+    assert obj._should_balance() is expect
 
 
 @pytest.mark.parametrize(
