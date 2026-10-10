@@ -140,7 +140,6 @@ def get_or_build_mega_moe(
     w1_scale,
     w2,
     w2_scale,
-    moonep_slots=0,
 ):
     # swiglu_limit belongs in the key: aiter bakes the clamp into the GEMM1
     # kernel at trace time (gemm_util.py `if self._swiglu_limit <= 0`), so two
@@ -157,7 +156,6 @@ def get_or_build_mega_moe(
         quant,
         mtpr,
         swiglu_limit,
-        moonep_slots,
     )
     m = _MEGA_CACHE.get(key)
     if m is None:
@@ -185,8 +183,6 @@ def get_or_build_mega_moe(
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
                 swiglu_limit=swiglu_limit,
-                # Only MoonEP-capable aiter builds take this argument.
-                **({"moonep_slots": moonep_slots} if moonep_slots else {}),
             )
         _MEGA_CACHE[key] = m
         if rank == 0:

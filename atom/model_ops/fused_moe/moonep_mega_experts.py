@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MoonEP expert balancing inside MegaMoE v2.
+"""MoonEP expert balancing in front of MegaMoE v2.
 
 Each rank keeps its ``EPR`` resident experts plus ``B`` prefetch slots in one
-P2P-readable ``[EPR + B]`` weight window.  Every prefill runs a MegaMoEV2
-instance over ``R * (EPR + B)`` virtual experts: its prepare kernel already
-exchanges the route histogram, so it places hot experts' routes on other
-ranks there (MoonEP) and those ranks pull the experts' weights into their
-slots before Stage1.  Unified decode does not balance: it runs the plain
-``R * EPR`` decode-capacity instance where Mega's fixed-slot decode path
-applies (exactly 48 experts per rank), else the same wide instance with every
-expert on its owner, which shares its symmetric workspace instead of
-allocating a second one.
+P2P-readable ``[EPR + B]`` weight window.  Every prefill is planned first: the
+group exchanges its logical route histogram, places hot experts' routes on
+other ranks (MoonEP), rewrites each route to the virtual id of its replica and
+pulls the placed experts' weights into the slots.  An ordinary MegaMoEV2 over
+``R * (EPR + B)`` virtual experts then runs it unchanged.  Unified decode does
+not balance: it runs the plain ``R * EPR`` decode-capacity instance where
+Mega's fixed-slot decode path applies (exactly 48 experts per rank), else the
+same wide instance with every route on its owner, which shares its symmetric
+workspace instead of allocating a second one.
 """
 
 import logging
@@ -31,6 +31,8 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 _ADOPTED = ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
+# One planner per EP layout serves every layer, like the Mega instances.
+_PLANNERS: dict = {}
 
 
 class MoonEPMegaExperts:
@@ -200,7 +202,6 @@ class MoonEPMegaExperts:
             w1_scale=w1_scale,
             w2=w2,
             w2_scale=w2_scale,
-            moonep_slots=self._prefetch_slots if wide else 0,
         )
 
     def _decode_mega(self, topk: int):
@@ -231,12 +232,42 @@ class MoonEPMegaExperts:
             return None
         return narrow
 
-    def _fill_slots(self, mega) -> None:
-        """Copy the experts prepare placed on this rank into its slots,
-        skipping those a slot already holds."""
+    def _plan(self, ids: torch.Tensor) -> torch.Tensor:
+        """Balance ``ids`` over the group, fill this rank's slots, and return
+        the virtual ids of the replicas the routes were given."""
 
-        placed, prev = mega.moonep_slot_tables()
-        self._pool.prefetch(placed[self._rank], prev[self._rank])
+        from aiter.ops.flydsl.kernels.moonep_plan import MoonEPPlanner
+
+        key = (
+            self._rank,
+            self._world_size,
+            self._world_size * self._experts_per_rank,
+            self._prefetch_slots,
+            self._mtpr * int(ids.shape[1]),
+        )
+        planner = _PLANNERS.get(key)
+        if planner is None:
+            rank, world, experts, slots, routes = key
+            planner = _PLANNERS[key] = MoonEPPlanner(
+                rank=rank,
+                world_size=world,
+                experts=experts,
+                slots=slots,
+                max_routes=routes,
+            )
+        if self._slot_state is None:
+            self._slot_state = planner.new_slot_state()
+        virtual = planner.plan(ids, self._slot_state)
+        # Slots already holding their expert are skipped.
+        self._pool.prefetch(
+            self._slot_state["placed"][self._rank], self._slot_state["prev"][self._rank]
+        )
+        return virtual
+
+    def _home_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """Virtual ids keeping every route on its owner's own copy (-1 stays)."""
+        owner = ids.clamp(min=0) // self._experts_per_rank
+        return ids + owner * self._prefetch_slots
 
     def __call__(
         self,
@@ -266,27 +297,24 @@ class MoonEPMegaExperts:
         mega = self._mega(wide=True, mtpr=self._mtpr, topk=topk)
         decode = self._decode_mega(topk)
         balance = self._should_balance()
-        kwargs = {}
-        if balance or decode is None:
-            if self._slot_state is None:
-                self._slot_state = mega.new_moonep_slot_state()
-            mega.bind_moonep_slot_state(self._slot_state)
-            kwargs["moonep_balance"] = balance
-            if balance:
-                kwargs["after_prepare"] = lambda: self._fill_slots(mega)
-        else:
-            mega = decode
 
         wts = topk_weights.to(torch.float32).contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
+        kwargs = {}
         pad_rows = None
         if self._mask_pad_rows:
             from atom.utils.forward_context import step_pad_rows
 
             pad_rows = step_pad_rows(rows)
         if pad_rows is not None:
-            # Prepare neither counts nor places a -1 slot; combine zeroes it.
-            ids = torch.where(pad_rows, -1, ids)
+            # Neither planned nor counted by Mega; combine zeroes it.
+            ids = torch.where(pad_rows, -1, ids).contiguous()
             kwargs["mask_invalid_slots"] = True
         with torch.inference_mode(False), torch.no_grad():
+            if balance:
+                ids = self._plan(ids)
+            elif decode is None:
+                ids = self._home_ids(ids)
+            else:
+                mega = decode
             return mega.forward(hidden_states.contiguous(), wts, ids, **kwargs)
