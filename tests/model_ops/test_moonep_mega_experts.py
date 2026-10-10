@@ -154,9 +154,9 @@ def test_other_passes_keep_experts_home_in_the_wide_instance(
 @pytest.mark.parametrize(
     "is_prefill, unified, expect",
     [
-        (True, True, True),  # every prefill balances, however small
-        (False, True, False),  # unified decode never balances
-        (False, False, True),  # mixed batch counts as prefill
+        (True, False, True),  # every prefill balances, however small
+        (False, True, False),  # the whole group decoding never balances
+        (False, False, True),  # decoding while a DP peer prefills balances too
     ],
 )
 def test_only_unified_decode_skips_balancing(monkeypatch, is_prefill, unified, expect):

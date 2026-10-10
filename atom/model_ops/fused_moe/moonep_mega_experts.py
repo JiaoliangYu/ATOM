@@ -167,18 +167,15 @@ class MoonEPMegaExperts:
         return window
 
     def _should_balance(self) -> bool:
-        """Balance every pass but unified decode.
+        """Balance unless the whole DP group is decoding.
 
-        The flags are agreed across the DP group, so all ranks take the same
-        instance and the same prepare variant.
+        Every EP rank must run the same prepare variant, so this reads the
+        DP-agreed flag rather than this rank's own ``is_prefill``: a rank
+        decoding while a peer prefills balances along with it.
         """
 
         context = get_forward_context().context
-        return (
-            context is None
-            or context.is_prefill
-            or not context.running_tokens_are_unified
-        )
+        return context is None or not context.running_tokens_are_unified
 
     def _mega(self, *, wide: bool, mtpr: int, topk: int):
         """The instance for one window, with this layer's weights bound."""
