@@ -1180,10 +1180,7 @@ class DeepseekV2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            # EPLB indexes ExpertLocationMetadata and the load monitor by this
-            # id. It has to be the checkpoint layer index (MTP included:
-            # num_hidden_layers + spec step). A draft-local 0 collides with the
-            # target's first MoE row and remaps the draft onto the wrong weights.
+            # EPLB indexes its per-layer tables by the checkpoint layer index.
             layer_id=layer_id,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
@@ -3119,7 +3116,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
-                layer_id=layer_idx,
+                layer_id=None if is_mtp_block else layer_idx,
             )
         else:
             self.mlp = DeepseekV2MLP(

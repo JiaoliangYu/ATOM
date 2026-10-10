@@ -146,44 +146,20 @@ class _FakeEpMoe(torch.nn.Module):
 class _FakeTarget(torch.nn.Module):
     """DSR1-shaped: dense layers have no expert weights; MoE ids start at 3."""
 
-    def __init__(self):
+    def __init__(self, second_moe_id: int = 4):
         super().__init__()
         self.dense0 = torch.nn.Identity()
         self.moe3 = _FakeEpMoe(3)
-        self.moe4 = _FakeEpMoe(4)
+        self.moe4 = _FakeEpMoe(second_moe_id)
 
 
-class _FakeDraft(torch.nn.Module):
-    def __init__(self, layer_id: int = 61):
-        super().__init__()
-        self.moe = _FakeEpMoe(layer_id)
-
-
-def _owner_with_draft(draft_layer_id: int = 61):
-    owner = type("Owner", (), {})()
-    owner.model = _FakeTarget()
-    owner.drafter = type("Drafter", (), {})()
-    owner.drafter.model = _FakeDraft(draft_layer_id)
-    return owner
-
-
-def test_dsr1_eplb_collects_gapped_target_and_mtp_layer_ids():
-    owner = _owner_with_draft()
-    layers = eplb.collect_ep_moe_layers(eplb.eplb_model_roots(owner))
-    assert sorted(layers) == [3, 4, 61]
-    assert layers[3] is owner.model.moe3
-    assert layers[61] is owner.drafter.model.moe
-
-
-def test_dsr1_eplb_rejects_draft_local_layer_id_collision():
-    owner = _owner_with_draft(draft_layer_id=3)
-    with pytest.raises(RuntimeError, match="layer_id=3"):
-        eplb.collect_ep_moe_layers(eplb.eplb_model_roots(owner))
-
-
-def test_eplb_roots_skip_missing_drafter():
-    owner = type("Owner", (), {})()
-    owner.model = _FakeTarget()
-    assert eplb.eplb_model_roots(owner) == [owner.model]
-    layers = eplb.collect_ep_moe_layers(eplb.eplb_model_roots(owner))
+def test_dsr1_eplb_collects_gapped_layer_ids():
+    model = _FakeTarget()
+    layers = eplb.collect_ep_moe_layers(model)
     assert sorted(layers) == [3, 4]
+    assert layers[3] is model.moe3
+
+
+def test_eplb_rejects_duplicate_layer_id():
+    with pytest.raises(RuntimeError, match="layer_id=3"):
+        eplb.collect_ep_moe_layers(_FakeTarget(second_moe_id=3))

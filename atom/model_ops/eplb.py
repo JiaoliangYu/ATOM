@@ -1613,60 +1613,23 @@ def get_live_expert_location_metadata() -> ExpertLocationMetadata | None:
     return _MANAGER.live_metadata if _MANAGER is not None else None
 
 
-def eplb_model_roots(owner: Any) -> list[Any]:
-    """Models whose EP MoE layers EPLB must own.
-
-    The target is ``owner.model``. A speculative drafter is a sibling, not a
-    child of that module, so ``model.modules()`` never sees MTP experts. Those
-    still dispatch through the same EPLB metadata and have to be registered or
-    their checkpoint layer ids index off the end of the table.
-    """
-    roots: list[Any] = []
-    model = getattr(owner, "model", None)
-    if model is not None and hasattr(model, "modules"):
-        roots.append(model)
-    drafter = getattr(owner, "drafter", None)
-    draft_model = getattr(drafter, "model", None) if drafter is not None else None
-    if (
-        draft_model is not None
-        and hasattr(draft_model, "modules")
-        and all(draft_model is not root for root in roots)
-    ):
-        roots.append(draft_model)
-    return roots
-
-
-def collect_ep_moe_layers(roots: list[Any]) -> dict[int, Any]:
-    """Map checkpoint layer id -> EP MoE module (the one that owns expert weights).
-
-    ``layer_id`` must be the checkpoint index. DeepSeek-R1's first layers are
-    dense, so MoE ids start at ``first_k_dense_replace``; MTP continues at
-    ``num_hidden_layers``. A draft-local id of 0 would alias the target row.
-    """
+def collect_ep_moe_layers(model: Any) -> dict[int, Any]:
+    """Map checkpoint layer id -> EP MoE module that owns expert weights."""
     layers: dict[int, Any] = {}
-    for root in roots:
-        if root is None or not hasattr(root, "modules"):
+    for module in model.modules():
+        layer_id = getattr(module, "layer_id", None)
+        if isinstance(layer_id, bool) or not isinstance(layer_id, int):
             continue
-        for module in root.modules():
-            layer_id = getattr(module, "layer_id", None)
-            # bool is a subclass of int; it is not a layer index.
-            if isinstance(layer_id, bool) or not isinstance(layer_id, int):
-                continue
-            if not bool(getattr(module, "use_ep", False)):
-                continue
-            if not all(hasattr(module, name) for name in ("w13_weight", "w2_weight")):
-                continue
-            previous = layers.get(layer_id)
-            if previous is module:
-                continue
-            if previous is not None:
-                raise RuntimeError(
-                    "EPLB found two EP MoE layers with the same layer_id="
-                    f"{layer_id}. Use the checkpoint layer index (DeepSeek-R1 "
-                    "MTP is num_hidden_layers + spec step). A draft-local id "
-                    "collides with the target and would remap the wrong experts."
-                )
-            layers[layer_id] = module
+        if not bool(getattr(module, "use_ep", False)):
+            continue
+        if not all(hasattr(module, name) for name in ("w13_weight", "w2_weight")):
+            continue
+        if layers.get(layer_id, module) is not module:
+            raise RuntimeError(
+                f"EPLB found two EP MoE layers with layer_id={layer_id}; "
+                "layer_id must be the checkpoint layer index"
+            )
+        layers[layer_id] = module
     return layers
 
 
@@ -1749,14 +1712,14 @@ class EPLBManager:
     def _maybe_initialize_runtime(self, owner: Any) -> None:
         if self.live_metadata is not None:
             return
-        roots = eplb_model_roots(owner)
-        if not roots:
+        model = getattr(owner, "model", None)
+        if model is None or not hasattr(model, "modules"):
             raise RuntimeError(
                 "EPLB is enabled but the runtime owner has no model.modules(); "
                 "cannot initialize manager-owned ExpertLocationMetadata"
             )
 
-        layers = collect_ep_moe_layers(roots)
+        layers = collect_ep_moe_layers(model)
         if not layers:
             raise RuntimeError(
                 "EPLB is enabled but no EP MoE layers with expert weights "
@@ -1794,6 +1757,7 @@ class EPLBManager:
                     f"ep_size={ep_size}"
                 )
         device = first_layer.w13_weight.device
+        # Rows of leading dense layers stay zero-load and are never migrated.
         self.live_metadata = ExpertLocationMetadata.from_trivial(
             num_layers=max(layers) + 1,
             num_logical_experts=num_logical,
@@ -2525,6 +2489,8 @@ def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:
     EPLB covers the target model's MoE layers only. Drafter/MTP MoE layers
     (e.g. the DSpark drafter's layer 61 on DSV4-Pro) are never migrated, so
     their logical ids already are physical ids and their load is not tracked.
+    Redundant slots do not change that: an EPLB-routed shared expert is a
+    logical id and loads into physical slot e like the routed experts.
     """
     return (
         meta is not None
