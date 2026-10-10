@@ -140,11 +140,10 @@ support_model_arch_dict = {
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
 }
-# Mono decode for an architecture whose registered class is itself the compiled
-# model, so the routing cannot sit in its forward: the installer wraps the
-# loaded model (after the drafter armed its hooks on the unwrapped layers), and
-# may add per-step buffers to the metadata builder before they are bound.
-# Architectures with an uncompiled outer class route inside it instead.
+# Mono decode by wrapping the loaded model: the installer runs after the drafter
+# armed its hooks on the unwrapped layers, and may add per-step buffers to the
+# metadata builder before they are bound. Architectures not listed here route
+# mono decode inside their own model class instead.
 mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
@@ -2678,6 +2677,7 @@ class ModelRunner:
             dp_size=dp_size,
             dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
             enforce_eager=self.enforce_eager,
+            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch),
             capture_sizes=self.capture_sizes_np,
             captured_tokens=(
                 self._piecewise_sorted_tokens if self._piecewise_cg_active() else None
