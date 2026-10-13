@@ -16,6 +16,7 @@ workspace instead of allocating a second one.
 import logging
 
 import torch
+from atom.plugin import is_plugin_mode
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.flydsl_mega_experts import (
@@ -24,7 +25,6 @@ from atom.model_ops.fused_moe.flydsl_mega_experts import (
     _select_decode_mtpr,
     get_or_build_mega_moe,
 )
-from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -49,8 +49,8 @@ class MoonEPMegaExperts:
 
         if getattr(get_current_atom_config(), "eplb_enable", False):
             raise ValueError("ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB")
-        # Reading all2all_manager initializes the mori symmetric heap that the
-        # weight pools are mapped from.
+        # build_mega_weights already initialized this manager before creating
+        # the symmetric weight pool; read it again for the EP geometry.
         ep = get_ep_group()
         am = ep.device_communicator.all2all_manager
         logger.info(
@@ -68,7 +68,6 @@ class MoonEPMegaExperts:
             world_size=int(am.world_size),
             num_experts=moe.num_experts,
             prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
-            group=ep.cpu_group,
         )
 
     def __init__(
@@ -82,11 +81,9 @@ class MoonEPMegaExperts:
         world_size: int,
         num_experts: int,
         prefetch_slots: int,
-        group=None,
         quant: str = "a8w4",
     ) -> None:
-        """``rank``/``world_size`` are positions in ``group``, the EP CPU process
-        group the weight pools bootstrap over."""
+        """``rank``/``world_size`` identify the initialized Mori EP group."""
         if world_size not in (4, 8):
             raise ValueError(f"MoonEP supports EP4 and EP8, got EP{world_size}")
         # Mega allocates on cuda:<rank>, so the EP rank must be the local device.
@@ -110,20 +107,42 @@ class MoonEPMegaExperts:
         self._experts_per_rank = num_experts // world_size
         self._prefetch_slots = prefetch_slots
         self._quant = quant
-        self._group = group
         self._slot_state = None
         self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
         self._pool, self._parts = self._adopt(layer)
 
     def _adopt(self, layer: torch.nn.Module):
-        """Move this layer's Mega weights and scales into one P2P-readable pool
-        with a ``[EPR + B]`` window per tensor."""
+        """Validate and take over the pool populated during weight shuffle."""
 
         from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
 
         epn = self._experts_per_rank
-        params, homes, parts, layouts = [], [], [], []
-        for name in _ADOPTED:
+        pool = getattr(layer, "_moonep_weight_pool", None)
+        if not isinstance(pool, MoonEPWeightPool):
+            raise TypeError(
+                "MoonEP weights were not built in symmetric storage; "
+                "build_mega_weights() must run with ATOM_ENABLE_MOONEP=1"
+            )
+        geometry = (
+            pool.rank,
+            pool.world_size,
+            pool.experts_per_rank,
+            pool.prefetch_slots,
+        )
+        expected_geometry = (
+            self._rank,
+            self._world_size,
+            epn,
+            self._prefetch_slots,
+        )
+        if geometry != expected_geometry:
+            raise ValueError(
+                "MoonEP weight-pool geometry changed between build and adopt: "
+                f"built={geometry}, runtime={expected_geometry}"
+            )
+
+        parts, layouts = [], []
+        for index, name in enumerate(_ADOPTED):
             param = getattr(layer, name, None)
             if param is None or param.data is None:
                 raise ValueError(f"MoonEP needs layer.{name}")
@@ -136,23 +155,24 @@ class MoonEPMegaExperts:
                     f"leading dim is neither {epn} nor a multiple of it"
                 )
             home = resident.reshape(epn, -1, *resident.shape[1:]) if flat else resident
-            params.append(param)
-            homes.append(home)
-            parts.append((tuple(home.shape[1:]), resident.dtype))
+            pool_home = pool.home[index]
+            if (
+                tuple(home.shape) != tuple(pool_home.shape)
+                or home.dtype != pool_home.dtype
+            ):
+                raise ValueError(
+                    f"{name} does not match pool part {index}: tensor "
+                    f"{tuple(home.shape)} {home.dtype}, pool "
+                    f"{tuple(pool_home.shape)} {pool_home.dtype}"
+                )
+            if home.data_ptr() != pool_home.data_ptr():
+                raise ValueError(
+                    f"{name} is not an alias of its symmetric pool home rows"
+                )
+            parts.append((tuple(pool_home.shape[1:]), pool_home.dtype))
             layouts.append((flat, bool(getattr(param, "is_shuffled", False))))
-        pool = MoonEPWeightPool(
-            rank=self._rank,
-            world_size=self._world_size,
-            experts_per_rank=epn,
-            prefetch_slots=self._prefetch_slots,
-            parts=parts,
-            group=self._group,
-        )
-        pool.stage_home(homes)
-        for param, home in zip(params, pool.home):
-            param.data = home.reshape(param.data.shape)
         logger.info(
-            "MoonEP adopted %s: %d resident + %d prefetch slots",
+            "MoonEP using symmetric %s: %d resident + %d prefetch slots",
             ", ".join(f"{n}{list(s)} {d}" for n, (s, d) in zip(_ADOPTED, parts)),
             epn,
             self._prefetch_slots,
