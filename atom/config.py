@@ -1654,6 +1654,20 @@ class EPLBConfig:
     #   "biased" -> fully replicate top-K hottest experts to all GPUs
     #               (K = num_redundant // num_gpus, per-node in multi-node)
     placement_policy: str = "naive"
+    # Decode expert swap: every `decode_rebalance_interval` pure-decode steps,
+    # swap a few experts between the busiest and idlest GPU of each layer by the
+    # decode load. 0 disables it.
+    decode_rebalance_interval: int = 0
+    decode_max_swaps_per_layer: int = 8
+    # Stop swapping a layer once a swap lowers its busiest GPU by less than this.
+    decode_min_swap_gain: float = 0.03
+    # 0 = no limit.
+    decode_max_rebalances: int = 0
+    # Which DecodeSwapPolicy function picks the swaps.
+    decode_swap_policy: str = "greedy_hot_cold"
+    # Leave a layer alone when its per-GPU decode balancedness (mean/max) is at
+    # least this.
+    decode_min_layer_balancedness: float = 0.9
 
     def __post_init__(self):
         self.load_window_size = int(self.load_window_size)
@@ -1686,6 +1700,28 @@ class EPLBConfig:
             "naive",
             "biased",
         }, "eplb.placement_policy must be one of {'naive','biased'}"
+        self.decode_rebalance_interval = int(self.decode_rebalance_interval)
+        assert (
+            self.decode_rebalance_interval >= 0
+        ), "eplb.decode_rebalance_interval must be >= 0"
+        self.decode_max_swaps_per_layer = int(self.decode_max_swaps_per_layer)
+        assert (
+            self.decode_max_swaps_per_layer > 0
+        ), "eplb.decode_max_swaps_per_layer must be > 0"
+        self.decode_min_swap_gain = float(self.decode_min_swap_gain)
+        assert (
+            0.0 <= self.decode_min_swap_gain < 1.0
+        ), "eplb.decode_min_swap_gain must be in [0, 1)"
+        self.decode_max_rebalances = int(self.decode_max_rebalances)
+        self.decode_swap_policy = str(self.decode_swap_policy).lower().strip()
+        assert self.decode_swap_policy in {
+            "greedy_hot_cold",
+            "greedy_activation",
+        }, "eplb.decode_swap_policy must be one of {'greedy_hot_cold', 'greedy_activation'}"
+        self.decode_min_layer_balancedness = float(self.decode_min_layer_balancedness)
+        assert (
+            0.0 < self.decode_min_layer_balancedness <= 1.0
+        ), "eplb.decode_min_layer_balancedness must be in (0, 1]"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "EPLBConfig":
