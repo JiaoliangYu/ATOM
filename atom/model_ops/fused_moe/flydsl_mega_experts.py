@@ -42,10 +42,10 @@ import logging
 import os
 
 import torch
-from atom.plugin import is_plugin_mode
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
 logger = logging.getLogger("atom")

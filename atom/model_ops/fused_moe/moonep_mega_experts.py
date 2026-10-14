@@ -16,7 +16,6 @@ workspace instead of allocating a second one.
 import logging
 
 import torch
-from atom.plugin import is_plugin_mode
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.flydsl_mega_experts import (
@@ -25,6 +24,7 @@ from atom.model_ops.fused_moe.flydsl_mega_experts import (
     _select_decode_mtpr,
     get_or_build_mega_moe,
 )
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
