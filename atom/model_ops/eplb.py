@@ -2627,6 +2627,73 @@ def record_eplb_expert_load(layer: Any, topk_physical: torch.Tensor) -> None:
 if _EPLB_HAS_TRITON:
 
     @triton.jit
+    def _eplb_append_shared_map_kernel(
+        topk_weights_ptr,  # [num_tokens, TOP_K_IN]
+        topk_ids_ptr,  # [num_tokens, TOP_K_IN]
+        dispatch_ptr,  # [num_logical]
+        l2p_ptr,  # [num_logical, R]
+        cnt_ptr,  # [num_logical]
+        out_weights_ptr,  # [num_tokens, TOP_K_OUT]
+        out_ids_ptr,  # [num_tokens, TOP_K_OUT]
+        load_ptr,  # [num_physical], used only when RECORD
+        shared_base,
+        shared_weight,
+        num_logical,
+        id_delta,
+        num_physical,
+        R,
+        numel_out,
+        BLOCK: tl.constexpr,
+        NUM_BINS: tl.constexpr,
+        TOP_K_IN: tl.constexpr,
+        TOP_K_OUT: tl.constexpr,
+        RECORD: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < numel_out
+        token_idx = offs // TOP_K_OUT
+        col = offs % TOP_K_OUT
+        is_shared = col >= TOP_K_IN
+        in_offs = token_idx * TOP_K_IN + tl.minimum(col, TOP_K_IN - 1)
+
+        routed_weight = tl.load(
+            topk_weights_ptr + in_offs, mask=mask & ~is_shared, other=0.0
+        )
+        weight = tl.where(is_shared, shared_weight, routed_weight)
+        tl.store(out_weights_ptr + offs, weight, mask=mask)
+
+        routed_lid = tl.load(
+            topk_ids_ptr + in_offs, mask=mask & ~is_shared, other=-1
+        ).to(tl.int64)
+        shared_lid = shared_base + (col - TOP_K_IN)
+        lid = tl.where(is_shared, shared_lid, routed_lid)
+        valid = (lid >= 0) & (lid < num_logical)
+        is_tail = lid >= num_logical
+        safe_lid = tl.where(valid, lid, 0)
+        mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(
+            tl.int64
+        )
+        need_spread = valid & (mapped < 0)
+        cnt = tl.load(cnt_ptr + safe_lid, mask=mask & valid, other=1).to(tl.int64)
+        cnt = tl.maximum(cnt, 1)
+        replica_idx = ((token_idx.to(tl.int64) * 2654435769) & 0xFFFFFFFF) % cnt
+        remote = tl.load(
+            l2p_ptr + safe_lid * R + replica_idx,
+            mask=mask & need_spread,
+            other=0,
+        ).to(tl.int64)
+        mapped = tl.where(need_spread, remote, mapped)
+        phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
+        tl.store(out_ids_ptr + offs, phys, mask=mask)
+
+        if RECORD:
+            in_range = mask & (phys >= 0) & (phys < num_physical)
+            bin_idx = tl.where(in_range, phys, num_physical).to(tl.int32)
+            hist = tl.histogram(bin_idx, NUM_BINS)
+            bins = tl.arange(0, NUM_BINS)
+            tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
+
+    @triton.jit
     def _eplb_remap_kernel(
         topk_ids_ptr,  # [numel]           logical ids (in dtype)
         dispatch_ptr,  # [num_logical]     this rank's logical->local physical, or -1
@@ -2717,6 +2784,92 @@ if _EPLB_HAS_TRITON:
         tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
 
+def eplb_append_shared_and_map(
+    layer: Any,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append routed shared experts and remap all ids in one Triton launch."""
+    meta = get_live_expert_location_metadata()
+    layer_id = getattr(layer, "layer_id", None)
+    if not _EPLB_HAS_TRITON or not _eplb_owns_layer(meta, layer_id):
+        out_weights, out_ids = layer.append_shared_logical_column(
+            topk_weights, topk_ids
+        )
+        return out_weights, eplb_map_and_record_fused(layer, out_ids)
+
+    assert topk_weights.dim() == 2 and topk_ids.dim() == 2
+    assert topk_weights.shape == topk_ids.shape
+    num_shared = int(getattr(layer, "num_fused_shared_experts", 0))
+    assert num_shared > 0
+    num_tokens, top_k_in = topk_ids.shape
+    top_k_out = top_k_in + num_shared
+    out_shape = (num_tokens, top_k_out)
+    out_weights = torch.empty(
+        out_shape, dtype=topk_weights.dtype, device=topk_weights.device
+    )
+    out_ids = torch.empty(out_shape, dtype=topk_ids.dtype, device=topk_ids.device)
+    if out_ids.numel() == 0:
+        return out_weights, out_ids
+
+    dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
+    l2p = meta.logical_to_physical_map[layer_id]
+    cnt = meta.logical_replica_count[layer_id]
+    if dispatch.device != topk_ids.device:
+        dispatch = dispatch.to(topk_ids.device)
+    if l2p.device != topk_ids.device:
+        l2p = l2p.to(topk_ids.device)
+    if cnt.device != topk_ids.device:
+        cnt = cnt.to(topk_ids.device)
+
+    num_logical = int(dispatch.numel())
+    num_physical = int(meta.num_physical_experts)
+    num_replicas = int(l2p.shape[-1])
+    shared_base = int(layer.expert_layout.num_routed)
+    assert shared_base + num_shared <= num_logical
+
+    from atom.config import get_current_atom_config
+
+    load_buf = None
+    atom_cfg = get_current_atom_config()
+    if _EPLB_RECORD_LOAD.get() and bool(getattr(atom_cfg, "eplb_enable", False)):
+        monitor = get_expert_load_monitor(
+            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+        )
+        load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+    record = load_buf is not None
+    dummy_load_buf = out_ids if load_buf is None else load_buf
+    numel_out = out_ids.numel()
+    num_bins = 1 << num_physical.bit_length()
+
+    def grid(meta_kw):
+        return (triton.cdiv(numel_out, meta_kw["BLOCK"]),)
+
+    _eplb_append_shared_map_kernel[grid](
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        dispatch,
+        l2p,
+        cnt,
+        out_weights,
+        out_ids,
+        dummy_load_buf,
+        shared_base,
+        float(layer.shared_expert_weight),
+        num_logical,
+        num_physical - num_logical,
+        num_physical,
+        num_replicas,
+        numel_out,
+        BLOCK=256,
+        NUM_BINS=num_bins,
+        TOP_K_IN=top_k_in,
+        TOP_K_OUT=top_k_out,
+        RECORD=record,
+    )
+    return out_weights, out_ids
+
+
 def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
     """Fused logical->physical remap + expert-load record (one Triton launch).
 
@@ -2762,9 +2915,9 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
         cnt = cnt.to(topk_ids.device)
     num_replicas = int(l2p.shape[-1])
 
-    # Resolve record buffer (== _cur_pass_count[layer_id]); None disables it.
-    # eplb_enable is static (server lifetime), so RECORD is a compile-time
-    # constexpr -> cudagraph capture fixes it, no per-step host branch.
+    # Resolve record buffer (== _cur_pass_count[layer_id]); the forward phase
+    # context disables it for decode/dummy capture. Each launched variant still
+    # has a compile-time RECORD choice, so decode graphs capture remap-only.
     from atom.config import get_current_atom_config
 
     load_buf = None
