@@ -712,6 +712,7 @@ class ExpertLocationMetadata:
         num_physical_experts: int | None = None,
         ep_size: int,
         ep_rank: int,
+        shared_logical_expert: int | None = None,
         device: torch.device | None = None,
     ) -> ExpertLocationMetadata:
         """Initial placement following the SGLang/vllm convention.
@@ -720,6 +721,10 @@ class ExpertLocationMetadata:
         Redundant slots are assigned valid logical experts immediately (no -1
         cold-start gap), matching the round-robin used by both SGLang
         (init_trivial) and vllm (build_initial_global_physical_to_logical_map).
+
+        When ``shared_logical_expert`` is set, that expert instead occupies the
+        last slot of every rank block. This gives a routed shared expert one
+        local replica per EP rank from the first forward.
         """
         dev = device if device is not None else torch.device("cpu")
         num_physical = (
@@ -729,6 +734,52 @@ class ExpertLocationMetadata:
         )
         assert num_physical >= num_logical_experts
         num_redundant = num_physical - num_logical_experts
+
+        if shared_logical_expert is not None:
+            assert num_physical % ep_size == 0
+            assert 0 <= shared_logical_expert < num_logical_experts
+            assert num_redundant >= ep_size - 1, (
+                "replicating the shared expert on every rank requires at least "
+                f"ep_size - 1 redundant slots, got {num_redundant} for "
+                f"ep_size={ep_size}"
+            )
+
+            # Fill every rank block with ordinary logical experts and reserve
+            # its final slot for the shared expert. For DSR1 EP4 this is:
+            #   [0..63, shared], [64..127, shared], ...
+            other = torch.arange(
+                num_physical - ep_size, dtype=torch.int32, device=dev
+            ).remainder(num_logical_experts - 1)
+            other += (other >= shared_logical_expert).to(other.dtype)
+            p2l_row = torch.cat(
+                (
+                    other.reshape(ep_size, -1),
+                    torch.full(
+                        (ep_size, 1),
+                        shared_logical_expert,
+                        dtype=torch.int32,
+                        device=dev,
+                    ),
+                ),
+                dim=1,
+            ).reshape(-1)
+            p2l = p2l_row.unsqueeze(0).expand(num_layers, -1).contiguous()
+            _, physical_rank_row, logcnt_row = _rebuild_placement_from_p2l(
+                p2l_row, num_logical_experts
+            )
+            physical_rank = (
+                physical_rank_row.unsqueeze(0).expand(num_layers, -1).contiguous()
+            )
+            logcnt = logcnt_row.unsqueeze(0).expand(num_layers, -1).contiguous()
+            l2p = _build_logical_to_physical_map(p2l, physical_rank, logcnt)
+            return cls.from_rebalance_result(
+                physical_to_logical_map=p2l,
+                logical_to_physical_map=l2p,
+                logical_replica_count=logcnt,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                max_num_replicas=num_redundant + 1,
+            )
 
         # p2l: slot i → logical i % num_logical (round-robin)
         p2l = (
@@ -1757,6 +1808,16 @@ class EPLBManager:
                     f"ep_size={ep_size}"
                 )
         device = first_layer.w13_weight.device
+        expert_layout = getattr(first_layer, "expert_layout", None)
+        shared_logical_expert = None
+        if bool(getattr(expert_layout, "shared_is_routed", False)):
+            num_shared = int(getattr(expert_layout, "num_fused_shared_experts", 0))
+            if num_shared != 1:
+                raise NotImplementedError(
+                    "EPLB initial local placement currently supports exactly one "
+                    f"routed shared expert, got {num_shared}"
+                )
+            shared_logical_expert = int(expert_layout.num_routed)
         # Rows of leading dense layers stay zero-load and are never migrated.
         self.live_metadata = ExpertLocationMetadata.from_trivial(
             num_layers=max(layers) + 1,
@@ -1764,6 +1825,7 @@ class EPLBManager:
             num_physical_experts=num_physical,
             ep_size=ep_size,
             ep_rank=ep_rank,
+            shared_logical_expert=shared_logical_expert,
             device=device,
         )
         self._moe_layers = layers
@@ -1957,27 +2019,18 @@ class EPLBManager:
                 layer.expert_mask = (runtime_map > -1).to(torch.int32)
 
     def _assert_placement_matches_loaded(self) -> None:
-        """Sanity-check the trivial placement against the checkpoint loader.
+        """Sanity-check the checkpoint loader's physical-slot ownership.
 
-        `from_trivial` declares the initial physical->logical placement and
-        derives expert_map independently; the model loader (determine_expert_map +
-        weight_loader) established its own. They MUST agree, else migration and
-        dispatch operate on a wrong picture. Both are layer-invariant, so checking
-        one representative MoE layer suffices. Assert instead of trusting blindly:
-          - base p2l is identity (loader convention: logical e -> physical slot e);
-          - our expert_map equals the loader's layer.expert_map.
+        The loader starts from logical e in physical slot e. ``fill_redundant``
+        migrates that base-only state into ``live_metadata`` (which may already
+        place a shared expert once per rank). Slot ownership itself is fixed by
+        the EP topology, so the metadata expert_map must still equal the loader's
+        map before that migration begins.
         """
         assert self.live_metadata is not None
         m = self.live_metadata
-        num_logical = m.num_logical_experts
         num_physical = m.num_physical_experts
         layer_id = min(self._moe_layers)
-        base = m.physical_to_logical_map[layer_id, :num_logical]
-        expected = torch.arange(num_logical, dtype=base.dtype, device=base.device)
-        assert torch.equal(base, expected), (
-            "EPLB initial placement base p2l is not identity; incompatible with "
-            "the checkpoint loader (logical e must load into physical slot e)"
-        )
         loaded = getattr(self._moe_layers[layer_id], "expert_map", None)
         if isinstance(loaded, torch.Tensor):
             ours = m.expert_map[layer_id].to(loaded.device)
@@ -2017,15 +2070,13 @@ class EPLBManager:
         )
 
     def fill_redundant(self) -> None:
-        """One-time init copy of each logical expert into its redundant physical
-        replica slots.
+        """One-time migration from the loader layout to the initial placement.
 
         The checkpoint loader only fills base slots (physical id < num_logical);
-        the redundant slots declared by `from_trivial` are uninitialized after
-        load, so dispatch to them before the first rebalance would read garbage.
-        This makes the loaded weights match the trivial placement by reusing the
-        migrate+commit path (old = base-only, new = live) -- a plain P2P copy from
-        the base holders. No-op when there are no redundant experts.
+        redundant slots are uninitialized and a rank-local shared layout also
+        moves some base experts. Reuse the migrate+commit path to make the loaded
+        weights match ``live_metadata`` before the first forward. No-op when
+        there are no redundant experts.
         """
         assert self.live_metadata is not None
         if self._ep_group is None or not self._moe_layers:
