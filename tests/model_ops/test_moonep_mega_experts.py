@@ -207,3 +207,45 @@ def test_rejects_eplb(monkeypatch):
     monkeypatch.setattr(mme, "get_current_atom_config", lambda: config)
     with pytest.raises(ValueError, match="EPLB"):
         mme.MoonEPMegaExperts.for_layer(None, None, model_dim=8, inter_dim=8)
+
+
+def test_for_layer_reuses_the_weight_pools_ep_geometry(monkeypatch):
+    config = SimpleNamespace(eplb_enable=False)
+    monkeypatch.setattr(mme, "get_current_atom_config", lambda: config)
+    pool = SimpleNamespace(rank=1, world_size=4, prefetch_slots=7)
+    layer = SimpleNamespace(_moonep_weight_pool=pool)
+    moe = SimpleNamespace(max_num_tokens=4096, num_experts=384)
+    captured = {}
+
+    def fake_init(self, adopted_layer, **kwargs):
+        captured["layer"] = adopted_layer
+        captured.update(kwargs)
+
+    monkeypatch.setattr(mme.MoonEPMegaExperts, "__init__", fake_init)
+
+    result = mme.MoonEPMegaExperts.for_layer(layer, moe, model_dim=7168, inter_dim=2048)
+
+    assert isinstance(result, mme.MoonEPMegaExperts)
+    assert captured == {
+        "layer": layer,
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "mtpr": 4096,
+        "rank": 1,
+        "world_size": 4,
+        "num_experts": 384,
+        "prefetch_slots": 7,
+    }
+
+
+def test_for_layer_requires_the_pool_built_by_weight_prep(monkeypatch):
+    config = SimpleNamespace(eplb_enable=False)
+    monkeypatch.setattr(mme, "get_current_atom_config", lambda: config)
+
+    with pytest.raises(RuntimeError, match="symmetric weight pool was not built"):
+        mme.MoonEPMegaExperts.for_layer(
+            SimpleNamespace(),
+            SimpleNamespace(max_num_tokens=4096, num_experts=384),
+            model_dim=7168,
+            inter_dim=2048,
+        )

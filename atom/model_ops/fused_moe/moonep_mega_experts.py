@@ -45,29 +45,28 @@ class MoonEPMegaExperts:
     @classmethod
     def for_layer(cls, layer: torch.nn.Module, moe, *, model_dim: int, inter_dim: int):
         """Take over ``layer``'s Mega weights on this rank of the EP group."""
-        from aiter.dist.parallel_state import get_ep_group
-
         if getattr(get_current_atom_config(), "eplb_enable", False):
             raise ValueError("ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB")
-        # build_mega_weights already initialized this manager before creating
-        # the symmetric weight pool; read it again for the EP geometry.
-        ep = get_ep_group()
-        am = ep.device_communicator.all2all_manager
+        pool = getattr(layer, "_moonep_weight_pool", None)
+        if pool is None:
+            raise RuntimeError(
+                "MoonEP symmetric weight pool was not built before for_layer()"
+            )
         logger.info(
             "MoonEP active over MegaMoE: rank=%d world=%d prefetch_slots=%d",
-            am.rank,
-            am.world_size,
-            envs.MOONEP_PREFETCH_SLOTS,
+            pool.rank,
+            pool.world_size,
+            pool.prefetch_slots,
         )
         return cls(
             layer,
             model_dim=model_dim,
             inter_dim=inter_dim,
             mtpr=moe.max_num_tokens,
-            rank=int(am.rank),
-            world_size=int(am.world_size),
+            rank=int(pool.rank),
+            world_size=int(pool.world_size),
             num_experts=moe.num_experts,
-            prefetch_slots=envs.MOONEP_PREFETCH_SLOTS,
+            prefetch_slots=int(pool.prefetch_slots),
         )
 
     def __init__(
