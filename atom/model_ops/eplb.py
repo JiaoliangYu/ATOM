@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any
@@ -25,6 +26,11 @@ import logging
 logger = logging.getLogger("atom")
 
 BufferCopyPlan = list[tuple[int, int]]
+
+# The forward wrapper sets this before entering the model. Decode, dummy runs,
+# and decode CUDA-graph capture only need logical->physical remapping; real
+# pure-prefill forwards additionally record the EPLB load histogram.
+_EPLB_RECORD_LOAD: ContextVar[bool] = ContextVar("_EPLB_RECORD_LOAD", default=True)
 
 
 @dataclass(frozen=True)
@@ -2509,25 +2515,25 @@ def with_eplb_forward_monitor(fn):
         if manager is None or manager.live_metadata is None:
             return fn(self, batch, *args, **kwargs)
         monitor = manager.monitor
-        monitor.on_forward_start()
+        is_dummy_run = getattr(batch, "is_dummy_run", False)
+        has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+        is_pure_prefill = (
+            has_prefill and getattr(batch, "total_tokens_num_decode", 0) == 0
+        )
+        record_load = not is_dummy_run and is_pure_prefill
+        record_token = _EPLB_RECORD_LOAD.set(record_load)
+        if record_load:
+            monitor.on_forward_start()
         try:
             return fn(self, batch, *args, **kwargs)
         finally:
-            is_dummy_run = getattr(batch, "is_dummy_run", False)
-            # Pure-prefill = has prefill tokens and no decode tokens (batches are
-            # not mixed today; the decode==0 check also future-proofs the TODO
-            # mixed batch). Local per-rank signal -- no DP sync needed, since only
-            # the (non-collective) window commit is gated; the step still advances.
-            is_pure_prefill = (
-                getattr(batch, "total_tokens_num_prefill", 0) > 0
-                and getattr(batch, "total_tokens_num_decode", 0) == 0
-            )
-            # Recording gate commits clean load on pure-prefill only (local op).
-            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
+            if record_load:
+                monitor.on_forward_end(is_dummy_run=False, is_pure_prefill=True)
+            _EPLB_RECORD_LOAD.reset(record_token)
             # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
             # group-uniform flag. Coincides with the pure-prefill commit above
             # under the no-mixed-batch invariant (see on_forward_pass_end).
-            local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+            local_has_prefill = not is_dummy_run and has_prefill
             dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
             manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
 
@@ -2590,6 +2596,8 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
 
 def record_eplb_expert_load(layer: Any, topk_physical: torch.Tensor) -> None:
     """Record per-physical-slot token counts for EPLB load monitoring."""
+    if not _EPLB_RECORD_LOAD.get():
+        return
     from atom.config import get_current_atom_config
 
     atom_cfg = get_current_atom_config()
@@ -2761,7 +2769,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
 
     load_buf = None
     atom_cfg = get_current_atom_config()
-    if bool(getattr(atom_cfg, "eplb_enable", False)):
+    if _EPLB_RECORD_LOAD.get() and bool(getattr(atom_cfg, "eplb_enable", False)):
         monitor = get_expert_load_monitor(
             enabled=True, window_size=atom_cfg.eplb_config.load_window_size
         )
