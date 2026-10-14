@@ -1817,11 +1817,13 @@ class EPLBManager:
         expert_layout = getattr(first_layer, "expert_layout", None)
         shared_logical_expert = None
         if bool(getattr(expert_layout, "shared_is_routed", False)):
-            num_shared = int(getattr(expert_layout, "num_fused_shared_experts", 0))
-            if num_shared != 1:
+            num_shared_logical = int(
+                getattr(expert_layout, "num_fused_shared_experts", 0)
+            )
+            if num_shared_logical != 1:
                 raise NotImplementedError(
                     "EPLB initial local placement currently supports exactly one "
-                    f"routed shared expert, got {num_shared}"
+                    f"routed shared expert, got {num_shared_logical}"
                 )
             shared_logical_expert = int(expert_layout.num_routed)
         # Rows of leading dense layers stay zero-load and are never migrated.
@@ -2789,7 +2791,12 @@ def eplb_append_shared_and_map(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Append routed shared experts and remap all ids in one Triton launch."""
+    """Append shared logical experts and remap all ids in one Triton launch.
+
+    ``num_fused_shared_experts`` is the number of shared *logical* experts,
+    not their live replica count. Replica counts and physical slots remain
+    fully dynamic and are read from ``cnt``/``l2p``/``dispatch`` below.
+    """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
     if not _EPLB_HAS_TRITON or not _eplb_owns_layer(meta, layer_id):
@@ -2800,10 +2807,10 @@ def eplb_append_shared_and_map(
 
     assert topk_weights.dim() == 2 and topk_ids.dim() == 2
     assert topk_weights.shape == topk_ids.shape
-    num_shared = int(getattr(layer, "num_fused_shared_experts", 0))
-    assert num_shared > 0
+    num_shared_logical = int(getattr(layer, "num_fused_shared_experts", 0))
+    assert num_shared_logical > 0
     num_tokens, top_k_in = topk_ids.shape
-    top_k_out = top_k_in + num_shared
+    top_k_out = top_k_in + num_shared_logical
     out_shape = (num_tokens, top_k_out)
     out_weights = torch.empty(
         out_shape, dtype=topk_weights.dtype, device=topk_weights.device
@@ -2826,7 +2833,7 @@ def eplb_append_shared_and_map(
     num_physical = int(meta.num_physical_experts)
     num_replicas = int(l2p.shape[-1])
     shared_base = int(layer.expert_layout.num_routed)
-    assert shared_base + num_shared <= num_logical
+    assert shared_base + num_shared_logical <= num_logical
 
     from atom.config import get_current_atom_config
 
