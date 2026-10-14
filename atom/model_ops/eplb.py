@@ -1839,9 +1839,10 @@ class EPLBManager:
         self.rebalance_min_balancedness = float(rebalance_min_balancedness)
         self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
         self.placement_policy = str(placement_policy).lower().strip()
-        assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
+        assert self.rebalance_interval >= 0, "eplb_rebalance_interval must be >= 0"
         assert (
-            self.rebalance_interval >= self.monitor.window_size
+            self.rebalance_interval == 0
+            or self.rebalance_interval >= self.monitor.window_size
         ), "eplb_rebalance_interval must be >= eplb_load_window_size"
         assert self.rebalance_balancedness_agg in (
             "min",
@@ -1850,7 +1851,7 @@ class EPLBManager:
         # 0 = rebalance for the life of the process.
         self.max_rebalances = max(0, envs.ATOM_EPLB_MAX_REBALANCES)
         self._rebalancing_stopped = False
-        self._gen = self._entrypoint()
+        self._gen = self._entrypoint() if self.rebalance_interval > 0 else None
         self.decode_rebalance_interval = max(0, int(decode_rebalance_interval))
         self.decode_max_swaps_per_layer = int(decode_max_swaps_per_layer)
         self.decode_min_swap_gain = float(decode_min_swap_gain)
@@ -2307,11 +2308,13 @@ class EPLBManager:
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
     ) -> None:
-        # Once stopped there is nothing left to schedule, so skip the per-step
-        # has-prefill reduction too. The stop latches on the same step on every
-        # rank (rebalance counts move in lockstep), so all ranks skip it together.
+        # Prefill and decode rebalancing are switched on independently. Once
+        # neither has anything left to schedule, skip the per-step has-prefill
+        # reduction too. Stops latch on the same step on every rank (rebalance
+        # counts move in lockstep), so all ranks skip it together.
+        prefill_active = self._gen is not None and not self._rebalancing_stopped
         decode_active = self._decode_gen is not None and not self._decode_stopped
-        if not self.enabled or (self._rebalancing_stopped and not decode_active):
+        if not self.enabled or not (prefill_active or decode_active):
             return
 
         # Resolve a migration-group-uniform has-prefill flag.
@@ -2336,7 +2339,7 @@ class EPLBManager:
             if decode_active:
                 next(self._decode_gen)
             return
-        if not self._rebalancing_stopped:
+        if prefill_active:
             next(self._gen)
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:

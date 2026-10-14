@@ -1643,6 +1643,8 @@ class EPLBConfig:
     """EPLB sub-config (vLLM-style: enable + config object)."""
 
     load_window_size: int = 1000
+    # Prefill-side rebalance every `rebalance_interval` steps that have
+    # prefill. 0 disables it.
     rebalance_interval: int = 3000
     rebalance_layers_per_chunk: int = 64
     num_redundant_experts: int = 0
@@ -1673,9 +1675,10 @@ class EPLBConfig:
         self.load_window_size = int(self.load_window_size)
         assert self.load_window_size > 0, "eplb.load_window_size must be > 0"
         self.rebalance_interval = int(self.rebalance_interval)
-        assert self.rebalance_interval > 0, "eplb.rebalance_interval must be > 0"
+        assert self.rebalance_interval >= 0, "eplb.rebalance_interval must be >= 0"
         assert (
-            self.rebalance_interval >= self.load_window_size
+            self.rebalance_interval == 0
+            or self.rebalance_interval >= self.load_window_size
         ), "eplb.rebalance_interval must be >= eplb.load_window_size"
         self.rebalance_layers_per_chunk = int(self.rebalance_layers_per_chunk)
         assert (

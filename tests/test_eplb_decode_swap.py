@@ -200,11 +200,11 @@ def test_decode_load_off_by_default():
     assert mon.dump_global_decode_stats() is None
 
 
-def _manager(mon, interval, max_rebalances=0):
+def _manager(mon, interval, max_rebalances=0, prefill_interval=1000):
     mgr = eplb.EPLBManager(
         enabled=True,
         monitor=mon,
-        rebalance_interval=1000,
+        rebalance_interval=prefill_interval,
         rebalance_min_balancedness=2.0,
         rebalance_balancedness_agg="min",
         decode_rebalance_interval=interval,
@@ -273,6 +273,47 @@ def test_decode_off_keeps_prefill_schedule():
     for _ in range(500):
         _decode_step(mgr)
     assert fired == []
+
+
+def test_prefill_off_runs_decode_only():
+    mgr = _manager(_monitor(), interval=2, prefill_interval=0)
+    assert mgr._gen is None
+    fired = []
+    _spy_decode(mgr, fired)
+    prefill_fired = []
+
+    def _fake_prefill():
+        prefill_fired.append(1)
+        return
+        yield  # pragma: no cover
+
+    mgr._rebalance = _fake_prefill
+    for _ in range(50):
+        _prefill_step(mgr)
+    for _ in range(3):
+        _decode_step(mgr)
+    assert prefill_fired == [] and fired == [1]
+
+
+def test_both_off_skips_step_entirely(monkeypatch):
+    mgr = _manager(_monitor(decode=False), interval=0, prefill_interval=0)
+
+    def _no_reduce(*args, **kwargs):
+        raise AssertionError("has-prefill reduction must be skipped")
+
+    mgr._dp_is_migration_group = False
+    monkeypatch.setattr(torch.distributed, "all_reduce", _no_reduce)
+    _prefill_step(mgr)
+    _decode_step(mgr)
+
+
+def test_config_accepts_prefill_rebalance_off():
+    from atom.config import EPLBConfig
+
+    cfg = EPLBConfig(rebalance_interval=0, decode_rebalance_interval=500)
+    assert cfg.rebalance_interval == 0
+    with pytest.raises(AssertionError, match="rebalance_interval"):
+        EPLBConfig(load_window_size=100, rebalance_interval=50)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
