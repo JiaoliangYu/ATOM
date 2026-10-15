@@ -2047,39 +2047,6 @@ class EPLBManager:
         # asymmetric P2P operations involving only a subset of EP ranks.
         torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
-        if self._decode_gen is not None:
-            self._warm_up_decode_collectives()
-
-    def _warm_up_decode_collectives(self) -> None:
-        """Set up what decode swaps use before serving: the load all-reduce and
-        a connection between every rank pair on the migration group, so the
-        first swap does not create them in the middle of traffic."""
-        assert self.live_metadata is not None
-        self.monitor.dump_global_decode_stats()
-        group = self._migration_group
-        world = torch.distributed.get_world_size(group)
-        me = torch.distributed.get_rank(group)
-        dev = self.live_metadata.expert_map.device
-        send = torch.zeros(world, dtype=torch.uint8, device=dev)
-        recv = torch.zeros(world, dtype=torch.uint8, device=dev)
-        ops = []
-        for peer in range(world):
-            if peer == me:
-                continue
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, send[peer : peer + 1], peer, group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, recv[peer : peer + 1], peer, group
-                )
-            )
-        for req in torch.distributed.batch_isend_irecv(ops):
-            req.wait()
-        torch.cuda.synchronize()
-        torch.distributed.barrier(group=group)
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
@@ -2465,10 +2432,7 @@ class EPLBManager:
             return
         self._decode_rebalance_count += 1
         yield from self._migrate_layers(
-            new_meta,
-            layer_ids,
-            f"decode swap #{self._decode_rebalance_count}",
-            sync=True,
+            new_meta, layer_ids, f"decode swap #{self._decode_rebalance_count}"
         )
 
     def _metadata_for_layers(
@@ -2625,9 +2589,7 @@ class EPLBManager:
         self._log_rebalance_metrics(rc=_rc, logical_load=logical_load, logcnt=logcnt)
         yield from self._migrate_layers(new_meta, layer_ids, f"rebalance #{_rc}")
 
-    def _migrate_layers(
-        self, new_meta, layer_ids: list[int], label: str, sync: bool = False
-    ):
+    def _migrate_layers(self, new_meta, layer_ids: list[int], label: str):
         import time as _time
 
         assert self.live_metadata is not None
@@ -2638,12 +2600,6 @@ class EPLBManager:
             chunk = layer_ids[start : start + chunk_size]
             yield
             _tc = _time.perf_counter()
-            if sync:
-                # Start the P2P only once every rank's previous forward is done
-                # and all ranks are here, so it never interleaves with in-flight
-                # cross-GPU MoE kernels.
-                torch.cuda.synchronize()
-                torch.distributed.barrier(group=self._migration_group)
             for layer_id in chunk:
                 # Reuse the pre-allocated single-layer temp buffers (allocated once
                 # at init) across every layer/rebalance — no serving-time alloc, no

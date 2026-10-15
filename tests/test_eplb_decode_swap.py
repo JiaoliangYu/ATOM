@@ -370,8 +370,8 @@ def test_decode_rebalance_builds_swapped_metadata(monkeypatch):
     mon._decode_load[1] = torch.tensor([3, 3, 3, 3, 3, 3, 3, 3], dtype=torch.int32)
     captured = {}
 
-    def _fake_migrate(new_meta, layer_ids, label, sync=False):
-        captured.update(meta=new_meta, layers=layer_ids, label=label, sync=sync)
+    def _fake_migrate(new_meta, layer_ids, label):
+        captured.update(meta=new_meta, layers=layer_ids, label=label)
         return
         yield  # pragma: no cover
 
@@ -381,7 +381,6 @@ def test_decode_rebalance_builds_swapped_metadata(monkeypatch):
     _decode_step(mgr)
 
     assert captured["layers"] == [0]
-    assert captured["sync"] is True
     assert mgr.decode_rebalance_count == 1
     meta = captured["meta"]
     assert meta.physical_to_logical_map[1].tolist() == list(range(8))
