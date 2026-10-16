@@ -78,6 +78,18 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
+## Dynamic chunking
+
+Interpolates pipeline-parallel chunk sizes between the configured batch budget
+and the equal-latency size solved from the calibrated chunk model. Used when
+neither `--dynamic-chunking-smooth-factor` nor `Config.dynamic_chunking_smooth_factor`
+is given, and read only when dynamic chunking is enabled, so a malformed value
+cannot affect a server that does not use the feature.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR** | float | 0.75 | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). Must be in `[0, 1]` when dynamic chunking is enabled. |
+
 ## Model loading
 
 | Variable | Type | Default | Description |
@@ -98,6 +110,7 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
+| **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
 ## Kernel / backend selection
 
@@ -153,7 +166,9 @@ combine knob as a quality/throughput tradeoff.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
-| **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MORI_V2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
+| **ATOM_MEGA_STAGE2_FUSED** | bool | 1 (true) | Under `ATOM_MORI_V2=1`, run the MoE layer on aiter's `MegaMoEGfx1250` (MegaMoE): the gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` falls back to mori's v2 op-layer with plain gather combine. Formerly `ATOM_MORI_V2_FUSED`. |
+| **ATOM_MEGA_STAGE1_FUSED** | bool | 1 (true) | MegaMoE compact stage 1 (aiter `stage1_fused`): routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM's per-expert rows directly. Only takes effect with `ATOM_MEGA_STAGE2_FUSED=1` and `MEGA_DISPATCH_WIRE=fp8`/`fp4`; a bf16 wire keeps the token-major path. Not supported together with the Triton experts. |
+| **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MEGA_STAGE2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
 | **ATOM_MEGA_DECODE_MTPR** | int | 128 | Capacity (rows per rank) of the small MegaMoEV2 instance that DP-unified decode / verify / draft passes reuse (`ATOM_MEGA_DECODE_FAST_PATH=1`); one of 128, 256, 512, 1024. A pass with more rows falls back to the instance sized for `max_num_batched_tokens`. Size it to cover the DP-padded decode graphs (`running_bs * (num_speculative_tokens + 1)` rows); above 128 the instance stays on aiter's fixed-slot path only if `AITER_MEGA_FIXED_SLOT_MAX_MTPR` admits it (511 / 1023 / 2047), otherwise it runs compact. |
 | **ATOM_ENABLE_MOONEP** | bool | 0 (false) | If set to `1`, balance MegaMoE prefill with MoonEP (EP4 or EP8): hot experts' routes go to other ranks, which prefetch those experts' weights into extra slots. Works with `--moe-backend mega` and, on gfx1250, with the fused MoRI v2 transport (`ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1`). Not combinable with EPLB redundant experts or `--fake-eplb`. |
 | **MOONEP_PREFETCH_SLOTS** | int | 8 | MoonEP prefetch slots per rank for other ranks' experts. |
@@ -310,6 +325,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## Prefix cache lookup
+
+All three default on and move work off the scheduler thread.
+`ATOM_FRONTEND_PREFIX_HASH=0` and `ATOM_PREFIX_WALK_MEMO=0` give the same hits.
+`ATOM_PREFIX_FAST_WALK=0` does not always: the fast walk compares tokens only on the last hit block, so a
+64-bit xxhash chained-hash collision on an interior block reuses another
+prompt's KV with no error (wrong output). `0` compares every hit block's tokens
+and catches it; set it when chasing a corruption that does not reproduce.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine with a fingerprint of the prompt tokens, beside the request in the ADD message (never inside a pickled `Sequence`; with `DisaggCoreManager` only the decode engine, which allocates, gets it). The engine adopts it if block size, seed, length and fingerprint match and its first, middle and last links rehash equal, then uses it for the prefix walk, `allocate` and publishing the prompt blocks after prefill, so prefill hashes no prompt block on the scheduler thread (it hashes the prompt bytes once for the fingerprint, about 26 us at 186k tokens; the LMCache/offload and PD-transfer publish paths still hash their blocks). Any mismatch falls back to engine-side hashing. Read in the API server process. |
+| **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's chain up with C-speed `map` rounds (the first block alone, then 16, 64, ... blocks, so a cold prompt costs one lookup), compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
+| **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across the probes that run every scheduler tick: the delayer's head check and probe, and the DP chunk-cost estimate (`BlockManager.can_allocate_memoized`). It walks again when a hash the walk read is evicted, remapped to another block or revoked by a republish of its block, the hash at its first miss is published, `clear_cache` runs, more than 8192 such changes happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-walks every tick. |
+
 ## State checkpoints
 
 For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;
@@ -323,6 +353,9 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+| **ATOM_DSV4_STATE_REPLAY** | bool | 0 (false) | DeepSeek-V4: keep a prefix hit that reaches past the nearest state checkpoint by more than the window's receptive field (7,748 tokens on V4-Pro, 7,875 with MTP or DSpark) and recompute only that field below it, which rebuilds the state exactly, instead of resuming at the checkpoint (`Config.state_replay_tokens`). Off on anything but the DeepSeek-V4 trunk with compress ratios 4 / 128, and with context parallelism, a speculative method other than MTP or the model's own DSpark layers (not a separate `--draft-model`), prefix caching off, or a KV connector other than LMCache MP offload alone. With that one LMCache saves carry the PAGE KV alone, no state image (the native layout registers the PAGE group alone, under a namespace of its own, so a stock LMCache server's hit is how far that KV reaches), and a hit whose PAGE KV LMCache holds past the HBM prefix loads that KV alone and replays below it. Every other model, and DeepSeek-V4 without the replay, keeps storing images. |
+| **ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS** | int | — (the model's native interval) | vLLM plugin (DeepSeek-V4 state checkpoints): overrides the checkpoint interval in tokens, snapped down to a multiple of the block size. `>0` a rung every N tokens plus the prompt-end anchor and the demand rung; `-1` no rungs, anchor and demand only; `0` no state checkpoint is published, so there is no prefix hit at all (vLLM reports a hit only when every state checkpoint group is cached; the state checkpoint groups still allocate their working blocks). |
+| **ATOM_STATE_CHECKPOINT_CHECK_BLOCKS** | bool | 0 (false) | vLLM plugin (state checkpoints) diagnostic: after every schedule, raise if a request holds more than two blocks in any state checkpoint group. |
 
 ### LMCache offload tier
 
@@ -345,6 +378,7 @@ derive a bound.
 | **OFFLOAD_LOOKUP_RETRY_STEPS** | int | 32 | Scheduler steps a failed tier lookup suppresses the next attempt. |
 | **OFFLOAD_ASYNC_LOOKUP_DEPTH** | int | 16 | `lmcache_mp` sends tier lookups for the head of the waiting queue before admission, as non-blocking requests, and admission consumes the answer; a request whose answer has not arrived is passed over (in arrival order) instead of blocking the scheduler. This is how many waiting requests per scheduling pass get a prefetched lookup. |
 | **OFFLOAD_LOOKUP_DEFER_S** | float | 2.0 | How long `lmcache_mp` admission may pass over a request whose prefetched lookup is still in flight before it waits for the answer (finite, ≥ 0). |
+| **OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT** | bool | 1 (true) | On by default; set to `0` to always wait for the lookup. Admit a prefill without waiting for its external-tier lookup when the lookup cannot change what is loaded: the HBM prefix leaves fewer than `OFFLOAD_MIN_LOAD_TOKENS` tokens uncached, so every load path would refuse the tier hit. Requires an asynchronous lookup (LMCache MP) and is not applied with joint KV/state offload. The lookup is still sent, because it refreshes the prefix's L1 LRU recency and opens the MP session whose end touches the request's chunks; its answer is not used as a load hit. The save floor starts at the HBM prefix and is lowered to the tier's contiguous hit when the answer arrives (or to 0 if it never does), so chunks the tier evicted are stored again. Read locks are released when the answer arrives; the MP session ends after that, and an unanswered lookup is given up after 120 s, leaving its locks to the read TTL. |
 | **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
 | **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
 | **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
