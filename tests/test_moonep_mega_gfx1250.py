@@ -70,6 +70,20 @@ def test_expert_rows():
         moonep._expert_rows(torch.empty(100, 8), 65)
 
 
+def test_geometry_does_not_tie_the_ep_rank_to_the_device(monkeypatch):
+    # gfx1250 allocates on the current device; ep_rank is only the cco rank.
+    monkeypatch.setenv("MOONEP_PREFETCH_SLOTS", "8")
+    monkeypatch.setattr(
+        moonep,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, fake_eplb=False),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 5)
+    moonep.check_moonep_geometry(ep_size=4, num_experts=260)
+    with pytest.raises(ValueError, match="EP4 and EP8"):
+        moonep.check_moonep_geometry(ep_size=2, num_experts=260)
+
+
 def test_virtual_experts(monkeypatch):
     monkeypatch.setenv("MOONEP_PREFETCH_SLOTS", "8")
     assert moonep.moonep_virtual_experts(260, 4) == 4 * (65 + 8)

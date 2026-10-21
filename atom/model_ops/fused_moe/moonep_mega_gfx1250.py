@@ -11,6 +11,11 @@ the virtual id of its replica and pulls the placed experts' weights into the
 slots.  The shared MegaMoEGfx1250 is built over ``R * (EPR + B)`` virtual
 experts and runs it unchanged.  A unified decode step keeps every route on
 its owner's resident copy.
+
+Everything is allocated on the current device and ``ep_rank`` is only the
+communicator rank, so it need not equal the device index.  The prefetch reads
+peers' memory through cco's LSA window, so the EP group must sit in one P2P
+domain (one node) -- the same requirement MegaMoEGfx1250 has.
 """
 
 import logging
@@ -36,7 +41,7 @@ def moonep_virtual_experts(num_experts: int, ep_size: int) -> int:
     return ep_size * (num_experts // ep_size + envs.MOONEP_PREFETCH_SLOTS)
 
 
-def check_moonep_geometry(*, ep_rank: int, ep_size: int, num_experts: int) -> None:
+def check_moonep_geometry(*, ep_size: int, num_experts: int) -> None:
     config = get_current_atom_config()
     if getattr(config, "eplb_enable", False) or getattr(config, "fake_eplb", False):
         raise ValueError("ATOM_ENABLE_MOONEP=1 cannot be combined with (fake) EPLB")
@@ -47,11 +52,6 @@ def check_moonep_geometry(*, ep_rank: int, ep_size: int, num_experts: int) -> No
     slots = envs.MOONEP_PREFETCH_SLOTS
     if not 0 < slots <= 64:
         raise ValueError(f"MOONEP_PREFETCH_SLOTS must be in [1, 64], got {slots}")
-    if torch.cuda.current_device() != ep_rank:
-        raise ValueError(
-            f"MoonEP needs EP rank {ep_rank} on cuda:{ep_rank}, "
-            f"running on cuda:{torch.cuda.current_device()}"
-        )
 
 
 def moonep_balance_step() -> bool:
@@ -133,7 +133,7 @@ class MoonEPLayer:
         from aiter.ops.flydsl.kernels.moonep_plan import MoonEPPlanner
         from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
 
-        check_moonep_geometry(ep_rank=ep_rank, ep_size=ep_size, num_experts=num_experts)
+        check_moonep_geometry(ep_size=ep_size, num_experts=num_experts)
         if getattr(layer, "w13_bias", None) is not None or (
             getattr(layer, "w2_bias", None) is not None
         ):

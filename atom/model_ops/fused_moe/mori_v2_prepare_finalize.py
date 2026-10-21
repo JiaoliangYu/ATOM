@@ -926,9 +926,7 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
                 moonep_virtual_experts,
             )
 
-            check_moonep_geometry(
-                ep_rank=all2all_manager.rank, ep_size=ep_size, num_experts=num_experts
-            )
+            check_moonep_geometry(ep_size=ep_size, num_experts=num_experts)
             moonep_experts = num_experts
             num_experts = moonep_virtual_experts(num_experts, ep_size)
         # Geometry only; the expert-GEMM recipe comes from the layer later.

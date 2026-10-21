@@ -110,6 +110,7 @@ def build_mega_weights(layer) -> None:
     if envs.ATOM_ENABLE_MOONEP:
         from aiter.dist.parallel_state import get_ep_group
         from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
+        from aiter.ops.shuffle import shuffle_scale_a16w4_out_shape
 
         if getattr(get_current_atom_config(), "eplb_enable", False):
             raise ValueError("ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB")
@@ -123,14 +124,22 @@ def build_mega_weights(layer) -> None:
             raise ValueError(f"MoonEP supports EP4 and EP8, got EP{world}")
         if not 0 < slots <= 64:
             raise ValueError(f"MoonEP prefetch_slots must be in [1, 64], got {slots}")
+        # MegaMoEV2 allocates on cuda:<rank>, so the EP rank must be the device.
         if torch.cuda.current_device() != rank:
             raise ValueError(
                 f"MoonEP needs EP rank {rank} on cuda:{rank}, "
                 f"running on cuda:{torch.cuda.current_device()}"
             )
 
-        def scale_part(scale: torch.Tensor) -> tuple[int, int]:
-            return (int(scale.shape[1]), (int(scale.shape[2]) + 7) // 8 * 8)
+        def _shuffled_scale_part_shape(scale: torch.Tensor) -> tuple[int, int]:
+            """Per-expert shape of ``shuffle_scale_a16w4``'s output for ``scale``.
+
+            The shuffle pads the last dim to a multiple of 8 (E8M0 1.0), and its
+            ``out=`` is the pool's home rows, so they must have the padded shape.
+            """
+            rows = int(scale.shape[1])
+            _, cols = shuffle_scale_a16w4_out_shape((E * rows, scale.shape[2]))
+            return (rows, cols)
 
         pool = MoonEPWeightPool(
             rank=rank,
@@ -139,9 +148,9 @@ def build_mega_weights(layer) -> None:
             prefetch_slots=slots,
             parts=[
                 (tuple(w13.shape[1:]), w13.dtype),
-                (scale_part(s1), s1.dtype),
+                (_shuffled_scale_part_shape(s1), s1.dtype),
                 (tuple(w2.shape[1:]), w2.dtype),
-                (scale_part(s2), s2.dtype),
+                (_shuffled_scale_part_shape(s2), s2.dtype),
             ],
         )
         outputs = (
