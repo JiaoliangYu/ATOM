@@ -1523,11 +1523,14 @@ class ExpertLoadMonitor:
         self._logged_first_record: bool = False
         self._logged_logical_without_metadata: bool = False
         self._load_group: Any | None = None
+        self._load_device_group: Any | None = None
         self._decode_load: torch.Tensor | None = None
         self._decode_steps = 0
 
-    def set_load_group(self, group: Any) -> None:
+    def set_load_group(self, group: Any, device_group: Any | None = None) -> None:
+        # device_group overrides the communicator the load is all-reduced on.
         self._load_group = group
+        self._load_device_group = device_group
 
     def initialize(
         self, *, num_layers: int, num_physical: int, device: torch.device
@@ -1720,7 +1723,9 @@ class ExpertLoadMonitor:
             # load as int32 for the same reason). The previous path routed the
             # counts through aiter's float custom all-reduce + round, which relied
             # on FP determinism to stay bit-identical across ranks.
-            device_group = getattr(group, "device_group", None)
+            device_group = self._load_device_group or getattr(
+                group, "device_group", None
+            )
             if device_group is not None:
                 global_load = local.to(torch.int64)
                 torch.distributed.all_reduce(
@@ -1983,7 +1988,6 @@ class EPLBManager:
             from aiter.dist.parallel_state import get_ep_group
 
             ep = get_ep_group()
-            self.monitor.set_load_group(ep)
             self._ep_group = ep.device_group
             self._ep_rank = int(ep.rank_in_group)
             # Dedicated communicator for migration P2P (same members/order as the
@@ -1993,6 +1997,10 @@ class EPLBManager:
             # new_group is collective over the default group; every rank calls it.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
             self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
+            # Reduce the load on the migration group too: its communicator is
+            # built at init, while the EP group's RCCL communicator is otherwise
+            # unused here and would cost ~2.8 GB per GPU on the first rebalance.
+            self.monitor.set_load_group(ep, device_group=self._migration_group)
             # If the DP group is exactly the migration group, the DP sync's
             # any_rank_has_prefill already spans it -> reuse it (free). Otherwise
             # keep False and OR the prefill flag over the migration group ourselves.
@@ -2047,6 +2055,46 @@ class EPLBManager:
         # asymmetric P2P operations involving only a subset of EP ranks.
         torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
+        if self._gen is not None or self._decode_gen is not None:
+            self._warm_up_migration_p2p()
+
+    def _warm_up_migration_p2p(self) -> None:
+        """Send an expert with every peer once before KV-cache sizing. RCCL
+        sets up P2P connections on first use and allocates ~0.45 GB per GPU for
+        them; left to the first migration, that allocation can come when the KV
+        cache has filled the GPU, and RCCL hangs while connecting."""
+        if self._ep_group is None or not self._moe_layers:
+            return
+        assert self._reusable_temp_buffers is not None
+        group = self._migration_group
+        me = torch.distributed.get_rank(group)
+        weights = self._expert_weights_of_layer[min(self._moe_layers)]
+        ops = []
+        for peer in range(torch.distributed.get_world_size(group)):
+            if peer == me:
+                continue
+            global_peer = torch.distributed.get_global_rank(group, peer)
+            for w, b in zip(weights, self._reusable_temp_buffers):
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        _as_p2p_bytes(w[0]),
+                        global_peer,
+                        group,
+                    )
+                )
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        _as_p2p_bytes(b[peer % b.shape[0]]),
+                        global_peer,
+                        group,
+                    )
+                )
+        for req in torch.distributed.batch_isend_irecv(ops):
+            req.wait()
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=group)
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
