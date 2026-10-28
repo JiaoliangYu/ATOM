@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
 
 import torch
 
@@ -121,7 +120,6 @@ def test_forward_hands_mega_the_virtual_ids_and_pool_windows(monkeypatch):
     layer_moonep.windows = windows
     pf = SimpleNamespace(
         mega=FakeMega(),
-        mask_pad_rows=False,
         num_dispatchers=lambda: 4,
         combine_quant_for_step=lambda: "bf16",
         moonep=layer_moonep,

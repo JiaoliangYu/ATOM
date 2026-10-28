@@ -20,7 +20,6 @@ import torch
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.flydsl_mega_experts import (
     _MEGA_DECODE_MTPR,
-    _enable_mega_pad_row_mask,
     _select_decode_mtpr,
     get_or_build_mega_moe,
 )
@@ -107,7 +106,6 @@ class MoonEPMegaExperts:
         self._prefetch_slots = prefetch_slots
         self._quant = quant
         self._slot_state = None
-        self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
         self._pool, self._parts = self._adopt(layer)
 
     def _adopt(self, layer: torch.nn.Module):
@@ -319,16 +317,6 @@ class MoonEPMegaExperts:
 
         wts = topk_weights.to(torch.float32).contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
-        kwargs = {}
-        pad_rows = None
-        if self._mask_pad_rows:
-            from atom.utils.forward_context import step_pad_rows
-
-            pad_rows = step_pad_rows(rows)
-        if pad_rows is not None:
-            # Neither planned nor counted by Mega; combine zeroes it.
-            ids = torch.where(pad_rows, -1, ids).contiguous()
-            kwargs["mask_invalid_slots"] = True
         with torch.inference_mode(False), torch.no_grad():
             if balance:
                 ids = self._plan(ids)
@@ -336,4 +324,8 @@ class MoonEPMegaExperts:
                 ids = self._home_ids(ids)
             else:
                 mega = decode
-            return mega.forward(hidden_states.contiguous(), wts, ids, **kwargs)
+            # Routing has already marked rows past the pass's real row count
+            # with expert -1. Mega must skip those invalid combine slots.
+            return mega.forward(
+                hidden_states.contiguous(), wts, ids, mask_invalid_slots=True
+            )

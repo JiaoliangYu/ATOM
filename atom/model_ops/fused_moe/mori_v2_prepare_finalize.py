@@ -48,7 +48,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.utils import envs
-from atom.utils.forward_context import get_forward_context, step_pad_rows
+from atom.utils.forward_context import get_forward_context
 
 try:
     import mori
@@ -474,7 +474,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self._mega_geometry = mega_geometry
         self.mega: Any = None
         self.is_fused = mega_geometry is not None
-        self.mask_pad_rows = False
         # The logical expert count when MoonEP balances this layer; the shared
         # MegaMoE is then built over its virtual experts.
         self._moonep_experts = moonep_experts
@@ -518,11 +517,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             combine_quant=_MEGA_COMBINE_QUANT,
         )
-        from atom.model_ops.fused_moe.flydsl_mega_experts import (
-            _enable_mega_pad_row_mask,
-        )
-
-        self.mask_pad_rows = _enable_mega_pad_row_mask(self.max_tokens_per_rank)
         if getattr(self, "_moonep_experts", None) is not None:
             from atom.model_ops.fused_moe.moonep_mega_gfx1250 import MoonEPLayer
 
@@ -596,10 +590,12 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         quant_type: QuantType = QuantType.No,
+        x_scale: torch.Tensor | None = None,
     ) -> mk.PrepareResultType:
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
+        assert x_scale is None, "the v2 gather transport moves bf16 rows only"
 
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
         # ids (0..global_num_experts-1); the transport routes id -> rank = id //
@@ -831,11 +827,6 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         self._assert_recipe_matches(mega, kwargs)
 
         ids = topk_ids.to(torch.int32).contiguous()
-        pad_rows = (
-            step_pad_rows(ids.shape[0]) if self.prepare_finalize.mask_pad_rows else None
-        )
-        if pad_rows is not None:
-            ids = torch.where(pad_rows, -1, ids)
         w1_scale, w2_scale = kwargs.get("w1_scale"), kwargs.get("w2_scale")
         moonep = getattr(self.prepare_finalize, "moonep", None)
         if moonep is not None:
@@ -843,7 +834,6 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 moonep_balance_step,
             )
 
-            # Pad rows are already -1: neither planned nor counted.
             ids = moonep.route(ids.contiguous(), balance=moonep_balance_step())
             w1, w1_scale, w2, w2_scale = moonep.windows
         out = mega(
@@ -863,12 +853,6 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             ),
             combine_quant=self.prepare_finalize.combine_quant_for_step(),
         )
-        if pad_rows is not None:
-            # combine sums every top-k slot and a -1 slot holds stale (possibly
-            # non-finite) data, so select zeros for the pad rows.
-            from atom.model_ops.fused_moe.flydsl_mega_experts import zero_pad_rows_
-
-            out = zero_pad_rows_(out, pad_rows)
         return out
 
     @staticmethod

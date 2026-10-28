@@ -31,10 +31,11 @@ class _FakePool:
 
 class _FakeMega:
     def __init__(self, w1):
-        self.w1, self.calls = w1, []
+        self.w1, self.calls, self.kwargs = w1, [], []
 
     def forward(self, x, wts, ids, **kwargs):
         self.calls.append(ids.clone())
+        self.kwargs.append(kwargs)
         return x
 
 
@@ -84,7 +85,7 @@ def _experts(monkeypatch, *, balance, fast_path=True, unified=True, tokens=16):
     obj._layer = SimpleNamespace()
     obj._model_dim, obj._inter_dim, obj._mtpr, obj._quant = 8, 8, 4096, "a8w4"
     obj._rank, obj._world_size, obj._experts_per_rank = 0, WORLD, EPR
-    obj._prefetch_slots, obj._slot_state, obj._mask_pad_rows = B, None, False
+    obj._prefetch_slots, obj._slot_state = B, None
     obj._pool, obj._parts = _FakePool(), ((False, False),) * len(mme._ADOPTED)
     obj._should_balance = lambda: balance
     return obj, built
@@ -104,6 +105,7 @@ def test_balanced_prefill_runs_planned_ids_and_fills_the_slots(monkeypatch):
     wide = built[WIDE]
     assert torch.equal(wide.calls[0], logical.to(torch.int32) + 1000)
     assert wide.w1.shape[0] == EPR + B
+    assert wide.kwargs == [{"mask_invalid_slots": True}]
     [planner] = mme._PLANNERS.values()
     assert planner.kwargs == {
         "rank": 0,
