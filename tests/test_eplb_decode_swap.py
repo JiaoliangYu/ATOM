@@ -321,7 +321,6 @@ def test_config_accepts_prefill_rebalance_off():
 def test_fused_record_skips_pad_rows_only_with_decode(monkeypatch, decode):
     import types
 
-    import atom.config
     import atom.utils.forward_context as fc
 
     dev = torch.device("cuda")
@@ -330,7 +329,7 @@ def test_fused_record_skips_pad_rows_only_with_decode(monkeypatch, decode):
     )
     monkeypatch.setattr(eplb, "get_live_expert_location_metadata", lambda: meta)
     monkeypatch.setattr(
-        atom.config,
+        eplb,
         "get_current_atom_config",
         lambda: types.SimpleNamespace(
             eplb_enable=True, eplb_config=types.SimpleNamespace(load_window_size=2)
@@ -341,8 +340,10 @@ def test_fused_record_skips_pad_rows_only_with_decode(monkeypatch, decode):
     if decode:
         mon.enable_decode_load()
     monkeypatch.setattr(eplb, "get_expert_load_monitor", lambda **_: mon)
-    pad = torch.tensor([[False], [False], [True], [True]], device=dev)
-    monkeypatch.setattr(fc, "step_pad_rows", lambda n: pad[:n])
+    scheduled_rows = torch.tensor([2], dtype=torch.int32, device=dev)
+    monkeypatch.setattr(
+        fc, "pass_scheduled_tokens_gpu", lambda n: scheduled_rows if n == 4 else None
+    )
 
     topk = torch.tensor([[0, 1], [1, 2], [7, 7], [7, 6]], dtype=torch.int32, device=dev)
     mon.on_forward_start()
