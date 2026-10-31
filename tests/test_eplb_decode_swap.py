@@ -451,3 +451,76 @@ def test_activation_policy_differs_from_tokens():
     act = eplb.DecodeSwapPolicy.activation(eplb.apply_swaps(load, swaps), 10)
     per_gpu = act.view(2, 3).sum(-1)
     assert abs(float(per_gpu[0] - per_gpu[1])) < 1e-6
+
+
+_DECODE = {"is_dummy_run": False, "is_pure_prefill": False, "is_pure_decode": True}
+
+
+def test_activation_window_keeps_recent_group_steps(monkeypatch):
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup())
+    mon = _monitor()
+    mon.enable_decode_load(activation_window=2)
+    _pass(mon, [3, 0, 0, 0], **_DECODE)
+    mon.advance_decode_window()
+    # not a group-wide decode step: overwritten by the next forward
+    _pass(mon, [0, 5, 0, 0], **_DECODE)
+    _pass(mon, [0, 0, 1, 0], **_DECODE)
+    mon.advance_decode_window()
+    _pass(mon, [9, 0, 0, 0], **{**_DECODE, "is_dummy_run": True})
+    mon.advance_decode_window()
+    act, steps = mon.dump_global_decode_activation()
+    assert steps == 2 and act.tolist() == [[0.0, 0.0, 0.5, 0.0]]
+    mon.reset_decode_load()
+    assert mon.dump_global_decode_activation()[1] == 0
+
+
+def test_measured_activation_drives_greedy_activation():
+    load = torch.tensor([[10.0, 10.0, 10.0, 10.0]])
+    p2l = torch.tensor([[0, 1, 2, 3]])
+    act = torch.tensor([[0.9, 0.9, 0.1, 0.1]])
+    kw = {"num_gpus": 2, "max_swaps_per_layer": 8, "min_gain": 0.0}
+    policy = eplb.DecodeSwapPolicy("greedy_activation", **kw)
+    assert policy.plan(load, p2l, 10) == []
+    assert eplb.DecodeSwapPolicy("greedy_hot_cold", **kw).plan(load, p2l, 10, act) == []
+    swaps = policy.plan(load, p2l, 10, act)
+    assert len(swaps) == 1
+    assert swaps[0].expert_a in (0, 1) and swaps[0].expert_b in (2, 3)
+
+
+def test_decode_rebalance_plans_on_recent_activation(monkeypatch):
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup())
+    mon = _monitor()
+    mgr = eplb.EPLBManager(
+        enabled=True,
+        monitor=mon,
+        rebalance_interval=1000,
+        rebalance_min_balancedness=2.0,
+        rebalance_balancedness_agg="min",
+        decode_rebalance_interval=3,
+        decode_swap_policy="greedy_activation",
+        decode_window_size=2,
+    )
+    mgr._dp_is_migration_group = True
+    mgr.live_metadata = eplb.ExpertLocationMetadata.from_trivial(
+        num_layers=1, num_logical_experts=4, ep_size=2, ep_rank=0
+    )
+    mgr._ep_group = object()
+    mgr._moe_layers = {0: None}
+    mon.enable_decode_load(activation_window=2)
+    captured = {}
+
+    def _fake_migrate(new_meta, layer_ids, label):
+        captured.update(meta=new_meta, layers=layer_ids)
+        return
+        yield  # pragma: no cover
+
+    mgr._migrate_layers = _fake_migrate
+    # Tokens over the whole interval favour gpu1 (slots 2, 3), but the two most
+    # recent steps only wake slots 0 and 1 on gpu0.
+    for counts in ([0, 0, 4, 4], [0, 0, 4, 4], [1, 1, 0, 0], [1, 1, 0, 0]):
+        _pass(mon, counts, **_DECODE)
+        _decode_step(mgr)
+    assert captured["layers"] == [0]
+    new = captured["meta"].physical_to_logical_map[0].tolist()
+    assert {0, 1} & set(new[2:]) and {2, 3} & set(new[:2])
+    assert mon._decode_active_filled == 0

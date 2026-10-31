@@ -576,22 +576,34 @@ class DecodeSwapPolicy:
         rate = physical_load.detach().to("cpu", torch.float64) / max(steps, 1.0)
         return 1.0 - torch.exp(-rate)
 
-    def slot_cost(self, physical_load: torch.Tensor, steps: float) -> torch.Tensor:
-        """Per-slot cost: estimated activation probability for greedy_activation,
-        token count otherwise."""
+    def slot_cost(
+        self,
+        physical_load: torch.Tensor,
+        steps: float,
+        activation: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-slot cost: activation probability for greedy_activation (measured
+        when `activation` is given, else estimated), token count otherwise."""
         if self.name == "greedy_activation":
+            if activation is not None:
+                return activation.detach().to("cpu", torch.float64)
             return self.activation(physical_load, steps)
         return physical_load.detach().to("cpu", torch.float64)
 
     def plan(
-        self, physical_load: torch.Tensor, p2l: torch.Tensor, steps: float = 1.0
+        self,
+        physical_load: torch.Tensor,
+        p2l: torch.Tensor,
+        steps: float = 1.0,
+        activation: torch.Tensor | None = None,
     ) -> list[ExpertSwap]:
         """Swaps for every layer whose per-GPU balancedness (mean/max of GPU
         cost) is below min_layer_balancedness; balanced layers are left alone.
-        `steps` is the number of decode steps the load was summed over."""
+        `steps` is the number of decode steps the load was summed over;
+        `activation` is the measured per-slot fraction of steps a slot was active."""
         assert physical_load.shape == p2l.shape and p2l.dim() == 2
         assert p2l.shape[1] % self.num_gpus == 0
-        cost = self.slot_cost(physical_load, steps)
+        cost = self.slot_cost(physical_load, steps, activation)
         p2l_cpu = p2l.detach().to("cpu")
         gpu_cost = cost.view(cost.shape[0], self.num_gpus, -1).sum(dim=-1)
         peak = gpu_cost.max(dim=1).values
@@ -650,8 +662,8 @@ class DecodeSwapPolicy:
     def greedy_activation(
         self, layer: int, cost: torch.Tensor, p2l: torch.Tensor
     ) -> list[ExpertSwap]:
-        """greedy_hot_cold on activation cost: evens out the expected number of
-        experts each GPU wakes per step."""
+        """greedy_hot_cold on activation cost: evens out the number of experts
+        each GPU wakes per step."""
         return self.greedy_hot_cold(layer, cost, p2l)
 
 
@@ -1524,6 +1536,11 @@ class ExpertLoadMonitor:
         self._load_device_group: Any | None = None
         self._decode_load: torch.Tensor | None = None
         self._decode_steps = 0
+        # [window, layers, physical] 0/1 rows: was the slot routed to by this
+        # rank in each of the most recent pure-decode steps.
+        self._decode_active: torch.Tensor | None = None
+        self._decode_active_pos = 0
+        self._decode_active_filled = 0
 
     def set_load_group(self, group: Any, device_group: Any | None = None) -> None:
         # device_group overrides the communicator the load is all-reduced on.
@@ -1573,10 +1590,21 @@ class ExpertLoadMonitor:
         self._num_physical = num_physical
         self._device = device
 
-    def enable_decode_load(self) -> None:
-        """Allocate the decode load accumulator (before cudagraph capture)."""
+    def enable_decode_load(self, activation_window: int = 0) -> None:
+        """Allocate the decode load accumulator (before cudagraph capture), and
+        the per-step activation window when `activation_window` > 0."""
         if self._cur_pass_count is not None and self._decode_load is None:
             self._decode_load = torch.zeros_like(self._cur_pass_count)
+        if (
+            activation_window > 0
+            and self._cur_pass_count is not None
+            and self._decode_active is None
+        ):
+            self._decode_active = torch.zeros(
+                (activation_window, *self._cur_pass_count.shape),
+                dtype=torch.uint8,
+                device=self._cur_pass_count.device,
+            )
 
     @property
     def decode_load_enabled(self) -> bool:
@@ -1668,7 +1696,18 @@ class ExpertLoadMonitor:
         # (step-driven, collective) rebalance -- lockstep is enforced separately
         # by on_forward_pass_end, which advances on a group-uniform prefill flag.
         # Pure-decode passes go to the decode accumulator when it is enabled.
-        if not self.enabled or is_dummy_run or self._cur_pass_count is None:
+        if not self.enabled or self._cur_pass_count is None:
+            return
+        if self._decode_active is not None:
+            # Every forward writes the current row (zeros unless this rank ran a
+            # real decode); the manager only advances it on group-wide decode
+            # steps, so rows line up across ranks.
+            row = self._decode_active[self._decode_active_pos]
+            if is_dummy_run or not is_pure_decode:
+                row.zero_()
+            else:
+                row.copy_(self._cur_pass_count > 0)
+        if is_dummy_run:
             return
         if is_pure_decode:
             if self._decode_load is not None:
@@ -1704,10 +1743,50 @@ class ExpertLoadMonitor:
         world_size = max(1, int(getattr(group, "world_size", 1)))
         return out[:-1].view_as(load).to(torch.int32), float(out[-1]) / world_size
 
+    def advance_decode_window(self) -> None:
+        """Commit the current activation row; call once per group-wide
+        pure-decode step, in lockstep on every rank."""
+        if self._decode_active is None:
+            return
+        self._decode_active_pos = (self._decode_active_pos + 1) % len(
+            self._decode_active
+        )
+        self._decode_active_filled = min(
+            self._decode_active_filled + 1, len(self._decode_active)
+        )
+
+    def dump_global_decode_activation(self) -> tuple[torch.Tensor, int] | None:
+        """(per-slot fraction of the windowed steps in which any rank routed to
+        the slot [L, P] on CPU, number of windowed steps)."""
+        if self._decode_active is None:
+            return None
+        n = self._decode_active_filled
+        if n == 0:
+            return torch.zeros(self._decode_active.shape[1:], dtype=torch.float64), 0
+        rows = self._decode_active[:n].clone()
+        group = self._load_group if self._load_group is not None else get_tp_group()
+        if int(getattr(group, "world_size", 1)) > 1:
+            # A slot is active in a step if any rank routed to it; the 0/1 rows
+            # summed over at most 255 ranks stay exact in uint8.
+            device_group = self._load_device_group or getattr(
+                group, "device_group", None
+            )
+            if device_group is not None:
+                torch.distributed.all_reduce(
+                    rows, op=torch.distributed.ReduceOp.SUM, group=device_group
+                )
+            else:
+                rows = group.all_reduce(rows.to(torch.float32), ca_fp8_quant=False)
+        active = (rows > 0).sum(dim=0, dtype=torch.int32)
+        return active.to("cpu", torch.float64) / n, n
+
     def reset_decode_load(self) -> None:
         if self._decode_load is not None:
             self._decode_load.zero_()
         self._decode_steps = 0
+        # Rows are indexed by physical slot, so they go stale once slots move.
+        self._decode_active_pos = 0
+        self._decode_active_filled = 0
 
     def _reduce_load(self, local: torch.Tensor) -> torch.Tensor:
         group = self._load_group if self._load_group is not None else get_tp_group()
@@ -1845,6 +1924,7 @@ class EPLBManager:
         decode_max_rebalances: int = 0,
         decode_swap_policy: str = "greedy_hot_cold",
         decode_min_layer_balancedness: float = 0.9,
+        decode_window_size: int = 500,
     ):
         self.enabled = enabled
         self.monitor = monitor
@@ -1872,6 +1952,8 @@ class EPLBManager:
         self.decode_swap_policy = str(decode_swap_policy)
         assert self.decode_swap_policy in DecodeSwapPolicy.POLICIES
         self.decode_min_layer_balancedness = float(decode_min_layer_balancedness)
+        self.decode_window_size = int(decode_window_size)
+        assert self.decode_window_size > 0
         self._decode_gen = (
             self._decode_entrypoint() if self.decode_rebalance_interval > 0 else None
         )
@@ -2056,7 +2138,11 @@ class EPLBManager:
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
         if self._decode_gen is not None:
-            self.monitor.enable_decode_load()
+            self.monitor.enable_decode_load(
+                min(self.decode_window_size, self.decode_rebalance_interval)
+                if self.decode_swap_policy == "greedy_activation"
+                else 0
+            )
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
@@ -2363,6 +2449,7 @@ class EPLBManager:
             # Pure-decode step across the migration group: only the decode
             # schedule advances.
             if decode_active:
+                self.monitor.advance_decode_window()
                 next(self._decode_gen)
             return
         if prefill_active:
@@ -2435,11 +2522,13 @@ class EPLBManager:
             return
         _t0 = _time.perf_counter()
         stats = self.monitor.dump_global_decode_stats()
+        windowed = self.monitor.dump_global_decode_activation()
         self.monitor.reset_decode_load()
         if stats is None:
             return
         load, steps = stats
         load = load.cpu()
+        activation = windowed[0] if windowed is not None else None
         _t1 = _time.perf_counter()
         m = self.live_metadata
         old_p2l = m.physical_to_logical_map
@@ -2451,7 +2540,9 @@ class EPLBManager:
             min_layer_balancedness=self.decode_min_layer_balancedness,
         )
         swaps = [
-            s for s in policy.plan(load, old_p2l, steps) if s.layer in self._moe_layers
+            s
+            for s in policy.plan(load, old_p2l, steps, activation)
+            if s.layer in self._moe_layers
         ]
         layer_ids = sorted({s.layer for s in swaps})
         _t2 = _time.perf_counter()
@@ -2463,7 +2554,10 @@ class EPLBManager:
         _t3 = _time.perf_counter()
         if m.ep_rank == 0:
             new_load = apply_swaps(load, swaps)
-            act, new_act = (policy.activation(x, steps) for x in (load, new_load))
+            if activation is not None:
+                act, new_act = activation, apply_swaps(activation, swaps)
+            else:
+                act, new_act = (policy.activation(x, steps) for x in (load, new_load))
             logger.info(
                 "EPLB decode swap (%s): steps=%.0f tokens bal min %.3f->%.3f "
                 "mean %.3f->%.3f; activation bal min %.3f->%.3f mean %.3f->%.3f; "
@@ -2795,6 +2889,7 @@ def get_eplb_manager(
     decode_max_rebalances: int = 0,
     decode_swap_policy: str = "greedy_hot_cold",
     decode_min_layer_balancedness: float = 0.9,
+    decode_window_size: int = 500,
 ) -> EPLBManager:
     global _MANAGER
     if (
@@ -2822,6 +2917,7 @@ def get_eplb_manager(
             decode_max_rebalances=decode_max_rebalances,
             decode_swap_policy=decode_swap_policy,
             decode_min_layer_balancedness=decode_min_layer_balancedness,
+            decode_window_size=decode_window_size,
         )
     return _MANAGER
 
@@ -2846,6 +2942,7 @@ def _get_configured_eplb_manager() -> EPLBManager | None:
         decode_max_rebalances=cfg.eplb_config.decode_max_rebalances,
         decode_swap_policy=cfg.eplb_config.decode_swap_policy,
         decode_min_layer_balancedness=cfg.eplb_config.decode_min_layer_balancedness,
+        decode_window_size=cfg.eplb_config.decode_window_size,
     )
 
 

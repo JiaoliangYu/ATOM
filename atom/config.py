@@ -1730,6 +1730,10 @@ class EPLBConfig:
     # Leave a layer alone when its per-GPU decode balancedness (mean/max) is at
     # least this.
     decode_min_layer_balancedness: float = 0.9
+    # greedy_activation plans from how often each slot was active over the most
+    # recent `decode_window_size` pure-decode steps before each swap (capped at
+    # decode_rebalance_interval).
+    decode_window_size: int = 500
 
     def __post_init__(self):
         self.load_window_size = int(self.load_window_size)
@@ -1785,6 +1789,8 @@ class EPLBConfig:
         assert (
             0.0 < self.decode_min_layer_balancedness <= 1.0
         ), "eplb.decode_min_layer_balancedness must be in (0, 1]"
+        self.decode_window_size = int(self.decode_window_size)
+        assert self.decode_window_size > 0, "eplb.decode_window_size must be > 0"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "EPLBConfig":
