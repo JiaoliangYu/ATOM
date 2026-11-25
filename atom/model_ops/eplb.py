@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
@@ -11,6 +12,8 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import get_current_atom_config
+from atom.model_ops.eplb_policy import PlacementPlan, PlacementPolicy, PlanContext
+from atom.model_ops.eplb_swap import SwapPolicy
 from atom.utils import envs
 
 try:
@@ -26,6 +29,10 @@ import logging
 logger = logging.getLogger("atom")
 
 BufferCopyPlan = list[tuple[int, int]]
+
+# Cumulative counts (the swap policy's): one pure-decode pass a rank in this
+# many is counted.
+DECODE_SAMPLE_EVERY = 8
 
 
 @dataclass(frozen=True)
@@ -374,6 +381,50 @@ def resolve_placement_policy(name: str | None):
             f"choices={sorted(_PLACEMENT_POLICIES)}"
         )
     return _PLACEMENT_POLICIES[key]
+
+
+class RebalancePolicy(PlacementPolicy):
+    """`naive` / `biased`: a rebalance re-places every layer from the load
+    window by `rebalance_experts`, with ``place_layer`` placing one layer, when
+    the balancedness gate lets it."""
+
+    def __init__(self, place_layer) -> None:
+        self.place_layer = place_layer
+
+    def plan(self, monitor: Any, ctx: PlanContext) -> PlacementPlan | None:
+        logical_load = monitor.dump_global_logical_load()
+        if logical_load is None:
+            return None
+        first_layer = ctx.moe_layers[min(ctx.moe_layers)]
+        num_groups = int(first_layer.num_expert_group or 1)
+        t0 = time.perf_counter()
+        p2l, l2p, logcnt = rebalance_experts(
+            logical_load,
+            num_physical=ctx.live.num_physical_experts,
+            num_groups=num_groups,
+            num_nodes=ctx.num_nodes,
+            num_gpus=ctx.live.ep_size,
+            enable_hierarchical=(num_groups > 1 and ctx.num_nodes > 1),
+            policy=self.place_layer,
+            # Current live placement -> enables the biased sticky/shortest-path
+            # fast-path: unchanged hot set => reuse old placement => zero migration.
+            old_p2l=ctx.live.physical_to_logical_map,
+        )
+        return PlacementPlan(
+            physical_to_logical=p2l,
+            logical_to_physical=l2p,
+            replica_count=logcnt,
+            layer_ids=sorted(ctx.moe_layers),
+            rearrange_ms=(time.perf_counter() - t0) * 1000.0,
+            logical_load=logical_load,
+        )
+
+
+def make_placement_policy(name: str | None) -> PlacementPolicy:
+    """The `PlacementPolicy` named by `EPLBConfig.placement_policy`."""
+    if name == "swap":
+        return SwapPolicy()
+    return RebalancePolicy(resolve_placement_policy(name))
 
 
 def _rebalance_single_layer_global(
@@ -1385,9 +1436,44 @@ class ExpertLoadMonitor:
         self._logged_first_record: bool = False
         self._logged_logical_without_metadata: bool = False
         self._load_group: Any | None = None
+        # Swap policy: logical pick counts since the start, folded through
+        # the live placement (`start_cumulative_counts`).
+        self._placement: torch.Tensor | None = None
+        self._placement_index: torch.Tensor | None = None  # int64, for scatter
+        self._cum_prefill: torch.Tensor | None = None
+        self._cum_decode: torch.Tensor | None = None
+        self._decode_passes = 0
+        # The decode rows of the sampled passes since the last plan, and their
+        # number: the operating point (decode rows a step) is the window's,
+        # not the mean since the start.
+        self._window_rows = 0
+        self._window_samples = 0
 
     def set_load_group(self, group: Any) -> None:
         self._load_group = group
+
+    def start_cumulative_counts(self, physical_to_logical_map: torch.Tensor) -> None:
+        """Keep logical pick counts since the start: every pure-prefill pass,
+        and one pure-decode pass in `DECODE_SAMPLE_EVERY`, folded through
+        ``physical_to_logical_map`` (the live placement, updated in place by
+        migration)."""
+        assert self._cur_pass_count is not None, "initialize the monitor first"
+        self._placement = physical_to_logical_map
+        self.placement_moved()
+        self._cum_prefill = torch.zeros_like(self._cur_pass_count, dtype=torch.int64)
+        self._cum_decode = torch.zeros_like(self._cum_prefill)
+
+    def placement_moved(self) -> None:
+        """Re-read the live placement after a migration commits."""
+        if self._placement is not None:
+            self._placement_index = self._placement.to(
+                self._cur_pass_count.device, torch.int64
+            )
+
+    def stop_cumulative_counts(self) -> None:
+        """No plan reads the counts again: the forward pays nothing for them."""
+        self._placement = None
+        self._placement_index = None
 
     def initialize(
         self, *, num_layers: int, num_physical: int, device: torch.device
@@ -1505,7 +1591,15 @@ class ExpertLoadMonitor:
                 tuple(topk_physical.shape),
             )
 
-    def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
+    def on_forward_end(
+        self,
+        is_dummy_run: bool,
+        is_pure_prefill: bool = True,
+        is_pure_decode: bool = False,
+        decode_rows: int = 0,
+    ) -> None:
+        if self._placement is not None and not is_dummy_run:
+            self._fold_cumulative(is_pure_prefill, is_pure_decode, decode_rows)
         # Commit this pass's load to the sliding window ONLY on a real
         # (non-dummy) pure-prefill forward -- EPLB balances on prefill load
         # only, so decode / DP-mixed / dummy passes are dropped here. Committing
@@ -1524,6 +1618,52 @@ class ExpertLoadMonitor:
         self._slot = (self._slot + 1) % self.window_size
         self._filled = min(self._filled + 1, self.window_size)
 
+    def _fold_cumulative(
+        self, is_pure_prefill: bool, is_pure_decode: bool, decode_rows: int
+    ) -> None:
+        if is_pure_prefill:
+            target = self._cum_prefill
+        elif is_pure_decode:
+            self._decode_passes += 1
+            if self._decode_passes % DECODE_SAMPLE_EVERY:
+                return
+            self._window_samples += 1
+            self._window_rows += decode_rows
+            target = self._cum_decode
+        else:
+            return
+        target.scatter_add_(1, self._placement_index, self._cur_pass_count.long())
+
+    def dump_global_cumulative(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """The group's logical pick counts since the start, prefill and
+        sampled decode [layers, logical], and the decode rows of the sampled
+        passes since the last `restart_decode_window` with the number of those
+        passes, each summed over the ranks (one collective)."""
+        assert self._cum_prefill is not None and self._cum_decode is not None
+        window = torch.tensor(
+            [self._window_rows, self._window_samples],
+            dtype=torch.int64,
+            device=self._cum_prefill.device,
+        )
+        payload = torch.cat(
+            [self._cum_prefill.reshape(-1), self._cum_decode.reshape(-1), window]
+        )
+        payload = self._all_reduce_counts(payload)
+        size = self._cum_prefill.numel()
+        shape = self._cum_prefill.shape
+        return (
+            payload[:size].view(shape),
+            payload[size : 2 * size].view(shape),
+            int(payload[-2].item()),
+            int(payload[-1].item()),
+        )
+
+    def restart_decode_window(self) -> None:
+        self._window_rows = 0
+        self._window_samples = 0
+
     def dump_global_physical_load(self) -> torch.Tensor | None:
         if self._expert_load_window is None or self._cur_pass_count is None:
             return None
@@ -1531,7 +1671,10 @@ class ExpertLoadMonitor:
             local = torch.zeros_like(self._cur_pass_count)
         else:
             local = self._expert_load_window[: self._filled].sum(dim=0)
+        return self._all_reduce_counts(local).to(torch.int32)
 
+    def _all_reduce_counts(self, local: torch.Tensor) -> torch.Tensor:
+        """``local`` integer counts summed over the load group, as int64."""
         group = self._load_group if self._load_group is not None else get_tp_group()
         world_size = int(getattr(group, "world_size", 1))
         if world_size > 1:
@@ -1551,17 +1694,17 @@ class ExpertLoadMonitor:
                     op=torch.distributed.ReduceOp.SUM,
                     group=device_group,
                 )
-                return global_load.to(torch.int32)
+                return global_load
             # Fallback: no torch process group exposed -- keep the float path.
             global_load = group.all_reduce(local.to(torch.float32), ca_fp8_quant=False)
-            return global_load.round().to(torch.int32)
-        return local
+            return global_load.round().to(torch.int64)
+        return local.to(torch.int64)
 
     def dump_global_logical_load(self) -> torch.Tensor | None:
         """Fold the observed physical load into per-logical-expert load.
 
         Single source of truth for the physical -> logical folding: both the
-        rebalance path (``EPLBManager._execute_runtime_rebalance``) and external
+        rebalance path (``RebalancePolicy.plan``) and external
         observers call this. Returns ``None`` when no load has been recorded
         yet. Before runtime metadata exists it returns the raw physical load as
         a compatibility fallback (shape ``[layers, physical]``) with a one-time
@@ -1628,11 +1771,13 @@ def _eplb_layer_end(model: Any) -> int | None:
     return None if end is None else int(end)
 
 
-def collect_ep_moe_layers(model: Any) -> dict[int, Any]:
+def collect_ep_moe_layers(model: Any, all_layers: bool = False) -> dict[int, Any]:
     """Map checkpoint layer id -> EP MoE module that owns expert weights, for
-    the layers before the model's `eplb_layer_end`. A layer past the placed
-    ones is never owned (`_eplb_owns_layer`): no remap, record or migration."""
-    end = _eplb_layer_end(model)
+    the layers before the model's `eplb_layer_end` (every layer with
+    ``all_layers``: the swap policy places on decode load too). A layer past
+    the placed ones is never owned (`_eplb_owns_layer`): no remap, record or
+    migration."""
+    end = None if all_layers else _eplb_layer_end(model)
     layers: dict[int, Any] = {}
     for module in model.modules():
         layer_id = getattr(module, "layer_id", None)
@@ -1678,6 +1823,7 @@ class EPLBManager:
         self.rebalance_min_balancedness = float(rebalance_min_balancedness)
         self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
         self.placement_policy = str(placement_policy).lower().strip()
+        self.policy = make_placement_policy(self.placement_policy)
         assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
         assert (
             self.rebalance_interval >= self.monitor.window_size
@@ -1744,7 +1890,7 @@ class EPLBManager:
                 "cannot initialize manager-owned ExpertLocationMetadata"
             )
 
-        layers = collect_ep_moe_layers(model)
+        layers = collect_ep_moe_layers(model, all_layers=self.policy.places_all_layers)
         if not layers:
             raise RuntimeError(
                 "EPLB is enabled but no EP MoE layers with expert weights "
@@ -1866,7 +2012,9 @@ class EPLBManager:
             ep_size,
             ep_rank,
         )
+        self._check_policy_deployment(num_logical, num_physical, ep_size)
         self.monitor.initialize_for_metadata(self.live_metadata)
+        self.policy.start(self.monitor, self.live_metadata)
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
@@ -1876,6 +2024,23 @@ class EPLBManager:
         # asymmetric P2P operations involving only a subset of EP ranks.
         torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
+
+    def _check_policy_deployment(
+        self, num_logical: int, num_physical: int, ep_size: int
+    ) -> None:
+        """Let the policy refuse the MoE layout or the parallel deployment at
+        start (once the EP and DP groups are known)."""
+        atom_config = get_current_atom_config()
+        self.policy.check_deployment(
+            num_logical=num_logical,
+            num_physical=num_physical,
+            ep_size=ep_size,
+            dp_size=self.replica_spread[0],
+            multi_node=(
+                atom_config.parallel_config.is_multinode_dp
+                or atom_config.is_multinode_tp
+            ),
+        )
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
@@ -2153,11 +2318,14 @@ class EPLBManager:
             yield
         while not self._max_rebalances_reached():
             yield from self._rebalance()
-            if self._max_rebalances_reached():
+            if self._rebalancing_stopped or self._max_rebalances_reached():
                 break
             for _ in range(self.rebalance_interval):
                 yield
-        self._stop_rebalancing()
+        if not self._rebalancing_stopped:
+            self._stop_rebalancing(
+                f"ATOM_EPLB_MAX_REBALANCES={self.max_rebalances} reached"
+            )
         # Never finish: a caller that still advances the generator idles here.
         while True:
             yield
@@ -2165,13 +2333,14 @@ class EPLBManager:
     def _max_rebalances_reached(self) -> bool:
         return 0 < self.max_rebalances <= self._rebalance_count
 
-    def _stop_rebalancing(self) -> None:
+    def _stop_rebalancing(self, reason: str) -> None:
         self._rebalancing_stopped = True
+        self.policy.stop(self.monitor)
         logger.info(
-            "EPLB stopped after %d rebalances (ATOM_EPLB_MAX_REBALANCES=%d); "
-            "the current expert placement is kept from now on",
+            "EPLB stopped after %d rebalances (%s); the current expert "
+            "placement is kept from now on",
             self._rebalance_count,
-            self.max_rebalances,
+            reason,
         )
 
     def _rebalance(self):
@@ -2184,6 +2353,9 @@ class EPLBManager:
                 yield
                 migrate_and_commit(new_meta, layer_ids=chunk)
         """
+        if not self.policy.gated:
+            yield from self._execute_rebalance()
+            return
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
             return
@@ -2202,42 +2374,50 @@ class EPLBManager:
         exception. Same-stream ordering makes migration naturally queue after
         the last forward pass's kernels, no synchronize needed.
         """
+        plan = self._plan()
+        if plan is None:
+            return
+        if not plan.layer_ids:
+            self._stop_rebalancing(plan.stop_reason)
+            return
         self._rebalance_count += 1
-        yield from self._execute_runtime_rebalance()
+        yield from self._execute_runtime_rebalance(plan)
 
-    def _execute_runtime_rebalance(self):
-        import time as _time
-
+    def _plan(self) -> PlacementPlan | None:
+        """The policy's next placement, or None (skipped, not counted)."""
         assert self.live_metadata is not None
         if self._ep_group is None:
             logger.warning("EPLB rebalance skipped: EP process group is unavailable")
-            return
-
-        logical_load = self.monitor.dump_global_logical_load()
-        if logical_load is None:
-            return
-
-        first_layer = self._moe_layers[min(self._moe_layers)]
-        num_groups = int(getattr(first_layer, "num_expert_group", None) or 1)
-        num_nodes = self._nnodes
-        ep_size = self.live_metadata.ep_size
-        _ep_rank = self.live_metadata.ep_rank
-        _rc = self._rebalance_count
-
-        _t0 = _time.perf_counter()
-        p2l, l2p, logcnt = rebalance_experts(
-            logical_load,
-            num_physical=self.live_metadata.num_physical_experts,
-            num_groups=num_groups,
-            num_nodes=num_nodes,
-            num_gpus=ep_size,
-            enable_hierarchical=(num_groups > 1 and num_nodes > 1),
-            policy=resolve_placement_policy(self.placement_policy),
-            # Current live placement -> enables the biased sticky/shortest-path
-            # fast-path: unchanged hot set => reuse old placement => zero migration.
-            old_p2l=self.live_metadata.physical_to_logical_map,
+            return None
+        return self.policy.plan(
+            self.monitor,
+            PlanContext(
+                live=self.live_metadata,
+                moe_layers=self._moe_layers,
+                num_nodes=self._nnodes,
+                dp_size=self.replica_spread[0],
+            ),
         )
-        new_meta = ExpertLocationMetadata.from_rebalance_result(
+
+    def _execute_runtime_rebalance(self, plan: PlacementPlan):
+        new_meta = self._new_metadata(
+            plan.physical_to_logical, plan.logical_to_physical, plan.replica_count
+        )
+        if plan.logical_load is not None:
+            self._log_rebalance_metrics(
+                rc=self._rebalance_count,
+                logical_load=plan.logical_load,
+                logcnt=plan.replica_count,
+            )
+        yield from self._migrate(
+            new_meta, plan.layer_ids, rearrange_ms=plan.rearrange_ms
+        )
+
+    def _new_metadata(
+        self, p2l: torch.Tensor, l2p: torch.Tensor, logcnt: torch.Tensor
+    ) -> ExpertLocationMetadata:
+        assert self.live_metadata is not None
+        return ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
             logical_to_physical_map=l2p,
             logical_replica_count=logcnt,
@@ -2246,23 +2426,32 @@ class EPLBManager:
             max_num_replicas=self.live_metadata.max_num_replicas,
         )
 
-        chunk_size = max(1, int(self._rebalance_layers_per_chunk))
-        layer_ids = sorted(self._moe_layers)
-        num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
-        _t_rearrange_ms = (_time.perf_counter() - _t0) * 1000.0
+    def _migrate(
+        self,
+        new_meta: ExpertLocationMetadata,
+        layer_ids: list[int],
+        *,
+        rearrange_ms: float,
+    ):
+        """Generator: migrate ``layer_ids`` to ``new_meta`` in chunks, yielding
+        between chunks so a forward pass can run in between."""
+        import time as _time
 
+        assert self.live_metadata is not None
+        _rc = self._rebalance_count
+        _ep_rank = self.live_metadata.ep_rank
+        chunk_size = max(1, int(self._rebalance_layers_per_chunk))
+        num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
         logger.info(
             "EPLB rebalance #%d ep_rank=%d: rearrange=%.1fms; migrating %d layers "
             "in %d chunks (size=%d)",
             _rc,
             _ep_rank,
-            _t_rearrange_ms,
+            rearrange_ms,
             len(layer_ids),
             num_chunks,
             chunk_size,
         )
-
-        self._log_rebalance_metrics(rc=_rc, logical_load=logical_load, logcnt=logcnt)
 
         for start in range(0, len(layer_ids), chunk_size):
             chunk = layer_ids[start : start + chunk_size]
@@ -2288,6 +2477,7 @@ class EPLBManager:
                     cuda_stream=None,
                 )
                 # if needed, just refresh relayer expert_map/mask here
+            self.monitor.placement_moved()
             _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
             logger.info(
                 "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",
@@ -2494,8 +2684,18 @@ def with_eplb_forward_monitor(fn):
                 getattr(batch, "total_tokens_num_prefill", 0) > 0
                 and getattr(batch, "total_tokens_num_decode", 0) == 0
             )
-            # Recording gate commits clean load on pure-prefill only (local op).
-            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
+            is_pure_decode = (
+                batch.total_tokens_num_decode > 0
+                and batch.total_tokens_num_prefill == 0
+            )
+            # Recording gate commits clean load on pure-prefill only (local op);
+            # the swap policy also samples pure-decode passes.
+            monitor.on_forward_end(
+                is_dummy_run,
+                is_pure_prefill,
+                is_pure_decode,
+                batch.total_tokens_num_decode,
+            )
             # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
             # group-uniform flag. Coincides with the pure-prefill commit above
             # under the no-mixed-batch invariant (see on_forward_pass_end).
@@ -2510,7 +2710,8 @@ def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:
     """True when ``layer_id`` is one of the MoE layers EPLB places.
 
     EPLB covers the target model's placed MoE layers only. Layers at or past
-    its ``eplb_layer_end``, and drafter/MTP MoE layers (e.g. the DSpark
+    its ``eplb_layer_end`` (placement_policy "swap" places every layer), and
+    drafter/MTP MoE layers (e.g. the DSpark
     drafter's layer 61 on DSV4-Pro), are never migrated, so
     their logical ids already are physical ids and their load is not tracked.
     Redundant slots do not change that: an EPLB-routed shared expert is a
